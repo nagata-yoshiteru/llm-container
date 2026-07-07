@@ -1,7 +1,12 @@
 services:
-  qwen3-coder-next:
+  nemotron-3-super:
+    # eugr/spark-vllm:latest は 2026-07-06 時点で vLLM 0.23.1rc1.dev841 の Spark
+    # 特化ビルド (SM_121 / GB10 向けカーネル込み)。Claude Code が要求する
+    # 0.23.0+ を満たすので、公式 vllm/vllm-openai:v0.24.0 ではなくこちらを維持。
+    # NVIDIA 公式ガイドは v0.20.0 固定を指定しているが、その後の 0.21〜0.23 で
+    # NVFP4 / MTP は改善されているはずなので前方互換で押す。
     image: eugr/spark-vllm:latest
-    container_name: qwen3-coder-next
+    container_name: nemotron-3-super
     restart: unless-stopped
 
     gpus: all
@@ -28,10 +33,21 @@ services:
       - ${HOME}/.cache/vllm/torchinductor:/cache/torchinductor
       - ${HOME}/.cache/vllm/triton:/cache/triton
       - ${HOME}/.cache/vllm/torch_extensions:/cache/torch_extensions
+      # reasoning parser を有効化する場合はこの mount のコメントを外し、
+      # モデルカードから super_v3_reasoning_parser.py を取得して
+      # docker-compose.yml と同じディレクトリに置くこと。
+      # - ./super_v3_reasoning_parser.py:/app/super_v3_reasoning_parser.py:ro
 
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
-      VLLM_ATTENTION_BACKEND: FLASHINFER
+      # NVFP4 の GEMM は Marlin カーネル経由 (Spark で実績)
+      VLLM_NVFP4_GEMM_BACKEND: marlin
+      # max_position_embeddings=262144 を超えて 1M まで押し広げるためのバイパス
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      # 単一 GPU でも allreduce パスは trtllm 経由が推奨
+      VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+      # FlashInfer の MoE-FP4 パスは Spark で不安定なので明示的に無効化
+      VLLM_USE_FLASHINFER_MOE_FP4: "0"
       TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
       TRITON_CACHE_DIR: /cache/triton
       TORCH_EXTENSIONS_DIR: /cache/torch_extensions
@@ -50,19 +66,28 @@ services:
         print("python vllm:", vllm.__version__)
         PY
 
-        exec vllm serve Qwen/Qwen3-Coder-Next-FP8 \
+        exec vllm serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
           --host 0.0.0.0 \
           --port 8910 \
-          --served-model-name qwen3-coder-next \
-          --max-model-len 262144 \
-          --gpu-memory-utilization 0.90 \
+          --served-model-name nemotron-3-super \
+          --trust-remote-code \
+          --dtype auto \
+          --quantization fp4 \
           --kv-cache-dtype fp8 \
+          --mamba_ssm_cache_dtype float16 \
+          --moe-backend marlin \
+          --tensor-parallel-size 1 \
+          --pipeline-parallel-size 1 \
+          --data-parallel-size 1 \
+          --gpu-memory-utilization 0.90 \
+          --max-model-len 1000000 \
           --max-num-seqs 4 \
-          --max-num-batched-tokens 8192 \
+          --enable-chunked-prefill \
+          --async-scheduling \
+          --speculative_config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}' \
           --enable-auto-tool-choice \
-          --tool-call-parser qwen3_coder \
-          --enable-prefix-caching
-          # 実験用: MTP 投機デコード (Qwen3-Next は重みに MTP ヘッドを含む)。
-          # GB10 では回帰する報告もあるので、外して速いか確認しつつ有効化する。
-          # --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
-
+          --tool-call-parser qwen3_coder
+          # reasoning parser を有効化するときは上の行末に \ を足し、下 2 行を有効化。
+          # 対応する volume mount のコメント解除と、プラグイン .py の配置も忘れずに。
+          # --reasoning-parser-plugin /app/super_v3_reasoning_parser.py \
+          # --reasoning-parser super_v3
