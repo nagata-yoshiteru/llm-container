@@ -26,10 +26,10 @@ services:
 
     volumes:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
-      - ${VLLM_CACHE_DIR:-/opt/vllm-cache}/vllm:/var/cache/vllm
-      - ${VLLM_CACHE_DIR:-/opt/vllm-cache}/torchinductor:/var/cache/torchinductor
-      - ${VLLM_CACHE_DIR:-/opt/vllm-cache}/triton:/var/cache/triton
-      - ${VLLM_CACHE_DIR:-/opt/vllm-cache}/torch_extensions:/var/cache/torch_extensions
+      - ${VLLM_CACHE_DIR:-./vllm-cache}/vllm:/var/cache/vllm
+      - ${VLLM_CACHE_DIR:-./vllm-cache}/torchinductor:/var/cache/torchinductor
+      - ${VLLM_CACHE_DIR:-./vllm-cache}/triton:/var/cache/triton
+      - ${VLLM_CACHE_DIR:-./vllm-cache}/torch_extensions:/var/cache/torch_extensions
 
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
