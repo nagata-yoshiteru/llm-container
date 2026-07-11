@@ -55,6 +55,12 @@ services:
       NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME:-}
       NCCL_IB_HCA: ${NCCL_IB_HCA:-}
 
+      NETWORK_IFACE: ${NETWORK_IFACE}
+
+      # PyTorch distributed / Gloo / NCCL が loopback を選ばないようにする
+      GLOO_SOCKET_IFNAME: ${NETWORK_IFACE}
+      NCCL_SOCKET_IFNAME: ${NETWORK_IFACE}
+
       # vLLM / Ray が接続先を拾えるようにする
       RAY_ADDRESS: ${HEAD_IP}:6379
       VLLM_HOST_IP: ${NODE_IP}
