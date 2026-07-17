@@ -1,27 +1,14 @@
 services:
-  qwen3-coder-next:
+  gpt-oss-120b:
     image: eugr/spark-vllm:latest
-    container_name: qwen3-coder-next
+    container_name: gpt-oss-120b
     restart: unless-stopped
 
     gpus: all
     ipc: host
-    # network_mode: host
-    # privileged: true
 
     ports:
       - "0.0.0.0:8910:8910"
-
-    # ulimits:
-    #   nofile:
-    #     soft: 1048576
-    #     hard: 1048576
-    #   memlock:
-    #     soft: -1
-    #     hard: -1
-    #   stack:
-    #     soft: 67108864
-    #     hard: 67108864
 
     volumes:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
@@ -31,7 +18,10 @@ services:
 
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
+
+      # DGX Spark / Blackwell向け
       VLLM_ATTENTION_BACKEND: FLASHINFER
+
       TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
       TRITON_CACHE_DIR: /cache/triton
       TORCH_EXTENSIONS_DIR: /cache/torch_extensions
@@ -50,19 +40,17 @@ services:
         print("python vllm:", vllm.__version__)
         PY
 
-        exec vllm serve Qwen/Qwen3-Coder-Next-FP8 \
+        exec vllm serve openai/gpt-oss-120b \
           --host 0.0.0.0 \
           --port 8910 \
-          --served-model-name qwen3-coder-next \
-          --max-model-len 262144 \
+          --served-model-name gpt-oss-120b \
+          --max-model-len 131072 \
           --gpu-memory-utilization 0.90 \
           --kv-cache-dtype fp8 \
           --max-num-seqs 4 \
           --max-num-batched-tokens 8192 \
           --enable-auto-tool-choice \
-          --tool-call-parser qwen3_coder \
+          --tool-call-parser openai \
+          --reasoning-parser openai_gptoss \
           --enable-prefix-caching
-          # 実験用: MTP 投機デコード (Qwen3-Next は重みに MTP ヘッドを含む)。
-          # GB10 では回帰する報告もあるので、外して速いか確認しつつ有効化する。
-          # --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
 
