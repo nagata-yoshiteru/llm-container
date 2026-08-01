@@ -71,10 +71,12 @@ fi
 [ -e /dev/infiniband/uverbs0 ] && ok "/dev/infiniband あり" || ng "/dev/infiniband がありません"
 
 MTU=$(cat "/sys/class/net/${ROCE_IF_NAME}/mtu" 2>/dev/null)
+ACTIVE_MTU=$(ibv_devinfo -d "${IB_HCA_NAME}" 2>/dev/null | awk '/active_mtu/ {print $2; exit}')
 if [ "${MTU:-0}" -ge 9000 ]; then
-    ok "MTU ${MTU}"
+    ok "MTU ${MTU} (RoCE path MTU ${ACTIVE_MTU:-?})"
 else
-    warn "MTU ${MTU:-?} — 9000 に上げると prefill が伸びる (両ノードで揃えること)"
+    warn "MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 9000 に上げると path MTU が 4096 になる"
+    warn "  手順は README の「セットアップ 4. MTU を 9000 に上げる」。両ノードで揃えること"
 fi
 
 echo
@@ -106,13 +108,32 @@ RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
 
 echo
 echo "== rootful docker =="
+[ -e /dev/nvidia0 ] && ok "/dev/nvidia0 あり" || ng "/dev/nvidia0 がありません (ドライバを確認)"
+
+# rootful daemon に nvidia ランタイムが登録されているか。
+# rootless 側 (~/.config/docker/daemon.json) に登録されていても rootful には効かない。
+# 未登録だとコンテナ内で NVML が初期化できず、vLLM が
+# "Failed to infer device type" で即死する。
+if grep -qs nvidia /etc/docker/daemon.json; then
+    ok "rootful daemon に nvidia ランタイム登録済み"
+else
+    ng "/etc/docker/daemon.json に nvidia ランタイムがありません"
+    echo "       sudo nvidia-ctk runtime configure --runtime=docker"
+    echo "       sudo systemctl restart docker"
+fi
+
 if sudo -n docker info >/dev/null 2>&1; then
     ok "sudo docker 利用可"
+    sudo -n docker info 2>/dev/null | grep -qi 'runtimes:.*nvidia' \
+        && ok "docker info に nvidia ランタイムあり" \
+        || ng "docker info に nvidia ランタイムがありません"
     sudo -n docker image inspect "${VLLM_IMAGE}" >/dev/null 2>&1 \
         && ok "イメージ取得済み" \
         || warn "イメージ未取得 — sudo docker pull ${VLLM_IMAGE}"
 else
-    warn "sudo docker が非対話で叩けません (パスワード入力が必要)"
+    warn "sudo docker が非対話で叩けません — 以下を手で確認すること:"
+    echo "       sudo docker info | grep -i runtimes        # nvidia が出ること"
+    echo "       sudo docker run --rm --gpus all ${VLLM_IMAGE} nvidia-smi"
 fi
 
 echo

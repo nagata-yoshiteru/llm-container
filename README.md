@@ -17,11 +17,15 @@ OpenAI 互換 API を `:8910` に生やす構成。
 | HCA | ケーブルが刺さっている側 (既定 `rocep1s0f0`, GID index 3 = RoCEv2/IPv4) | 同左 |
 
 IP・ホスト名・パスはすべて `.env` に書く。`.env` は git 管理外。
-以下の手順では worker を `$WORKER` (QSFP 側の IP) として書く。
+以下の手順では worker を 2 通りの経路で呼ぶ。
 
 ```bash
-WORKER=<worker の RoCE IP>     # .env の WORKER_ROCE_IP と同じ値
+WORKER=<worker の RoCE IP>       # QSFP 直結側。.env の WORKER_ROCE_IP と同じ値
+WORKER_MGMT=<worker の管理用 IP> # 普通の Ethernet / tailscale 側
 ```
+
+**QSFP 側の設定をいじるときは必ず `$WORKER_MGMT` 経由で SSH すること。**
+`$WORKER` でログインしたまま MTU やアドレスを変えると自分の足を撃つ。
 
 ---
 
@@ -38,6 +42,29 @@ sudo docker ...    # rootful  -- こっちを使う
 `sudo docker compose` はカレントディレクトリの `.env` をそのまま読む。ただし
 **`.env` の中で `${HOME}` などのシェル変数は使えない** (sudo で `HOME=/root` になるため)。
 `MODEL_PATH` は repo 相対 (`./models/...`) か絶対パスで書くこと。
+
+### rootful daemon に nvidia ランタイムを登録する (最初に 1 回)
+
+rootless 側 (`~/.config/docker/daemon.json`) に nvidia ランタイムが登録してあっても、
+**rootful 側 (`/etc/docker/daemon.json`) には効かない**。未登録のまま起動すると
+コンテナ内で NVML が初期化できず、vLLM が起動直後に
+`RuntimeError: Failed to infer device type` で死ぬ。
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+ssh -t "$WORKER_MGMT" 'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker'
+```
+
+確認 (**これが通るまで vLLM を起動しない**):
+
+```bash
+sudo docker info | grep -i runtimes          # nvidia が出ること
+sudo docker run --rm --gpus all "$(sed -n 's/^VLLM_IMAGE=//p' .env)" nvidia-smi
+```
+
+`systemctl restart docker` は rootful 側のコンテナを止めるので、先に
+`sudo docker compose --profile head down` などで片付けておくこと。
 
 ---
 
@@ -100,7 +127,73 @@ sudo sysctl -w vm.swappiness=10
 
 `MemAvailable` が 105GB 以上あれば OK。
 
-### 4. preflight
+### 4. MTU を 9000 に上げる (任意だが推奨 / 一度やれば済む)
+
+QSFP の Ethernet MTU が既定の 1500 だと、**RoCE の path MTU が 1024 に落ちる**。
+9000 に上げると HCA の上限である 4096 まで上がり、NCCL の 1 転送あたりの
+パケット数が 1/4 になる。上流も MTU を 9000 にして運用している。
+
+```bash
+ip -d link show enp1s0f0np0 | grep -o 'maxmtu [0-9]*'   # 9978 くらいあるはず
+ibv_devinfo -d rocep1s0f0 | grep -E 'active_mtu|max_mtu'
+#   max_mtu: 4096 / active_mtu: 1024  <- この active_mtu を 4096 にしたい
+```
+
+> **vLLM を止めてからやること。** NCCL は初期化時に path MTU を読むので、
+> 動作中に変えると中途半端な状態になる。
+> また **SSH は `$WORKER_MGMT` 経由で**。QSFP 側から入っていると接続が切れる。
+
+**(a) まず一時変更で試す** (再起動で元に戻る)。片側だけ 9000 の間は大きいパケットが
+落ちるので、間を空けずに両方やる。
+
+```bash
+sudo ip link set dev enp1s0f0np0 mtu 9000
+ssh -t "$WORKER_MGMT" 'sudo ip link set dev enp1s0f0np0 mtu 9000'
+```
+
+**(b) 効いたか確認**
+
+```bash
+ip -br link show enp1s0f0np0
+ibv_devinfo -d rocep1s0f0 | grep active_mtu     # 4096 (5) になっていること
+ping -M do -s 8972 -c 3 "$WORKER"               # 8972 = 9000 - 28、フラグメント禁止で通ること
+```
+
+`active_mtu: 4096 (5)` になって ping が通れば成功。
+
+**(c) 永続化** — QSFP は netplan + NetworkManager が管理していて、
+NVIDIA の connect-two-sparks が置いた `/etc/netplan/40-cx7.yaml` が本体。
+
+```bash
+sudo netplan get                        # 現状確認
+sudo $EDITOR /etc/netplan/40-cx7.yaml
+```
+
+`enp1s0f0np0:` のブロックに `mtu: 9000` を 1 行足す。
+
+```yaml
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      link-local: [ipv4]
+      mtu: 9000          # <- これを追加
+```
+
+適用は `apply` ではなく **`try`** を使う。設定をミスって疎通が切れても 120 秒で自動的に戻る。
+
+```bash
+sudo netplan try        # 問題なければ Enter で確定、放置すれば revert
+```
+
+worker 側も同じ編集をして、(b) の確認をもう一度。
+
+**再起動後は必ず確認すること。** netplan の適用が外れると 1500 に戻る。
+`scripts/preflight.sh` が MTU を WARN で出すので、そこで気付ける。
+
+### 5. preflight
 
 ```bash
 ./scripts/preflight.sh                                         # head
@@ -196,13 +289,15 @@ KV の実測レートは **約 53KB/token** (上流 bjk110 の報告: 10GiB = 20
 
 | 症状 | 原因と対処 |
 |---|---|
+| `RuntimeError: Failed to infer device type` / `Can't initialize NVML` / `No CUDA runtime is found` | rootful daemon に nvidia ランタイムが登録されていない。`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` を両ノードで (→ 「rootful daemon に nvidia ランタイムを登録する」) |
 | NCCL が `unhandled system error` / `ibv_reg_mr` で `Cannot allocate memory` | RDMA がコンテナに通っていない。`--device /dev/infiniband`・`memlock` 無制限・`network_mode: host`・`ipc: host` は compose に入っているので、まず **rootful で起動しているか**を疑う |
 | QP ハンドシェイクが `local GID ::` で死ぬ / rendezvous で固まる | Spark は RoCE ポートを 2 本見せるがケーブルは 1 本。刺さっていない側の GID index 3 は空。`show_gids` で IPv4 が QSFP 側のアドレスになっている行の DEV と INDEX を `.env` の `IB_HCA_NAME` / `NCCL_IB_GID_INDEX` に入れる |
 | 再起動したら疎通しなくなった | QSFP 側は link-local なので IP が変わることがある。`ip -br addr show enp1s0f0np0` を見て `.env` を更新 (preflight が検出する) |
 | worker が exit 137 | UMA の OOM-kill。他のワークロードを止めて再起動してからやり直す。`MAX_MODEL_LEN` と KV を下げるのも手 |
 | 速度が 5〜10 tok/s しか出ない | ネイティブ FP8 DeepGEMM 経路に乗っていない。起動ログに `scale_fmt=ue8m0` / DeepGEMM 有効の行が出ているか確認。`VLLM_USE_DEEP_GEMM_E8M0=1` は必須 |
 | 出力が文字化け・意味不明 | イメージやビルドを変えた後にコンパイルキャッシュが残っている。`sudo rm -rf vllm-cache/{vllm,triton,torchinductor}/*` して再起動 |
-| prefill が遅い | 2 台の driver / kernel / firmware バージョンが揃っているか。上流はここを揃えるだけで prefill +140% と報告している。あと MTU が 1500 のままなら 9000 に上げる (両ノード同時に) |
+| prefill が遅い | 2 台の driver / kernel / firmware バージョンが揃っているか。上流はここを揃えるだけで prefill +140% と報告している。あと MTU が 1500 のままなら 9000 に上げる (→ セットアップ 4.) |
+| `ping -M do -s 8972` が通らない | 片側の MTU が 1500 のまま。両ノードとも 9000 になっているか確認 (→ セットアップ 4.) |
 | `unknown reasoning parser` 等で起動しない | `.env` の `VLLM_PARSER_ARGS` を空にして素の起動をまず通す |
 | block size 関連のエラーで起動しない | `VLLM_EXTRA_ARGS` から `--block-size 256` を外す |
 

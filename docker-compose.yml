@@ -99,13 +99,11 @@ x-vllm-service: &vllm-service
     stack:
       soft: 67108864
       hard: 67108864
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: all
-            capabilities: [gpu]
+  # rootful docker 側に nvidia ランタイムが登録されている必要がある。
+  # 未登録だとコンテナ内で NVML が初期化できず、vLLM が
+  # "Failed to infer device type" で即死する。
+  #   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+  gpus: all
   # 意図的に restart させない。EngineCore の初期化失敗で無限再起動すると
   # GB10 の unified memory を食い潰してホストごと巻き込む。
   restart: "no"
