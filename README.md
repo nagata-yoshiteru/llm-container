@@ -60,11 +60,31 @@ ssh -t "$WORKER_MGMT" 'sudo nvidia-ctk runtime configure --runtime=docker && sud
 
 ```bash
 sudo docker info | grep -i runtimes          # nvidia が出ること
-sudo docker run --rm --gpus all "$(sed -n 's/^VLLM_IMAGE=//p' .env)" nvidia-smi
+
+IMAGE=$(sed -n 's/^VLLM_IMAGE=//p' .env)
+sudo docker run --rm --gpus all \
+  --device /dev/nvidia0 --device /dev/nvidiactl \
+  --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools \
+  "$IMAGE" nvidia-smi                        # GB10 が出ること
 ```
 
 `systemctl restart docker` は rootful 側のコンテナを止めるので、先に
 `sudo docker compose --profile head down` などで片付けておくこと。
+
+#### `--device` を明示している理由
+
+`/etc/nvidia-container-runtime/config.toml` に **`no-cgroups = true`** が入っていると、
+`--gpus all` だけでは GPU が使えない。これは rootless docker で GPU を使うための
+必須設定だが、rootful では nvidia-container-cli が **device cgroup の許可リストを
+更新しなくなる**ため、コンテナ内にデバイスノードは現れるのにアクセスが弾かれ、
+`Failed to initialize NVML` → `Failed to infer device type` で落ちる。
+
+`no-cgroups = false` にすると今度は rootless 側の GPU が壊れるので、設定は触らず
+**デバイスノードを明示的に渡して cgroup を通す**。compose の `devices:` に入れてある。
+
+それでもダメな場合は `docker-compose.yml` の `x-vllm-service` に
+`privileged: true` を足す (device cgroup ごとバイパスされる)。上流の
+tonyd2wild のレシピも `--privileged` を使っている。
 
 ---
 
@@ -289,7 +309,7 @@ KV の実測レートは **約 53KB/token** (上流 bjk110 の報告: 10GiB = 20
 
 | 症状 | 原因と対処 |
 |---|---|
-| `RuntimeError: Failed to infer device type` / `Can't initialize NVML` / `No CUDA runtime is found` | rootful daemon に nvidia ランタイムが登録されていない。`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` を両ノードで (→ 「rootful daemon に nvidia ランタイムを登録する」) |
+| `RuntimeError: Failed to infer device type` / `Can't initialize NVML` / `No CUDA runtime is found` | ① rootful daemon に nvidia ランタイムが未登録 → `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`。② それでもダメなら `no-cgroups=true` で device cgroup に弾かれている → compose の `devices:` で `/dev/nvidia*` を渡す (対応済み)、最終手段は `privileged: true` (→ 「rootful daemon に nvidia ランタイムを登録する」) |
 | NCCL が `unhandled system error` / `ibv_reg_mr` で `Cannot allocate memory` | RDMA がコンテナに通っていない。`--device /dev/infiniband`・`memlock` 無制限・`network_mode: host`・`ipc: host` は compose に入っているので、まず **rootful で起動しているか**を疑う |
 | QP ハンドシェイクが `local GID ::` で死ぬ / rendezvous で固まる | Spark は RoCE ポートを 2 本見せるがケーブルは 1 本。刺さっていない側の GID index 3 は空。`show_gids` で IPv4 が QSFP 側のアドレスになっている行の DEV と INDEX を `.env` の `IB_HCA_NAME` / `NCCL_IB_GID_INDEX` に入れる |
 | 再起動したら疎通しなくなった | QSFP 側は link-local なので IP が変わることがある。`ip -br addr show enp1s0f0np0` を見て `.env` を更新 (preflight が検出する) |

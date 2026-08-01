@@ -92,6 +92,15 @@ x-vllm-service: &vllm-service
     - /sys/class/infiniband:/sys/class/infiniband:ro
   devices:
     - /dev/infiniband:/dev/infiniband
+    # /etc/nvidia-container-runtime/config.toml が no-cgroups=true (rootless docker で
+    # GPU を使うのに必須の設定) だと、nvidia-container-cli が device cgroup の許可
+    # リストを更新しない。コンテナ内にノードは現れるがアクセスが弾かれ、vLLM が
+    # "Failed to infer device type" で死ぬ。ここで明示的に渡して cgroup を通す。
+    # これでもダメなら privileged: true を足す (device cgroup ごとバイパスされる)。
+    - /dev/nvidia0:/dev/nvidia0
+    - /dev/nvidiactl:/dev/nvidiactl
+    - /dev/nvidia-uvm:/dev/nvidia-uvm
+    - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
   ulimits:
     memlock:
       soft: -1

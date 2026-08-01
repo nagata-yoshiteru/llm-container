@@ -122,6 +122,14 @@ else
     echo "       sudo systemctl restart docker"
 fi
 
+# no-cgroups=true は rootless docker で GPU を使うのに必須だが、rootful では
+# device cgroup の許可リストが更新されなくなる。compose 側で /dev/nvidia* を
+# 明示的に渡してあるのでそれで通るが、通らない場合は privileged: true が要る。
+if grep -qsE '^\s*no-cgroups\s*=\s*true' /etc/nvidia-container-runtime/config.toml; then
+    warn "no-cgroups=true (rootless 用の設定)。rootful では /dev/nvidia* の明示渡しが必要"
+    warn "  compose の devices: で対応済み。それでも NVML が死ぬなら privileged: true を足す"
+fi
+
 if sudo -n docker info >/dev/null 2>&1; then
     ok "sudo docker 利用可"
     sudo -n docker info 2>/dev/null | grep -qi 'runtimes:.*nvidia' \
