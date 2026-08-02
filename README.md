@@ -133,7 +133,7 @@ ssh -t "$WORKER" "cd ~/repos/llm-container && sudo docker pull \$(sed -n 's/^VLL
 
 ### 3. メモリを空ける (2 台とも)
 
-重みが 1 台あたり約 78GiB + KV 14GiB。121GB の unified memory に対してギリギリなので、
+重みが 1 台あたり約 78GiB + KV 18GiB。121GB の unified memory に対してギリギリなので、
 **起動前に他のワークロードを止める**。GB10 の UVM は一度確保されると完全には返らないので、
 迷ったら再起動が一番確実。
 
@@ -347,45 +347,50 @@ sudo docker compose --env-file .env --env-file presets/256k.env --profile head u
 **worker 側も同じ組み合わせで起動すること。** 詳しい根拠と差分表は
 [`presets/README.md`](presets/README.md)。
 
-| プリセット | コンテキスト | KV | 合計メモリ | 状態 |
+| プリセット | コンテキスト | KV | 確保スロット | 状態 |
 |---|---|---|---|---|
-| (既定 / `128k.env`) | 131,072 | 18GiB | 111GiB | **実績あり** (42 tok/s) |
-| `256k.env` | 262,144 | 18GiB | 111GiB | 実績構成と同メモリ。通る見込み |
-| `1m-ds-mla.env` | 1,048,576 | 24GiB | 117GiB | **実験**。`fp8_ds_mla` が要る |
+| (既定 / `128k.env`) | 131,072 | 18GiB | 286,458 (2.19x) | **実績あり** |
+| `256k.env` | 262,144 | 18GiB | 539,285 (2.06x) | **実績あり** (250K 入力で検証) |
+| `1m.env` | 1,048,576 | 18GiB | 約 206 万 (外挿) | 未検証。計算上は入る |
+| `1m-ds-mla.env` | 1,048,576 | 24GiB | ? | `1m.env` が KV 不足で落ちたとき用 |
 
-### 実測レート
+**KV の確保量はどれも 18GiB (1m-ds-mla を除く) = メモリ使用量は同じ。**
+コンテキストを伸ばしてもメモリは増えない。
 
-KV のレートは起動中のサーバの `/metrics` から読める:
+### 実測スループット (256K 構成)
+
+DSpark k=7 / `MAX_NUM_SEQS=1` / prefix caching なし。
+
+| 入力 | TTFT | prefill | decode | 合計 |
+|---:|---:|---:|---:|---:|
+| 3,922 | 2.07s | 1,891 t/s | 48.7 t/s | 4.0s |
+| 15,958 | 7.55s | 2,114 t/s | 50.0 t/s | 9.6s |
+| 63,984 | 31.4s | 2,040 t/s | 49.6 t/s | 34.0s |
+| 131,008 | 68.1s | 1,924 t/s | 57.1 t/s | 70.3s |
+| 199,920 | 110.9s | 1,802 t/s | 44.5 t/s | 113.5s |
+| 249,952 | 145.1s | 1,723 t/s | 59.1 t/s | 147.1s |
+
+**decode がコンテキスト長でほとんど劣化しない** (4K で 48.7、250K でも 59.1 t/s)。
+prefill も 250K まで 15% しか落ちない。`MemAvailable` は 250K 入力時で最小 6.7GiB。
+
+### KV サイズは「B/token 一定」ではない
+
+確保できるスロット数は `MAX_MODEL_LEN` によって変わる。同じ 18GiB でも
+128K 指定なら 286,458 スロット、256K 指定なら 539,285 スロット取れる。
+c4a (1/4) / c128a (1/128) 圧縮のおかげで **長いほど 1 トークンが安くなる**ので、
+線形に外挿すると大きく外す。
 
 ```bash
+# 実測はこれで読む
 curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' \
   | grep -E 'kv_cache_(memory_bytes|size_tokens)|block_size'
-#   kv_cache_memory_bytes="19327352832"   (18GiB)
-#   kv_cache_size_tokens="286458"         -> 67,470 B/token = 65.9 KiB/token
 ```
 
-> `--block-size` の指定でこのレートは変わる。未指定 (block_size=4) のときは
-> 130,737 B/token だったものが、`--block-size 256` を渡したら 67,470 B/token に
-> 半減した。**設定を変えたら必ず測り直すこと。**
-
-`MAX_NUM_SEQS=1` なら必要な KV はほぼ `MAX_MODEL_LEN x 65.9KiB`。
 **KV プールが `MAX_MODEL_LEN` に足りないと vLLM は起動時に即エラーで落ちる**ので、
-失敗は早くて分かりやすい。
+失敗は早くて分かりやすい。実際に効いてくる制約は KV よりも prefill の活性化メモリ。
 
-メモリ収支は「KV 18GiB のとき host `used` が 111GiB」→ **KV 以外が 93GiB**
-(重み 78GiB + ランタイム 15GiB)。unified memory は 121GiB なので
-**KV に回せるのは実質 18〜20GiB**。
-
-| コンテキスト | 必要 KV | 判定 |
-|---|---|---|
-| 128K | 8.2GiB | 余裕 |
-| 256K | 16.5GiB | 入る (現行の 18GiB のまま) |
-| 512K | 32.9GiB | **入らない** (合計 126GiB) |
-| 1M | 65.9GiB | **論外** |
-
-つまり **plain fp8 のままでは 256K が実用上の上限**。512K 以上を狙うなら
-`--kv-cache-dtype fp8_ds_mla` で KV そのものを削るしかない
-(→ [`presets/1m-ds-mla.env`](presets/1m-ds-mla.env))。
+詳しい見積もり方、`--block-size` の影響、`fp8_ds_mla` への切り替えは
+[`presets/README.md`](presets/README.md) に。
 
 ### その他のチューニング
 
