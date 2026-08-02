@@ -105,16 +105,17 @@ VLLM_CMD=(
 
 [ "${ROLE}" = "worker" ] && VLLM_CMD+=(--headless)
 
-# VLLM_EXTRA_ARGS / VLLM_PARSER_ARGS は空白区切りで展開する。
+# VLLM_*_ARGS は空白区切りで展開する。
 # JSON を渡す場合は値の内側に空白を入れないこと (例: {"method":"dspark"})。
-if [ -n "${VLLM_PARSER_ARGS:-}" ]; then
+#
+#   VLLM_PARSER_ARGS : reasoning / tool-call パーサ。全構成で共通
+#   VLLM_KV_ARGS     : KV キャッシュ関連。コンテキスト長ごとに変わる (presets/)
+#   VLLM_EXTRA_ARGS  : その他。全構成で共通
+for _args in "${VLLM_PARSER_ARGS:-}" "${VLLM_KV_ARGS:-}" "${VLLM_EXTRA_ARGS:-}"; do
+    [ -n "${_args}" ] || continue
     # shellcheck disable=SC2206
-    VLLM_CMD+=(${VLLM_PARSER_ARGS})
-fi
-if [ -n "${VLLM_EXTRA_ARGS:-}" ]; then
-    # shellcheck disable=SC2206
-    VLLM_CMD+=(${VLLM_EXTRA_ARGS})
-fi
+    VLLM_CMD+=(${_args})
+done
 set +f
 
 echo "[entrypoint] exec: ${VLLM_CMD[*]}"

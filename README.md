@@ -337,32 +337,55 @@ sudo docker logs -f dsv4-head
 `MAX_MODEL_LEN` がコンテキスト長 (1 リクエストあたりのトークン上限)。
 モデル自体は 1,048,576 まで対応しているが、実際には KV キャッシュのメモリで頭打ちになる。
 
-KV のレートは **この構成の実測で約 128KiB/token**。起動中のサーバの `/metrics` から読める:
+コンテキスト長ごとの設定は [`presets/`](presets/) にオーバーレイとして置いてある。
+`.env` (IP・パス入り) はそのままに、差分だけを重ねる:
 
 ```bash
-curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' | grep -E 'kv_cache_(memory_bytes|size_tokens)'
-#   kv_cache_memory_bytes="10737418240"   (10GiB)
-#   kv_cache_size_tokens="82130"          -> 130,737 B/token
+sudo docker compose --env-file .env --env-file presets/256k.env --profile head up -d
 ```
 
-`MAX_NUM_SEQS=1` なら必要な KV はほぼ `MAX_MODEL_LEN x 128KiB`。
+**worker 側も同じ組み合わせで起動すること。** 詳しい根拠と差分表は
+[`presets/README.md`](presets/README.md)。
+
+| プリセット | コンテキスト | KV | 合計メモリ | 状態 |
+|---|---|---|---|---|
+| (既定 / `128k.env`) | 131,072 | 18GiB | 111GiB | **実績あり** (42 tok/s) |
+| `256k.env` | 262,144 | 18GiB | 111GiB | 実績構成と同メモリ。通る見込み |
+| `1m-ds-mla.env` | 1,048,576 | 24GiB | 117GiB | **実験**。`fp8_ds_mla` が要る |
+
+### 実測レート
+
+KV のレートは起動中のサーバの `/metrics` から読める:
+
+```bash
+curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' \
+  | grep -E 'kv_cache_(memory_bytes|size_tokens)|block_size'
+#   kv_cache_memory_bytes="19327352832"   (18GiB)
+#   kv_cache_size_tokens="286458"         -> 67,470 B/token = 65.9 KiB/token
+```
+
+> `--block-size` の指定でこのレートは変わる。未指定 (block_size=4) のときは
+> 130,737 B/token だったものが、`--block-size 256` を渡したら 67,470 B/token に
+> 半減した。**設定を変えたら必ず測り直すこと。**
+
+`MAX_NUM_SEQS=1` なら必要な KV はほぼ `MAX_MODEL_LEN x 65.9KiB`。
 **KV プールが `MAX_MODEL_LEN` に足りないと vLLM は起動時に即エラーで落ちる**ので、
 失敗は早くて分かりやすい。
 
-| `MAX_MODEL_LEN` | 必要 KV | `--kv-cache-memory-bytes` | 重み込みの総量 | 状況 |
-|---|---|---|---|---|
-| 65536 (64K) | 8.0GiB | `10737418240` (10GiB) | 88GiB | 実績あり |
-| **131072 (128K)** | **16.0GiB** | **`19327352832`** (18GiB) | **96GiB** | **この repo の既定** |
-| 262144 (256K) | 32.0GiB | `36507222016` (34GiB) | 112GiB | 現実的に入らない |
+メモリ収支は「KV 18GiB のとき host `used` が 111GiB」→ **KV 以外が 93GiB**
+(重み 78GiB + ランタイム 15GiB)。unified memory は 121GiB なので
+**KV に回せるのは実質 18〜20GiB**。
 
-ノードの unified memory は 119GiB、重みが 1 台あたり 78GiB。256K は KV だけで 32GiB
-必要になるので、活性化メモリを足すと収まらない。**`MAX_MODEL_LEN` を変えたら
-`VLLM_EXTRA_ARGS` の `--kv-cache-memory-bytes` も必ず一緒に動かすこと。**
+| コンテキスト | 必要 KV | 判定 |
+|---|---|---|
+| 128K | 8.2GiB | 余裕 |
+| 256K | 16.5GiB | 入る (現行の 18GiB のまま) |
+| 512K | 32.9GiB | **入らない** (合計 126GiB) |
+| 1M | 65.9GiB | **論外** |
 
-256K 以上を狙うなら KV そのものを削るしかない。1M コンテキストを dual Spark で
-回したという報告はあるが、そちらは `--kv-cache-dtype nvfp4_ds_mla` (FP8 の半分) を
-使っている。このイメージで通るかは未検証で、ダメなら起動時に
-`Invalid value for kv-cache-dtype` で即落ちるので試すコストは低い。
+つまり **plain fp8 のままでは 256K が実用上の上限**。512K 以上を狙うなら
+`--kv-cache-dtype fp8_ds_mla` で KV そのものを削るしかない
+(→ [`presets/1m-ds-mla.env`](presets/1m-ds-mla.env))。
 
 ### その他のチューニング
 
