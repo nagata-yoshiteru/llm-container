@@ -287,8 +287,14 @@ r = client.chat.completions.create(
 )
 ```
 
-thinking は `reasoning_content` に入る (`--reasoning-parser deepseek_v4` を
-渡しているため)。外すと `content` が null になってクライアントが壊れる。
+**thinking は `reasoning` フィールドに入る。** `reasoning_content` ではないので注意
+(多くの OpenAI 互換クライアントは `reasoning_content` を見にいくため、thinking が
+表示されないことがある)。`--reasoning-parser deepseek_v4` を外すと thinking が
+`content` 側に混ざるので、外さないこと。
+
+```python
+r.choices[0].message.reasoning    # <- ここ
+```
 
 ### Anthropic 互換 (`/v1/messages`) — Claude Code から使う
 
@@ -320,8 +326,26 @@ curl -s http://127.0.0.1:8910/v1/messages \
 
 ### reasoning effort
 
-0731 は `low` / `high` / `max` の 3 段階を持つ。high / max は出力が
-長くなるので `max_tokens` を大きめに。
+0731 は `low` / `high` / `max` の 3 段階を持つ。**未指定だと thinking は一切出ない**
+(即答モード)。推論させたいときだけ明示的に渡す。
+
+```python
+client.chat.completions.create(..., reasoning_effort="high")
+```
+
+**thinking がトークン予算の 8 割前後を食う。** 実測:
+
+| タスク | effort | 出力 | thinking | 本文 |
+|---|---|---:|---:|---:|
+| Rust 実装 | high | 16,384 (上限で打ち切り) | 30,037 chars (78%) | 8,433 chars |
+| 数学の導出 | max | 13,367 (自然終了) | 26,514 chars (87%) | 3,795 chars |
+
+長い成果物が欲しいなら `max_tokens` を **32K 以上**にしないと本文が途中で切れる。
+上の Rust 実装は 16K では足りずに関数の途中で打ち切られた。
+
+**thinking の言語は入力言語に追随しない。** 日本語で聞いても thinking は中国語や
+英語で出る (本文は日本語で返る)。またコード中のコメントも中国語になることが
+あるので、コメント言語を指定したいならプロンプトで明示すること。
 
 ### 状態を見る
 
@@ -347,50 +371,59 @@ sudo docker compose --env-file .env --env-file presets/256k.env --profile head u
 **worker 側も同じ組み合わせで起動すること。** 詳しい根拠と差分表は
 [`presets/README.md`](presets/README.md)。
 
-| プリセット | コンテキスト | KV | 確保スロット | 状態 |
-|---|---|---|---|---|
-| (既定 / `128k.env`) | 131,072 | 18GiB | 286,458 (2.19x) | **実績あり** |
-| `256k.env` | 262,144 | 18GiB | 539,285 (2.06x) | **実績あり** (250K 入力で検証) |
-| `1m.env` | 1,048,576 | 18GiB | 約 206 万 (外挿) | 未検証。計算上は入る |
-| `1m-ds-mla.env` | 1,048,576 | 24GiB | ? | `1m.env` が KV 不足で落ちたとき用 |
+| プリセット | コンテキスト | KV | 確保スロット | 実効上限 | 状態 |
+|---|---|---|---|---|---|
+| (既定 / `128k.env`) | 131,072 | 18GiB | 286,458 (2.19x) | 131,072 | **実績あり** |
+| `256k.env` | 262,144 | 18GiB | 539,285 (2.06x) | 262,144 | **実績あり** |
+| `1m.env` | 1,048,576 | 18GiB | 970,424 (**0.93x**) | **約 970K** | **実績あり** (900K 入力で検証) |
+| `1m-ds-mla.env` | 1,048,576 | 24GiB | ? | ? | 未検証 |
 
-**KV の確保量はどれも 18GiB (1m-ds-mla を除く) = メモリ使用量は同じ。**
-コンテキストを伸ばしてもメモリは増えない。
+**KV の確保量はどれも 18GiB = メモリ使用量は同じ。** コンテキストを伸ばしても
+KV は増えない。ただし `1m.env` は `kv_cache_max_concurrency` が 0.93 で、
+`MAX_MODEL_LEN` いっぱい (1,048,576) のリクエストは KV に入らない。実効上限は約 970K。
 
-### 実測スループット (256K 構成)
+### 実測スループット
 
-DSpark k=7 / `MAX_NUM_SEQS=1` / prefix caching なし。
+| 入力 | TTFT | prefill | decode |
+|---:|---:|---:|---:|
+| 3,922 | 2.0s | 1,938 t/s | 40.5 t/s |
+| 15,958 | 9.7s | 1,646 t/s | 62.1 t/s |
+| 63,984 | 35.4s | 1,808 t/s | 47.8 t/s |
+| 131,008 | 72.7s | 1,802 t/s | 60.4 t/s |
+| 249,952 | 149.6s | 1,670 t/s | 49.3 t/s |
+| 499,994 | 372.0s | 1,344 t/s | 65.5 t/s |
+| 900,014 | 874.1s | 1,030 t/s | 55.5 t/s |
 
-| 入力 | TTFT | prefill | decode | 合計 |
-|---:|---:|---:|---:|---:|
-| 3,922 | 2.07s | 1,891 t/s | 48.7 t/s | 4.0s |
-| 15,958 | 7.55s | 2,114 t/s | 50.0 t/s | 9.6s |
-| 63,984 | 31.4s | 2,040 t/s | 49.6 t/s | 34.0s |
-| 131,008 | 68.1s | 1,924 t/s | 57.1 t/s | 70.3s |
-| 199,920 | 110.9s | 1,802 t/s | 44.5 t/s | 113.5s |
-| 249,952 | 145.1s | 1,723 t/s | 59.1 t/s | 147.1s |
+**decode はコンテキスト長でほぼ劣化しない** (4K で 40.5、900K でも 55.5 t/s)。
+一方 **prefill は 900K で半減する**ので、支配的なのは TTFT。
+128K で約 1 分、250K で約 2 分半、500K で約 6 分、900K で **約 15 分**。
+長尺を投げるならクライアントのタイムアウトを必ず伸ばすこと。
 
-**decode がコンテキスト長でほとんど劣化しない** (4K で 48.7、250K でも 59.1 t/s)。
-prefill も 250K まで 15% しか落ちない。`MemAvailable` は 250K 入力時で最小 6.7GiB。
+### 上限を決めているのは KV ではなくメモリ
 
-### KV サイズは「B/token 一定」ではない
+`MemAvailable` の最小値は 250K 入力で 6.7GiB、**900K 入力で 1.9GiB**。
+KV は固定サイズなので増えないが、prefill 中の活性化メモリはコンテキスト長に
+比例して増える。**ここが実質的な天井**で、KV を増やして真の 1M にしようとすると
+長尺で OOM-kill される。
 
-確保できるスロット数は `MAX_MODEL_LEN` によって変わる。同じ 18GiB でも
-128K 指定なら 286,458 スロット、256K 指定なら 539,285 スロット取れる。
-c4a (1/4) / c128a (1/128) 圧縮のおかげで **長いほど 1 トークンが安くなる**ので、
-線形に外挿すると大きく外す。
+GB10 の UVM は解放が遅く、900K を 1 発投げたあと `MemAvailable` は 2GiB 程度
+までしか戻らなかった。長尺の連投は未検証。
+
+### KV サイズは「B/token 一定」ではない — 外挿してはいけない
+
+同じ 18GiB でも `MAX_MODEL_LEN` によって確保スロット数が変わる。
+c4a (1/4) / c128a (1/128) 圧縮のおかげで長いほど 1 トークンが安くなるが、
+効きには頭打ちがあり、線形でもべき乗でもない。実際に 128K/256K の 2 点から
+1M を外挿して 2 倍以上外した。
+
+**唯一の判断基準は `kv_cache_max_concurrency >= 1.0`。** 起動したら必ず確認する:
 
 ```bash
-# 実測はこれで読む
 curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' \
-  | grep -E 'kv_cache_(memory_bytes|size_tokens)|block_size'
+  | grep -E 'kv_cache_max_concurrency|kv_cache_size_tokens'
 ```
 
-**KV プールが `MAX_MODEL_LEN` に足りないと vLLM は起動時に即エラーで落ちる**ので、
-失敗は早くて分かりやすい。実際に効いてくる制約は KV よりも prefill の活性化メモリ。
-
-詳しい見積もり方、`--block-size` の影響、`fp8_ds_mla` への切り替えは
-[`presets/README.md`](presets/README.md) に。
+詳細は [`presets/README.md`](presets/README.md) に。
 
 ### その他のチューニング
 
