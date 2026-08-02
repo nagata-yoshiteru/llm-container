@@ -269,26 +269,100 @@ ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose --profile work
 
 ---
 
+## 使う
+
+`network_mode: host` なので、head に届くアドレスならどれでも叩ける
+(通常 LAN / tailscale / QSFP)。認証はしていないが、多くのクライアントが
+空でないキーを要求するので適当な文字列を渡す。
+
+### OpenAI 互換 (`/v1/chat/completions`)
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://<head>:8910/v1", api_key="local")
+r = client.chat.completions.create(
+    model="deepseek-v4-flash",
+    messages=[{"role": "user", "content": "..."}],
+    temperature=1.0, top_p=0.95,     # agent 用途。それ以外は top_p=1.0
+)
+```
+
+thinking は `reasoning_content` に入る (`--reasoning-parser deepseek_v4` を
+渡しているため)。外すと `content` が null になってクライアントが壊れる。
+
+### Anthropic 互換 (`/v1/messages`) — Claude Code から使う
+
+vLLM は Anthropic Messages API も生やすので、**変換プロキシなしで Claude Code を
+直結できる**。
+
+```bash
+curl -s http://127.0.0.1:8910/v1/messages \
+  -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+`~/.claude/settings.json` の `env` を向ける (この repo の
+`scripts/local-llm-on.sh` / `local-llm-off.sh` が設定ファイルを差し替える):
+
+```jsonc
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8910",
+    "ANTHROPIC_AUTH_TOKEN": "local",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "deepseek-v4-flash",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "deepseek-v4-flash"
+  }
+}
+```
+
+`SERVED_MODEL_NAME` を変えたら 3 つのモデル名も揃えること。
+
+### reasoning effort
+
+0731 は `low` / `high` / `max` の 3 段階を持つ。high / max は出力が
+長くなるので `max_tokens` を大きめに。
+
+### 状態を見る
+
+```bash
+curl -s http://127.0.0.1:8910/metrics | grep -E '^vllm:(kv_cache_usage_perc|num_requests)'
+sudo docker logs -f dsv4-head
+```
+
+---
+
 ## コンテキスト長とメモリ
 
 `MAX_MODEL_LEN` がコンテキスト長 (1 リクエストあたりのトークン上限)。
 モデル自体は 1,048,576 まで対応しているが、実際には KV キャッシュのメモリで頭打ちになる。
 
-KV の実測レートは **約 53KB/token** (上流 bjk110 の報告: 10GiB = 201,624 token)。
-`MAX_NUM_SEQS=1` なら必要な KV はほぼ `MAX_MODEL_LEN x 53KB` で見積もれる。
+KV のレートは **この構成の実測で約 128KiB/token**。起動中のサーバの `/metrics` から読める:
 
-| `MAX_MODEL_LEN` | 必要 KV | `--kv-cache-memory-bytes` | 状況 |
-|---|---|---|---|
-| 65536 (64K) | 3.3GiB | `4294967296` | 上流の常用構成 |
-| 131072 (128K) | 6.5GiB | `8589934592` | 上流が単発で通している線 |
-| **262144 (256K)** | **13.0GiB** | **`15032385536`** | **この repo の既定** |
-| 524288 (512K) | 26.0GiB | `28991029248` | 重み込みで 105GiB 超。未検証 |
+```bash
+curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' | grep -E 'kv_cache_(memory_bytes|size_tokens)'
+#   kv_cache_memory_bytes="10737418240"   (10GiB)
+#   kv_cache_size_tokens="82130"          -> 130,737 B/token
+```
 
-`MAX_MODEL_LEN` を変えたら `.env` の `VLLM_EXTRA_ARGS` の中の
-`--kv-cache-memory-bytes` も一緒に動かすこと。OOM-kill されたら 131072 + 8GiB まで下げる。
+`MAX_NUM_SEQS=1` なら必要な KV はほぼ `MAX_MODEL_LEN x 128KiB`。
+**KV プールが `MAX_MODEL_LEN` に足りないと vLLM は起動時に即エラーで落ちる**ので、
+失敗は早くて分かりやすい。
 
-なお 1M コンテキストを dual Spark で回したという報告もあるが、そちらは KV dtype が
-`nvfp4_ds_mla` だったり別のイメージだったりするので、この構成のまま伸ばせる保証はない。
+| `MAX_MODEL_LEN` | 必要 KV | `--kv-cache-memory-bytes` | 重み込みの総量 | 状況 |
+|---|---|---|---|---|
+| 65536 (64K) | 8.0GiB | `10737418240` (10GiB) | 88GiB | 実績あり |
+| **131072 (128K)** | **16.0GiB** | **`19327352832`** (18GiB) | **96GiB** | **この repo の既定** |
+| 262144 (256K) | 32.0GiB | `36507222016` (34GiB) | 112GiB | 現実的に入らない |
+
+ノードの unified memory は 119GiB、重みが 1 台あたり 78GiB。256K は KV だけで 32GiB
+必要になるので、活性化メモリを足すと収まらない。**`MAX_MODEL_LEN` を変えたら
+`VLLM_EXTRA_ARGS` の `--kv-cache-memory-bytes` も必ず一緒に動かすこと。**
+
+256K 以上を狙うなら KV そのものを削るしかない。1M コンテキストを dual Spark で
+回したという報告はあるが、そちらは `--kv-cache-dtype nvfp4_ds_mla` (FP8 の半分) を
+使っている。このイメージで通るかは未検証で、ダメなら起動時に
+`Invalid value for kv-cache-dtype` で即落ちるので試すコストは低い。
 
 ### その他のチューニング
 
