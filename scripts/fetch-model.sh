@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 # =============================================================================
-# DeepSeek-V4-Flash-0731 の重みを取得する (約 167GB / safetensors 48 shard)。
+# MiniMax-M3 NVFP4 の重みを取得する (約 250GB / safetensors 88 shard)。
 #
-# 2 台とも「同じ絶対パス」に落とす必要がある。head 側で実行したあと、
-# worker 側でも同じコマンドを実行すること (rsync でコピーしてもよい)。
+# 3 台とも「同じ絶対パス」に落とす必要がある。head 側で実行したあと、
+# 残り 2 台でも同じコマンドを実行すること (rsync でコピーしてもよい)。
 #
 #   ./scripts/fetch-model.sh
+#
+# 既定は NVIDIA 公式の nvidia/MiniMax-M3-NVFP4。NGC の vLLM (upstream) は
+# indexer を qkv に畳む fused 実装なので、`self_attn.index_k_proj` 命名の
+# こちらでないと `Shard id for QKVParallelLinear ... got shard id index_k` で落ちる。
+#
+# tonyd2wild の chthonic fork イメージに載せ替えるなら luke 版 (非 fused):
+#   REPO_ID=lukealonso/MiniMax-M3-NVFP4 ./scripts/fetch-model.sh ./models/MiniMax-M3-NVFP4-luke
 #
 # rootless / rootful どちらの docker とも無関係。sudo は不要。
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-REPO_ID="${REPO_ID:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+REPO_ID="${REPO_ID:-nvidia/MiniMax-M3-NVFP4}"
 
 # 保存先は .env の MODEL_PATH に合わせる (第 1 引数で上書き可)。
 DEST="${1:-${MODEL_PATH:-}}"
 if [ -z "${DEST}" ] && [ -f .env ]; then
     DEST=$(sed -n 's/^MODEL_PATH=//p' .env | tail -1)
 fi
-DEST="${DEST:-./models/DeepSeek-V4-Flash-0731}"
+DEST="${DEST:-./models/MiniMax-M3-NVFP4}"
 
 if ! command -v hf >/dev/null 2>&1; then
     echo "huggingface_hub CLI (hf) が見つかりません。以下でインストールしてください:" >&2
@@ -27,9 +34,10 @@ if ! command -v hf >/dev/null 2>&1; then
     exit 1
 fi
 
+mkdir -p "$(dirname "${DEST}")"
 AVAIL_KB=$(df -Pk "$(dirname "${DEST}")" | awk 'NR==2 {print $4}')
-if [ "${AVAIL_KB}" -lt $((200 * 1024 * 1024)) ]; then
-    echo "WARN: $(dirname "${DEST}") の空きが 200GB 未満です ($((AVAIL_KB / 1024 / 1024)) GB)" >&2
+if [ "${AVAIL_KB}" -lt $((300 * 1024 * 1024)) ]; then
+    echo "WARN: $(dirname "${DEST}") の空きが 300GB 未満です ($((AVAIL_KB / 1024 / 1024)) GB)" >&2
 fi
 
 mkdir -p "${DEST}"
@@ -43,5 +51,8 @@ hf download "${REPO_ID}" --local-dir "${DEST}" --max-workers 8
 echo
 echo "==> 取得結果"
 du -sh "${DEST}"
-ls "${DEST}"/model-*.safetensors 2>/dev/null | wc -l | xargs echo "safetensors shards:"
-echo "(48 shard / 約 167GB になっていれば OK)"
+N=$(ls "${DEST}"/*.safetensors 2>/dev/null | wc -l)
+echo "safetensors shards: ${N}"
+if [ "${REPO_ID}" = "nvidia/MiniMax-M3-NVFP4" ]; then
+    echo "(88 shard / 約 250GB になっていれば OK)"
+fi

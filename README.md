@@ -1,245 +1,159 @@
-# DeepSeek-V4-Flash-0731 on 2x DGX Spark
+# MiniMax-M3 (NVFP4) on 3x DGX Spark
 
-[deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
-(304B MoE / FP8+FP4 / 167GB) を DGX Spark 2 台に **TP=2** で分割して、
-OpenAI 互換 API を `:8910` に生やす構成。
+[nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4)
+(428B MoE / A23B / NVFP4 / 250GB) を DGX Spark 3 台に **PP=3** で分割して、
+OpenAI 互換 / Anthropic 互換 API を `:8910` に生やす構成。
 
-- 分散バックエンドは **Ray ではなく `mp`** (torch.distributed SPMD)。head/worker が
-  それぞれ `vllm serve` を `--nnodes/--node-rank/--master-addr` 付きで起動する。
-- ノード間の NCCL は 200GbE QSFP 直結リンクの **RoCEv2 (RDMA)**。
-- **native DSpark speculative decoding (k=7)** を使う。0731 が同梱している draft
-  モジュールで、蒸留なしで速度を出している本体。
+| | |
+|---|---|
+| コンテキスト | 256K (既定) / 最大 512K |
+| decode | 約 10 tok/s |
+| イメージ | vLLM 公式 nightly (linux-arm64) を digest 固定 |
+| 分散 | Ray / PP=3 / TP=1 |
 
-| | head | worker |
-|---|---|---|
-| 役割 | rank 0 / API `:8910` | rank 1 / `--headless` |
-| NIC | QSFP 直結の `enp1s0f0np0` | 同左 |
-| HCA | ケーブルが刺さっている側 (既定 `rocep1s0f0`, GID index 3 = RoCEv2/IPv4) | 同左 |
+前構成 (DeepSeek-V4-Flash / 2 台 / 51 tok/s) は
+`DGX-Spark-2/deepseek-ai/DeepSeek-V4-Flash-0731` ブランチにある。
+**速度が要る仕事はそちらの方が速い。** M3 は品質と引き換え。
 
-IP・ホスト名・パスはすべて `.env` に書く。`.env` は git 管理外。
-以下の手順では worker を 2 通りの経路で呼ぶ。
+## 構成の要点
 
-```bash
-WORKER=<worker の RoCE IP>       # QSFP 直結側。.env の WORKER_ROCE_IP と同じ値
-WORKER_MGMT=<worker の管理用 IP> # 普通の Ethernet / tailscale 側
-```
+- **TP=3 は使えない。** M3 は `num_key_value_heads=4` で、vLLM は kv_heads と TP の
+  どちらかがもう一方で割り切れることを要求する。PP=3 なら 60 layer / 3 = 20 で割れる。
+- **重みはイメージと組で選ぶ。** M3 の MSA indexer には実装が 2 系統あり、重みの命名が
+  割れている。upstream vLLM は fused 実装なので `self_attn.index_k_proj` 命名の
+  nvidia 版が正しい。
+- **NGC (`nvcr.io/nvidia/vllm`) は使えない。** 最新の 26.07-py3 でも中身が 2026-06-17 で、
+  M3 の PP 対応 (2026-06-24) に届かない。26.08 が出たら乗り換え候補。
+- **投機デコードは使えない。** MTP の重みが nvidia 版に無く、EAGLE3 は draft に
+  target の PP がそのままコピーされるため 1 層の draft に PP=3 が課されて落ちる。
 
-**QSFP 側の設定をいじるときは必ず `$WORKER_MGMT` 経由で SSH すること。**
-`$WORKER` でログインしたまま MTU やアドレスを変えると自分の足を撃つ。
+**SSH は必ず管理 NIC 側の IP を使うこと。** QSFP 側のアドレスでログインしたまま
+MTU やアドレスを変えると自分の足を撃つ。
 
 ---
 
 ## Docker は rootful を使う
 
-この構成は `--device /dev/infiniband` / `memlock unlimited` / host network での RDMA が
-必要なので、**rootless では動かない**。この repo の docker コマンドは全部 `sudo` を付ける。
+`--device /dev/infiniband` / `memlock unlimited` / host network での RDMA が必要なので
+**rootless では動かない**。この repo の docker コマンドは全部 `sudo` を付ける。
+
+`sudo docker compose` はカレントディレクトリの `.env` を読む。sudo で `HOME=/root` に
+なるため **`.env` の中でシェル変数は使えない**。`MODEL_PATH` は repo 相対か絶対パスで。
+
+### nvidia ランタイムの登録 (最初に 1 回 / 3 台とも)
+
+rootless 側に登録してあっても rootful 側 (`/etc/docker/daemon.json`) には効かない。
+未登録だと `RuntimeError: Failed to infer device type` で即死する。
 
 ```bash
-docker  ...        # rootless (このホストのデフォルト) -- 使わない
-sudo docker ...    # rootful  -- こっちを使う
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+ssh -t "$N1" 'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker'
+ssh -t "$N2" 'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker'
+
+sudo docker info | grep -i runtimes    # nvidia が出るまで先に進まない
 ```
 
-`sudo docker compose` はカレントディレクトリの `.env` をそのまま読む。ただし
-**`.env` の中で `${HOME}` などのシェル変数は使えない** (sudo で `HOME=/root` になるため)。
-`MODEL_PATH` は repo 相対 (`./models/...`) か絶対パスで書くこと。
-
-### rootful daemon に nvidia ランタイムを登録する (最初に 1 回)
-
-rootless 側 (`~/.config/docker/daemon.json`) に nvidia ランタイムが登録してあっても、
-**rootful 側 (`/etc/docker/daemon.json`) には効かない**。未登録のまま起動すると
-コンテナ内で NVML が初期化できず、vLLM が起動直後に
-`RuntimeError: Failed to infer device type` で死ぬ。
-
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-ssh -t "$WORKER_MGMT" 'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker'
-```
-
-確認 (**これが通るまで vLLM を起動しない**):
-
-```bash
-sudo docker info | grep -i runtimes          # nvidia が出ること
-
-IMAGE=$(sed -n 's/^VLLM_IMAGE=//p' .env)
-sudo docker run --rm --gpus all \
-  --device /dev/nvidia0 --device /dev/nvidiactl \
-  --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools \
-  "$IMAGE" nvidia-smi                        # GB10 が出ること
-```
-
-`systemctl restart docker` は rootful 側のコンテナを止めるので、先に
-`sudo docker compose --profile head down` などで片付けておくこと。
-
-#### `--device` を明示している理由
-
-`/etc/nvidia-container-runtime/config.toml` に **`no-cgroups = true`** が入っていると、
-`--gpus all` だけでは GPU が使えない。これは rootless docker で GPU を使うための
-必須設定だが、rootful では nvidia-container-cli が **device cgroup の許可リストを
-更新しなくなる**ため、コンテナ内にデバイスノードは現れるのにアクセスが弾かれ、
-`Failed to initialize NVML` → `Failed to infer device type` で落ちる。
-
-`no-cgroups = false` にすると今度は rootless 側の GPU が壊れるので、設定は触らず
-**デバイスノードを明示的に渡して cgroup を通す**。compose の `devices:` に入れてある。
-
-それでもダメな場合は `docker-compose.yml` の `x-vllm-service` に
-`privileged: true` を足す (device cgroup ごとバイパスされる)。上流の
-tonyd2wild のレシピも `--privileged` を使っている。
+compose が `/dev/nvidia*` を明示的に渡しているのは、`no-cgroups=true`
+(rootless で GPU を使うのに必須) だと rootful で device cgroup に弾かれるため。
+それでもダメなら `x-vllm-service` に `privileged: true` を足す。
 
 ---
 
 ## セットアップ
 
-### 0. repo と .env を 2 台に配る
+### 0. repo と .env を 3 台に配る
 
 ```bash
 cp .env.example .env
-$EDITOR .env      # HEAD_ROCE_IP / WORKER_ROCE_IP / MODEL_PATH を自分の環境に合わせる
+$EDITOR .env      # NODE{0,1,2}_MGMT_IP / NCCL_IB_ADDR_RANGE / MODEL_PATH を実機に合わせる
 
-# worker へ同期 (2 台とも .env の中身は同じでよい。役割は --profile で切り替える)
-rsync -av --exclude .git --exclude models --exclude vllm-cache ./ "$WORKER:~/repos/llm-container/"
+for H in "$N1" "$N2"; do
+  rsync -av --exclude .git --exclude models --exclude vllm-cache ./ "$H:~/repos/llm-container/"
+done
 ```
 
-`HEAD_ROCE_IP` / `WORKER_ROCE_IP` / `IB_HCA_NAME` / `NCCL_IB_GID_INDEX` は実機で確認する:
+3 台とも `.env` の中身は同じでよい。役割は `--profile` で切り替える。
+
+### 1. ケーブル (3 本 / 三角メッシュ)
+
+各ノードが両ポートを使い、ケーブル 3 本で三角形を作る。スイッチは要らない。
+Spark は 1 ポートにつき 2 本の "twin" インターフェースを見せるので、
+`ip -br addr show` では 4 本が up になっているのが正常。
+
+**各ノードで f0 が向いている隣人が違う**ため、NCCL の既定の「同 index の NIC 同士を
+ペア」では未接続のサブネットにダイヤルする。`NCCL_CROSS_NIC=1` が必須なのはこのため。
+
+配線しなおす場合は `/etc/netplan/40-cx7.yaml` を編集して `sudo netplan try`
+(`apply` ではなく `try`。疎通が切れても 120 秒で戻る)。
+
+### 2. MTU を 9000 に上げる (4 本すべて / 3 台とも)
+
+1500 のままだと RoCE の path MTU が 1024 に落ちる。9000 にすると 4096 まで上がる。
+**電源を落とすたびに 1500 に戻る**ので再起動後は確認すること。
 
 ```bash
-ip -br addr show enp1s0f0np0     # QSFP 側の IPv4
-show_gids                        # その IPv4 が載っている行の DEV 名 と INDEX (RoCE v2 の方)
+for I in enp1s0f0np0 enP2p1s0f0np0 enp1s0f1np1 enP2p1s0f1np1; do
+  sudo ip link set dev "$I" mtu 9000
+done
+ibv_devinfo -d rocep1s0f0 | grep active_mtu    # 4096 (5) になること
 ```
 
-NVIDIA の connect-two-sparks は link-local (169.254.x.x) を振るので、
-**再起動で IP が変わることがある**。`scripts/preflight.sh` が検出する。
-
-### 1. 重みを取得 (2 台とも / 各 167GB, 48 shard)
+### 3. 重みを取得 (3 台とも / 各 250GB, 88 shard)
 
 ```bash
-./scripts/fetch-model.sh                                       # head
-ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh'
+./scripts/fetch-model.sh
+ssh "$N1" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh'
+ssh "$N2" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh'
 ```
 
-保存先は `.env` の `MODEL_PATH`。`hf` が無ければ `pip install -U 'huggingface_hub[cli,hf_transfer]'`。
+### 4. イメージをビルド (3 台とも) — rootful
 
-### 2. イメージを取得 (2 台とも / 約 14GB) — **rootful**
-
-digest 固定。vLLM 0.25.0 / linux-arm64 / sm_121 ネイティブビルド。
+[`Dockerfile`](Dockerfile) が公式 nightly に ray と NCCL 2.30.7 を足す。
+NCCL 2.30.7 は 3 ノードメッシュに要る subnet-aware routing の対応版で、
+2.30.7 未満ならビルド時に止まる。
 
 ```bash
+sudo docker compose --profile head build
+
 IMAGE=$(sed -n 's/^VLLM_IMAGE=//p' .env)
-sudo docker pull "$IMAGE"
-ssh -t "$WORKER" "cd ~/repos/llm-container && sudo docker pull \$(sed -n 's/^VLLM_IMAGE=//p' .env)"
+sudo docker save "$IMAGE" | ssh "$N1" 'sudo docker load'
+sudo docker save "$IMAGE" | ssh "$N2" 'sudo docker load'
 ```
 
-> **必ず起動前に pull しておくこと。** 片方が pull 中に rendezvous が始まるとハンドシェイクごと固まる。
+ビルドログ末尾に `BAKED_NCCL_VERSION 23007 (2.30.7)` が出れば OK。
 
-### 3. メモリを空ける (2 台とも)
+> **起動前に 3 台とも用意しておくこと。** 1 台が build 中に rendezvous が始まると固まる。
 
-重みが 1 台あたり約 78GiB + KV 20GiB。121GB の unified memory に対してギリギリなので、
-**起動前に他のワークロードを止める**。GB10 の UVM は一度確保されると完全には返らないので、
-迷ったら再起動が一番確実。
+### 5. メモリを空けて preflight
 
 ```bash
-docker ps                                    # rootless 側で動いているものを確認
-docker stats --no-stream                     # どれがメモリを食っているか
-docker stop <他のコンテナ>
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
-sudo sysctl -w vm.swappiness=10
+./scripts/preflight.sh                                         # 3 台とも
 ```
 
-`MemAvailable` が 105GB 以上あれば OK。
-
-### 4. MTU を 9000 に上げる (任意だが推奨 / 一度やれば済む)
-
-QSFP の Ethernet MTU が既定の 1500 だと、**RoCE の path MTU が 1024 に落ちる**。
-9000 に上げると HCA の上限である 4096 まで上がり、NCCL の 1 転送あたりの
-パケット数が 1/4 になる。上流も MTU を 9000 にして運用している。
-
-```bash
-ip -d link show enp1s0f0np0 | grep -o 'maxmtu [0-9]*'   # 9978 くらいあるはず
-ibv_devinfo -d rocep1s0f0 | grep -E 'active_mtu|max_mtu'
-#   max_mtu: 4096 / active_mtu: 1024  <- この active_mtu を 4096 にしたい
-```
-
-> **vLLM を止めてからやること。** NCCL は初期化時に path MTU を読むので、
-> 動作中に変えると中途半端な状態になる。
-> また **SSH は `$WORKER_MGMT` 経由で**。QSFP 側から入っていると接続が切れる。
-
-**(a) まず一時変更で試す** (再起動で元に戻る)。片側だけ 9000 の間は大きいパケットが
-落ちるので、間を空けずに両方やる。
-
-```bash
-sudo ip link set dev enp1s0f0np0 mtu 9000
-ssh -t "$WORKER_MGMT" 'sudo ip link set dev enp1s0f0np0 mtu 9000'
-```
-
-**(b) 効いたか確認**
-
-```bash
-ip -br link show enp1s0f0np0
-ibv_devinfo -d rocep1s0f0 | grep active_mtu     # 4096 (5) になっていること
-ping -M do -s 8972 -c 3 "$WORKER"               # 8972 = 9000 - 28、フラグメント禁止で通ること
-```
-
-`active_mtu: 4096 (5)` になって ping が通れば成功。
-
-**(c) 永続化** — QSFP は netplan + NetworkManager が管理していて、
-NVIDIA の connect-two-sparks が置いた `/etc/netplan/40-cx7.yaml` が本体。
-
-```bash
-sudo netplan get                        # 現状確認
-sudo $EDITOR /etc/netplan/40-cx7.yaml
-```
-
-`enp1s0f0np0:` のブロックに `mtu: 9000` を 1 行足す。
-
-```yaml
-network:
-  version: 2
-  renderer: NetworkManager
-  ethernets:
-    enp1s0f0np0:
-      dhcp4: no
-      link-local: [ipv4]
-      mtu: 9000          # <- これを追加
-```
-
-適用は `apply` ではなく **`try`** を使う。設定をミスって疎通が切れても 120 秒で自動的に戻る。
-
-```bash
-sudo netplan try        # 問題なければ Enter で確定、放置すれば revert
-```
-
-worker 側も同じ編集をして、(b) の確認をもう一度。
-
-**再起動後は必ず確認すること。** netplan の適用が外れると 1500 に戻る。
-`scripts/preflight.sh` が MTU を WARN で出すので、そこで気付ける。
-
-### 5. preflight
-
-```bash
-./scripts/preflight.sh                                         # head
-ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/preflight.sh'
-```
-
-NG が出ている状態で起動しても、5〜10 分待たされてから NCCL エラーか OOM-kill で死ぬだけ。
+NG が出た状態で起動しても、数分待たされた挙句 NCCL エラーか OOM-kill で死ぬだけ。
 
 ---
 
 ## 起動
 
-**worker を先に、head を後に。** head が rendezvous の master になるので、worker が先に
-待ち受けている状態にしてから head を上げる。
+**worker を先に、head を最後に。**
 
 ```bash
-# --- worker ---
-ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose --profile worker up -d'
-
-# --- head ---
+ssh -t "$N2" 'cd ~/repos/llm-container && sudo docker compose --profile worker2 up -d'
+ssh -t "$N1" 'cd ~/repos/llm-container && sudo docker compose --profile worker1 up -d'
 sudo docker compose --profile head up -d
-sudo docker logs -f dsv4-head
+sudo docker logs -f m3-head
 ```
 
-初回は Triton / DeepGEMM の JIT が走るので **15〜20 分**かかる。2 回目以降は
-`vllm-cache/` が効いて 7〜9 分程度。`Application startup complete` が出れば完了。
+重みロードに 8〜10 分、初期化を含めて 12〜15 分ほど。
+`Application startup complete` が出れば完了。
+
+コンテキスト長を変えるときは [`presets/`](presets/) を重ねる (3 台とも同じ組み合わせで)。
+
+```bash
+sudo docker compose --env-file .env --env-file presets/128k.env --profile head up -d
+```
 
 ### 確認
 
@@ -247,181 +161,97 @@ sudo docker logs -f dsv4-head
 curl -s http://127.0.0.1:8910/health
 curl -s http://127.0.0.1:8910/v1/models | python3 -m json.tool
 
-curl -s http://127.0.0.1:8910/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-v4-flash",
-       "messages":[{"role":"user","content":"クイックソートを Rust で書いて"}],
-       "temperature":1.0,"top_p":0.95,"max_tokens":512}'
+# KV が足りているか。1.0 を下回っていたら設定を見直す
+curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' \
+  | grep -E 'kv_cache_max_concurrency|kv_cache_size_tokens'
 ```
 
-> **コールドスタート後の最初の 1 発はタイムアウトすることがある。** 新しい prompt shape に
-> 対する JIT / MoE エキスパートのウォームアップで、異常ではない。そのまま投げ直せば通る。
+> **コールドスタート後の 1 発目は TTFT が 40 秒ほどかかる。** Triton の JIT と
+> autotune が走るためで異常ではない。2 回目以降は 1 秒台。
 
 ### 停止
 
 ```bash
 sudo docker compose --profile head down
-ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose --profile worker down'
+ssh -t "$N1" 'cd ~/repos/llm-container && sudo docker compose --profile worker1 down'
+ssh -t "$N2" 'cd ~/repos/llm-container && sudo docker compose --profile worker2 down'
 ```
 
-コンテナを落としても UVM は完全には解放されない。別の構成に切り替えるときは
-**両ノードを再起動してから**始めること。
+UVM は完全には解放されない。構成を変えるときは 3 台とも再起動してから。
 
 ---
 
 ## 使う
 
-`network_mode: host` なので、head に届くアドレスならどれでも叩ける
-(通常 LAN / tailscale / QSFP)。認証はしていないが、多くのクライアントが
-空でないキーを要求するので適当な文字列を渡す。
-
-### OpenAI 互換 (`/v1/chat/completions`)
+`network_mode: host` なので head に届くアドレスならどれでも叩ける。認証はしていないが、
+多くのクライアントが空でないキーを要求するので適当な文字列を渡す。
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://<head>:8910/v1", api_key="local")
 r = client.chat.completions.create(
-    model="deepseek-v4-flash",
+    model="minimax-m3",
     messages=[{"role": "user", "content": "..."}],
-    temperature=1.0, top_p=0.95,     # agent 用途。それ以外は top_p=1.0
+    temperature=1.0, top_p=0.95, top_k=40,   # MiniMax 推奨値
 )
+r.choices[0].message.reasoning               # thinking はここ
 ```
 
-**thinking は `reasoning` フィールドに入る。** `reasoning_content` ではないので注意
-(多くの OpenAI 互換クライアントは `reasoning_content` を見にいくため、thinking が
-表示されないことがある)。`--reasoning-parser deepseek_v4` を外すと thinking が
-`content` 側に混ざるので、外さないこと。
+**thinking がトークン予算を食う。** `max_tokens` は成果物の数倍を見ること。
+実測で 4,096 トークンすべてを thinking に使い切って本文 0 文字になった例がある。
 
-```python
-r.choices[0].message.reasoning    # <- ここ
-```
+### Claude Code から使う
 
-### Anthropic 互換 (`/v1/messages`) — Claude Code から使う
-
-vLLM は Anthropic Messages API も生やすので、**変換プロキシなしで Claude Code を
-直結できる**。
-
-```bash
-curl -s http://127.0.0.1:8910/v1/messages \
-  -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
-  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
-```
-
-`~/.claude/settings.json` の `env` を向ける (この repo の
-`scripts/local-llm-on.sh` / `local-llm-off.sh` が設定ファイルを差し替える):
+vLLM が Anthropic Messages API も生やすので、変換プロキシなしで直結できる。
+`~/.claude/settings.json` の `env` を向ける
+([`scripts/local-llm-on.sh`](scripts/local-llm-on.sh) が差し替える)。
 
 ```jsonc
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8910",
     "ANTHROPIC_AUTH_TOKEN": "local",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "deepseek-v4-flash",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-flash",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "deepseek-v4-flash"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "minimax-m3",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "minimax-m3",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "minimax-m3"
   }
 }
 ```
 
-`SERVED_MODEL_NAME` を変えたら 3 つのモデル名も揃えること。
-
-### reasoning effort
-
-`low` / `high` / `max` の 3 段階。**未指定だと thinking は一切出ない**(即答モード)。
-
-```python
-client.chat.completions.create(..., reasoning_effort="high")
-```
-
-**thinking がトークン予算の 7〜9 割を食う**ので、`max_tokens` は成果物の 4〜5 倍を
-見積もること。16K では Rust の実装が途中で切れた。また「数値検算を付けて」のように
-手計算を要求すると thinking が発散して、答えに到達していたのに本文 0 文字で
-24,576 トークンを使い切った例がある。検算はコードを書かせて実行する形にする。
-
-thinking の言語は入力言語に追随しない (日本語で聞いても中国語や英語で思考する)。
-生成コードのコメントも中国語になることがあるので、必要ならプロンプトで指定する。
-
-### ストリーミング時の注意
-
-reasoning から content へ切り替わるデルタは **両方のフィールドを同時に持つ**。
-片方だけ拾うともう片方が落ちる。
-
-```python
-rc, cc = delta.get("reasoning"), delta.get("content")
-if rc: reasoning.append(rc)
-if cc: content.append(cc)      # elif にすると本文の先頭が消える
-```
-
-### 状態を見る
-
-```bash
-curl -s http://127.0.0.1:8910/metrics | grep -E '^vllm:(kv_cache_usage_perc|num_requests)'
-sudo docker logs -f dsv4-head
-```
+> **ストリーミングでは thinking が分離されない。** 非ストリームなら
+> `reasoning` / `thinking` ブロックに正しく分かれるが、ストリーミングでは
+> リーズニングパーサが効かず `<mm:think>...</mm:think>` が本文に混ざる。
+> Claude Code は既定でストリーミングするので表示が汚れる。動作自体はする。
 
 ---
 
 ## コンテキスト長とメモリ
 
-`MAX_MODEL_LEN` がコンテキスト長。既定は **1M** (モデルの上限)。
-短くしたい場合は [`presets/`](presets/) のオーバーレイを重ねる:
+`GPU_MEMORY_UTILIZATION` は「予算 = util × MemTotal(119.63GiB)」を決めるだけで、
+増えるのは KV プールのみ。**decode 速度には効かない**(帯域律速のため)。
+上がるのは載せられるコンテキスト長・同時実行数・prefix cache の保持量。
 
-```bash
-sudo docker compose --env-file .env --env-file presets/256k.env --profile head up -d
-```
+head は API サーバと Ray head を抱えるぶん free が 104.66GiB しかなく、
+**0.875 が絶対の天井**。GB10 は UMA なので超過すると CUDA OOM では済まず、
+`exit 137` でノードごと落ちる。
 
-**worker 側も同じ組み合わせで起動すること。**
+KV サイズを固定したいなら `VLLM_KV_ARGS` に `--kv-cache-memory <bytes>` を足す
+(指定すると `GPU_MEMORY_UTILIZATION` は無視される)。util 由来だと起動時の
+空きメモリでブレる。
 
-| プリセット | コンテキスト | KV | max_concurrency | 特性 |
-|---|---|---|---|---|
-| `128k.env` | 131,072 | 18GiB | 2.19 | prefill の余白が最大 |
-| `256k.env` | 262,144 | 18GiB | 2.06 | **常用向け**。250K 入力でも残 6.7GiB |
-| (既定 / `1m.env`) | 1,048,576 | 20GiB | 1.69 | 900K 入力で残 1.9GiB |
+## 速度
 
-### 実測
+decode は 1 token ごとに active 23B 分の重み (NVFP4 で約 11.5GB) を読む帯域律速。
+GB10 の 273GB/s から**理論上限は約 24 tok/s**、実測 10 tok/s はその 4 割強。
+PP のノード間通信は 1 token あたり hidden state 12KB × 2 hop しか流れないので、
+**decode ではネットワークは律速ではない**。
 
-| 入力 | TTFT | prefill | decode |
-|---:|---:|---:|---:|
-| 15,958 | 9.7s | 1,646 t/s | 62.1 t/s |
-| 131,008 | 72.7s | 1,802 t/s | 60.4 t/s |
-| 249,952 | 149.6s | 1,670 t/s | 49.3 t/s |
-| 499,994 | 372.0s | 1,344 t/s | 65.5 t/s |
-| 900,014 | 874.1s | 1,030 t/s | 55.5 t/s |
+投機デコードが使えない以上、残っている手は限られる。
 
-**decode は 37.7〜65.5 t/s (18 計測の平均 51.4)** で、入力・出力の長さにほぼ依存
-しない。6 分半の連続生成でも劣化なし。一方 **prefill は 900K で半減する**ので、
-体感を決めるのは TTFT (128K で約 1 分、500K で約 6 分、900K で約 15 分)。
-
-### 天井は KV ではなく prefill の活性化メモリ
-
-`MemAvailable` の最小値は 250K 入力で 6.7GiB、900K 入力で **1.9GiB**。
-KV は固定サイズなので増えないが、prefill 中の活性化メモリは入力長に比例する。
-OOM-kill (exit 137) されたら `MAX_NUM_BATCHED_TOKENS` を下げるか `256k.env` に落とす。
-
-### KV サイズは計算で予測できない
-
-`kv_cache_size_tokens` は `MAX_MODEL_LEN` にも KV バイト数にも比例しない
-(圧縮の効き方が非線形)。**起動して `/metrics` を読むこと。**
-判断基準は `max_concurrency >= 1.0`。
-
-```bash
-curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' \
-  | grep -E 'kv_cache_max_concurrency|kv_cache_size_tokens'
-```
-
-根拠と外した予測の記録は [`presets/README.md`](presets/README.md) に。
-
-### その他のチューニング
-
-| 変数 | 既定 | メモ |
-|---|---|---|
-| `HOST_PORT` | 8910 | API のポート |
-| `MAX_NUM_SEQS` | 1 | 上げると同時実行できるが、KV を分け合うので実効コンテキストが減る |
-| `GPU_MEMORY_UTILIZATION` | 0.87 | unified memory なので上げすぎるとホストごと OOM |
-| `num_speculative_tokens` | 7 | DSpark の draft 長。効いていない感じなら 5 も試す価値あり |
-| `NCCL_DEBUG` | WARN | ハンドシェイクを追うときは `INFO` |
-
-`VLLM_EXTRA_ARGS` / `VLLM_PARSER_ARGS` は entrypoint が空白で分割するので、
-**JSON の中に空白を入れないこと**。
+- `MAX_NUM_BATCHED_TOKENS` を上げる (適用済み / 上流報告で +1.5 tok/s)
+- sm_121 ネイティブビルド ([eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker))。
+  現イメージは sm_120 SASS 止まり。効果は未確認
+- REAP で枝刈りした重み。active が減るぶん速いが品質とのトレードオフ
 
 ---
 
@@ -429,38 +259,33 @@ curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' 
 
 | 症状 | 原因と対処 |
 |---|---|
-| `RuntimeError: Failed to infer device type` / `Can't initialize NVML` / `No CUDA runtime is found` | ① rootful daemon に nvidia ランタイムが未登録 → `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`。② それでもダメなら `no-cgroups=true` で device cgroup に弾かれている → compose の `devices:` で `/dev/nvidia*` を渡す (対応済み)、最終手段は `privileged: true` (→ 「rootful daemon に nvidia ランタイムを登録する」) |
-| NCCL が `unhandled system error` / `ibv_reg_mr` で `Cannot allocate memory` | RDMA がコンテナに通っていない。`--device /dev/infiniband`・`memlock` 無制限・`network_mode: host`・`ipc: host` は compose に入っているので、まず **rootful で起動しているか**を疑う |
-| QP ハンドシェイクが `local GID ::` で死ぬ / rendezvous で固まる | Spark は RoCE ポートを 2 本見せるがケーブルは 1 本。刺さっていない側の GID index 3 は空。`show_gids` で IPv4 が QSFP 側のアドレスになっている行の DEV と INDEX を `.env` の `IB_HCA_NAME` / `NCCL_IB_GID_INDEX` に入れる |
-| 再起動したら疎通しなくなった | QSFP 側は link-local なので IP が変わることがある。`ip -br addr show enp1s0f0np0` を見て `.env` を更新 (preflight が検出する) |
-| worker が exit 137 | UMA の OOM-kill。他のワークロードを止めて再起動してからやり直す。`MAX_MODEL_LEN` と KV を下げるのも手 |
-| 速度が 5〜10 tok/s しか出ない | ネイティブ FP8 DeepGEMM 経路に乗っていない。起動ログに `scale_fmt=ue8m0` / DeepGEMM 有効の行が出ているか確認。`VLLM_USE_DEEP_GEMM_E8M0=1` は必須 |
-| 出力が文字化け・意味不明 | イメージやビルドを変えた後にコンパイルキャッシュが残っている。`sudo rm -rf vllm-cache/{vllm,triton,torchinductor}/*` して再起動 |
-| prefill が遅い | 2 台の driver / kernel / firmware バージョンが揃っているか。上流はここを揃えるだけで prefill +140% と報告している。あと MTU が 1500 のままなら 9000 に上げる (→ セットアップ 4.) |
-| `ping -M do -s 8972` が通らない | 片側の MTU が 1500 のまま。両ノードとも 9000 になっているか確認 (→ セットアップ 4.) |
-| `unknown reasoning parser` 等で起動しない | `.env` の `VLLM_PARSER_ARGS` を空にして素の起動をまず通す |
-| block size 関連のエラーで起動しない | `VLLM_EXTRA_ARGS` から `--block-size 256` を外す |
-
-ログ:
+| `No common block size for 128` | GB10 特有。MSA は block size 128 しか受けないが、full attention 側で既定選択される FlashInfer は 128 以上を sm_100 系でしか advertise しない。`--attention-backend TRITON_ATTN` で回避 (既定で入れてある) |
+| `Shard id for QKVParallelLinear ... got shard id index_k` | 重みとイメージの組み合わせ違い。upstream vLLM には `nvidia/MiniMax-M3-NVFP4` を使う。並列度をいじっても直らない |
+| `Pipeline parallelism is not supported for this model` | イメージの vLLM が古く M3 の PP 対応を含んでいない。NGC 26.07 が該当。投機デコードを有効にしたときも draft 側で同じエラーが出る |
+| `ibv_modify_qp err 110` / rendezvous で固まる | `.env` に `NCCL_IB_GID_INDEX` が残っている。3 台メッシュでは消すこと (preflight が検出) |
+| NCCL が 2.30.7 未満 | subnet-aware routing が無くメッシュでは必ず失敗する。起動ログの `[entrypoint] NCCL version:` を確認 |
+| Ray が rank0 を kill する (実 OOM ではない) | `RAY_memory_monitor_refresh_ms=0` が効いているか確認 |
+| 重みロード中に head だけ OOM | Ray の object store が既定で約 36GB/node を予約する。`RAY_OBJECT_STORE_MEMORY` を確認 |
+| `Failed to infer device type` / NVML 初期化失敗 | rootful daemon に nvidia ランタイムが未登録。または `no-cgroups=true` で device cgroup に弾かれている |
+| NCCL が `unhandled system error` / `ibv_reg_mr` 失敗 | RDMA がコンテナに通っていない。まず rootful で起動しているか疑う |
+| decode が極端に遅い (5 tok/s 未満) | RoCE に乗らず 1GbE を通っている。あるいは帯域が 12.8Gb/s で張り付いている。後者は **3 台とも電源ブリックを 60〜90 秒抜く**コールド電源断で戻る (ウォームリブートでは直らない) |
+| worker が exit 137 | UMA の OOM-kill。`MAX_NUM_BATCHED_TOKENS` を下げる |
+| `<tool_call>` や `<mm:think>` が本文に漏れる | 非ストリームなら `VLLM_PARSER_ARGS` を確認。ストリーミングでは既知の未対応 |
+| 出力が文字化け・意味不明 | イメージ変更後にコンパイルキャッシュが残っている。`sudo rm -rf vllm-cache/*/*` して再起動 |
 
 ```bash
-sudo docker logs -f dsv4-head
-ssh -t "$WORKER" 'sudo docker logs -f dsv4-worker'
+sudo docker logs -f m3-head
+ssh -t "$N1" 'sudo docker logs -f m3-worker1'
 ```
 
 ---
 
 ## 出典
 
-この構成は以下の実機レポートを組み合わせたもの。
-
-- [bjk110/spark_vllm_docker](https://github.com/bjk110/spark_vllm_docker) — 使っているイメージと、
-  native DSpark k=7 / 固定 FP8 KV という検証済みの組み合わせの出所
-- [tonyd2wild/deepseek-v4-flash-dgx-spark](https://github.com/tonyd2wild/deepseek-v4-flash-dgx-spark) —
-  dual Spark の RDMA / NCCL GID 周りと `mp` バックエンドでの 2 ノード TP
-- [DevelopersIO: DGX Spark 2 台で DeepSeek V4 Flash-DSpark を動かしてみた](https://dev.classmethod.jp/en/articles/dgx-spark-2node-deepseek-v4-flash-dspark/) —
-  QSFP ではなく Wi-Fi/Ethernet 側を掴んでしまう罠と、実測スループット
-- [vLLM Recipes: DeepSeek-V4-Flash](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash) — 公式推奨フラグ
-- [al-engr.com: DS4 dual Spark deploy](https://al-engr.com/ds4-dual-spark-deploy.html) — 128K での KV プール実測と失敗事例
-- [howtospark.com: DeepSeek V4 Flash DSpark dual Spark 1M](https://howtospark.com/recipes/deepseek-v4-flash-dspark-dual-spark-1m) — 1M コンテキストの構成
-- [Flowtivity: 1M context on two DGX Sparks](https://flowtivity.ai/blog/deepseek-v4-flash-1m-context-dual-dgx-spark/) — 1M での実測値
+- [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) — 重み
+- [vLLM recipes: MiniMax-M3](https://recipes.vllm.ai/MiniMaxAI/MiniMax-M3) — 公式の serve 設定
+- [NVIDIA/dgx-spark-playbooks](https://github.com/NVIDIA/dgx-spark-playbooks) — DGX Spark 公式 playbook
+- [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) —
+  3 ノードメッシュの配線・NCCL 変数、sm_121 ネイティブビルド
+- [tonyd2wild/Minimax-M3-NVFP-3x-DGX-Sparks-TP-3](https://github.com/tonyd2wild/Minimax-M3-NVFP-3x-DGX-Sparks-TP-3) —
+  Ray の OOM 修正、NCCL の subnet-aware routing、コールド電源断
