@@ -27,8 +27,26 @@ OpenAI 互換 / Anthropic 互換 API を `:8910` に生やす構成。
 - **投機デコードは使えない。** MTP の重みが nvidia 版に無く、EAGLE3 は draft に
   target の PP がそのままコピーされるため 1 層の draft に PP=3 が課されて落ちる。
 
-**SSH は必ず管理 NIC 側の IP を使うこと。** QSFP 側のアドレスでログインしたまま
+## ノードの役割
+
+3 台とも同じ repo と `.env` を置き、compose の `--profile` だけで役割を切り替える。
+`.env` の `NODE0_MGMT_IP` に指定した機体が head (rank0) になる。
+
+| | head | worker1 | worker2 |
+|---|---|---|---|
+| rank | 0 (Ray head / API `:8910`) | 1 | 2 |
+| profile | `head` | `worker1` | `worker2` |
+| コンテナ | `m3-head` | `m3-worker1` | `m3-worker2` |
+| `.env` の IP | `NODE0_MGMT_IP` | `NODE1_MGMT_IP` | `NODE2_MGMT_IP` |
+
+以降のコマンドは worker 2 台の管理 IP を `$N1` / `$N2` で参照する。
+**必ず管理 NIC 側 (10GbE) の IP を使うこと。** QSFP 側のアドレスでログインしたまま
 MTU やアドレスを変えると自分の足を撃つ。
+
+```bash
+N1=<worker1 の管理 IP>    # .env の NODE1_MGMT_IP と同じ
+N2=<worker2 の管理 IP>    # .env の NODE2_MGMT_IP と同じ
+```
 
 ---
 
