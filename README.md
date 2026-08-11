@@ -410,6 +410,55 @@ curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' 
 
 根拠と外した予測の記録は [`presets/README.md`](presets/README.md) に。
 
+### もっと速くしたい (anemll ランタイムへの差し替え)
+
+既定構成の decode は **37.7〜65.5 t/s (平均 51.4)**。一方、同じ 2 台構成で
+**71〜76 t/s** を出している報告があり、その差はチューニングではなく
+**ランタイムイメージの違い**。`presets/anemll-1m.env` がその構成。
+
+| | 既定 (`.env`) | `anemll-1m.env` |
+|---|---|---|
+| イメージ | `ghcr.io/bjk110/vllm-spark` (vLLM 0.25.0) | `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (0.25.2) |
+| KV | `fp8` 固定 20GiB | `nvfp4_ds_mla` (1 token あたりが半分以下) |
+| MoE | `marlin` | `flashinfer_b12x` |
+| DSpark | k=7 greedy | **k=5** probabilistic |
+| cudagraph | 固定 `[8]` | `--max-cudagraph-capture-size 36` |
+| scheduler | prefix caching 無効 / seqs=1 | prefix caching + chunked prefill + async / seqs=6 |
+
+**0731 では k=7 は正しくない。** drafter は 1 パスあたり 5 トークン
+(`dspark_block_size=5`) しか出さない。上流レシピでは k>5 は boot 拒否か
+生成時 crash になる。既定イメージは preview チェックポイント向けに k=7 で
+検証されたもので、0731 でそのまま動いてはいるが期待どおり効いている保証はない。
+
+```bash
+# 2 台ともイメージを pull してから
+sudo docker pull ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+
+# worker -> head の順に
+ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose \
+  --env-file .env --env-file presets/anemll-1m.env --profile worker up -d'
+sudo docker compose --env-file .env --env-file presets/anemll-1m.env --profile head up -d
+```
+
+**未検証プロファイル。** 既定構成は `.env` のまま残っているので、`--env-file` を
+外せば戻る。イメージを跨いだら `vllm-cache/{vllm,triton,torchinductor}` は消すこと。
+
+#### 速度が出ていないときに最初に見るもの
+
+decode が遅い原因は「step が遅い」ではなく **draft acceptance が低い**ことが多い。
+`tok/s = steps/s × 1 step あたりの採択トークン数` なので、acceptance が半分なら
+速度も半分になる。**出力品質は完璧なまま**なので、モデルが遅いように見える。
+
+```bash
+sudo docker logs dsv4-head 2>&1 | grep -iE 'acceptance|accepted throughput|drafted'
+```
+
+`Avg Draft acceptance rate` が 60% 前後なら健全、**25% 前後なら drafter が壊れている**。
+0731 + DSpark には「draft 側の shared expert (12 テンソル) を weight loader が
+黙って捨てる」既知のバグがあり、これを踏むと mean decode が 32.7 -> 55.4 t/s、
+acceptance が 25.7% -> 60.2% 変わる (上流実測)。ログは `logger.debug` なので
+既定の INFO では何も出ず、ロード成功として扱われる。
+
 ### その他のチューニング
 
 | 変数 | 既定 | メモ |
@@ -417,7 +466,7 @@ curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' 
 | `HOST_PORT` | 8910 | API のポート |
 | `MAX_NUM_SEQS` | 1 | 上げると同時実行できるが、KV を分け合うので実効コンテキストが減る |
 | `GPU_MEMORY_UTILIZATION` | 0.87 | unified memory なので上げすぎるとホストごと OOM |
-| `num_speculative_tokens` | 7 | DSpark の draft 長。効いていない感じなら 5 も試す価値あり |
+| `num_speculative_tokens` | 7 | DSpark の draft 長。**0731 の drafter は 1 パス 5 トークン**なので 5 が正しい。5 にするなら `cudagraph_capture_sizes` も `[8]` -> `[6]` (= 1+k) にすること |
 | `NCCL_DEBUG` | WARN | ハンドシェイクを追うときは `INFO` |
 
 `VLLM_EXTRA_ARGS` / `VLLM_PARSER_ARGS` は entrypoint が空白で分割するので、
@@ -464,3 +513,10 @@ ssh -t "$WORKER" 'sudo docker logs -f dsv4-worker'
 - [al-engr.com: DS4 dual Spark deploy](https://al-engr.com/ds4-dual-spark-deploy.html) — 128K での KV プール実測と失敗事例
 - [howtospark.com: DeepSeek V4 Flash DSpark dual Spark 1M](https://howtospark.com/recipes/deepseek-v4-flash-dspark-dual-spark-1m) — 1M コンテキストの構成
 - [Flowtivity: 1M context on two DGX Sparks](https://flowtivity.ai/blog/deepseek-v4-flash-1m-context-dual-dgx-spark/) — 1M での実測値
+- [MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark) —
+  `presets/anemll-1m.env` の出所。NVFP4 DS-MLA / b12x MoE / k=5 の serve 引数一式
+- [Anemll/dspark-vllm-gx10](https://github.com/Anemll/dspark-vllm-gx10) — GB10 向け vLLM 0.25.2 ポート
+- [tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark) —
+  k の上限 (`k<=5`)、DSpark shared-expert loader バグ (+69% decode)、ランタイム比較
+- [DevelopersIO: DGX Spark 2 台で DeepSeek V4 Flash-0731](https://dev.classmethod.jp/articles/dgx-spark-2node-deepseek-v4-flash-0731/) —
+  上記レシピ既定値での実測 (decode 71〜76 t/s / prefill 約 1,900 t/s)

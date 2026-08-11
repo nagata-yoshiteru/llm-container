@@ -33,11 +33,38 @@ unset_if_empty \
     VLLM_CACHE_ROOT \
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS \
     VLLM_USE_BREAKABLE_CUDAGRAPH \
+    VLLM_USE_DEEP_GEMM_E8M0 \
+    VLLM_MOE_USE_DEEP_GEMM \
+    VLLM_USE_B12X_MOE \
+    VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM \
+    VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M \
+    VLLM_USE_FLASHINFER_SAMPLER \
     FLASHINFER_CUDA_ARCH_LIST \
+    FLASHINFER_DISABLE_VERSION_CHECK \
+    FLASHINFER_WORKSPACE_BASE \
+    TILELANG_CLEANUP_TEMP_FILES \
+    DG_JIT_USE_NVRTC \
+    DG_JIT_NVCC_COMPILER \
+    CUTE_DSL_ARCH \
+    DSPARK_ENCODING_FILE \
     TORCH_CUDA_ARCH_LIST \
     NCCL_IGNORE_CPU_AFFINITY \
     NCCL_IB_GID_INDEX \
+    NCCL_NET \
+    NCCL_CROSS_NIC \
+    NCCL_CUMEM_ENABLE \
+    NCCL_IB_ADDR_FAMILY \
+    NCCL_IB_ROCE_VERSION_NUM \
     MAX_JOBS
+
+# ---------------------------------------------------------------------------
+# LD_LIBRARY_PATH はイメージ側の値を潰さないよう「前に足す」。
+# (bjk110 イメージでは HPC-X の NCCL RDMA plugin を pip 版 NCCL より先に見せる。
+#  anemll イメージでは /usr/local/cuda/lib64 だけを足す)
+# ---------------------------------------------------------------------------
+if [ -n "${VLLM_LD_LIBRARY_PATH_EXTRA:-}" ]; then
+    export LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH_EXTRA}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 
 : "${ROLE:?ROLE must be 'head' or 'worker'}"
 : "${MODEL_CONTAINER_PATH:?MODEL_CONTAINER_PATH must be set}"
@@ -76,6 +103,50 @@ if command -v ibv_devinfo >/dev/null 2>&1; then
         exit 1
     fi
     echo "[entrypoint] RDMA OK: ${IB_HCA_NAME} PORT_ACTIVE"
+fi
+
+# ---------------------------------------------------------------------------
+# 0731 同梱の encoding をランタイムに入れる (DSPARK_ENCODING_INSTALL=1 のときだけ)
+#
+# 0731 は chat template を同梱せず、`encoding/encoding_dsv4.py` が
+# メッセージ整形と reasoning_effort (low/high/max) の解釈を持っている。
+# チェックポイントより古いランタイムだと low が high に潰されるので、
+# encoder を上書きしたうえで wrapper の分岐も直す (どちらも best-effort)。
+# `--tokenizer-mode deepseek_v4` とセットで使うこと。
+# ---------------------------------------------------------------------------
+if [ "${DSPARK_ENCODING_INSTALL:-0}" = "1" ]; then
+    ENCODING_SRC="${DSPARK_ENCODING_FILE:-${MODEL_CONTAINER_PATH}/encoding/encoding_dsv4.py}"
+    VLLM_DIR="$(python3 -c 'import os,vllm;print(os.path.dirname(vllm.__file__))' 2>/dev/null || true)"
+    if [ -f "${ENCODING_SRC}" ] && [ -n "${VLLM_DIR}" ] && [ -d "${VLLM_DIR}/tokenizers" ]; then
+        cp "${ENCODING_SRC}" "${VLLM_DIR}/tokenizers/deepseek_v4_encoding.py"
+        echo "[entrypoint] encoding installed: ${ENCODING_SRC} -> ${VLLM_DIR}/tokenizers/deepseek_v4_encoding.py"
+        python3 - "${VLLM_DIR}" <<'PY' || echo "[entrypoint] WARN: reasoning_effort パッチはスキップ (パターン不一致)" >&2
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1]) / "tokenizers" / "deepseek_v4.py"
+old = ('elif reasoning_effort in ("max", "xhigh"):\n'
+       '                reasoning_effort = "max"\n'
+       '            else:\n'
+       '                reasoning_effort = "high"')
+new = ('elif reasoning_effort in ("max", "xhigh"):\n'
+       '                reasoning_effort = "max"\n'
+       '            elif reasoning_effort == "high":\n'
+       '                reasoning_effort = "high"\n'
+       '            else:\n'
+       '                reasoning_effort = "low"')
+s = p.read_text()
+if new in s:
+    print("[entrypoint] reasoning_effort パッチは適用済み")
+    raise SystemExit(0)
+if old not in s:
+    raise SystemExit(1)
+p.write_text(s.replace(old, new))
+print("[entrypoint] reasoning_effort パッチを適用した")
+PY
+    else
+        echo "[entrypoint] WARN: DSPARK_ENCODING_INSTALL=1 だが ${ENCODING_SRC} が無い。スキップする" >&2
+    fi
 fi
 
 # ---------------------------------------------------------------------------

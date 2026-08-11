@@ -50,17 +50,47 @@ x-vllm-env: &vllm-env
   NCCL_IGNORE_CPU_AFFINITY: ${NCCL_IGNORE_CPU_AFFINITY:-1}
   NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
   NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
-  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH:-/usr/lib/aarch64-linux-gnu/libnccl.so.2}
+  # `:-` ではなく `-` なのは、presets/ 側で「空にして無効化する」ためにわざと。
+  # (`:-` だと空文字も未設定扱いになって既定値に戻ってしまう)
+  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-/usr/lib/aarch64-linux-gnu/libnccl.so.2}
+  NCCL_NET: ${NCCL_NET:-}
+  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-}
+  NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-}
+  NCCL_IB_ADDR_FAMILY: ${NCCL_IB_ADDR_FAMILY:-}
+  NCCL_IB_ROCE_VERSION_NUM: ${NCCL_IB_ROCE_VERSION_NUM:-}
   # 初回の Triton/DeepGEMM JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
-  # HPC-X の NCCL RDMA plugin を pip 版 NCCL から見えるようにする
-  LD_LIBRARY_PATH: /opt/hpcx/nccl_rdma_sharp_plugin/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+  # HPC-X の NCCL RDMA plugin を pip 版 NCCL から見えるようにする。
+  # イメージ側の LD_LIBRARY_PATH を潰さないよう、entrypoint が「前に足す」。
+  # 別イメージ (anemll 等) に差し替えるときは presets/ で上書きする。
+  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/opt/hpcx/nccl_rdma_sharp_plugin/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64}
 
   # ---- SM121 数値契約 (チューニングではなく必須) ----
-  VLLM_USE_DEEP_GEMM_E8M0: ${VLLM_USE_DEEP_GEMM_E8M0:-1}
-  VLLM_MOE_USE_DEEP_GEMM: ${VLLM_MOE_USE_DEEP_GEMM:-0}
+  # 既定イメージ (bjk110 / DeepGEMM FP8 経路) 用。anemll イメージは b12x MoE を
+  # 使うので presets/anemll-1m.env が空にする (空文字は entrypoint が unset する)。
+  VLLM_USE_DEEP_GEMM_E8M0: ${VLLM_USE_DEEP_GEMM_E8M0-1}
+  VLLM_MOE_USE_DEEP_GEMM: ${VLLM_MOE_USE_DEEP_GEMM-0}
   FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST:-12.1}
   TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-12.1a}
+
+  # ---- b12x / NVFP4 DS-MLA (anemll イメージのときだけ値が入る) ----
+  # 既定イメージでは未登録の変数なので、空のまま渡すと vLLM が
+  # "Unknown vLLM environment variable" を出す。空文字は entrypoint が unset する。
+  VLLM_USE_B12X_MOE: ${VLLM_USE_B12X_MOE:-}
+  VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: ${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-}
+  VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: ${VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M:-}
+  VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-}
+  FLASHINFER_DISABLE_VERSION_CHECK: ${FLASHINFER_DISABLE_VERSION_CHECK:-}
+  FLASHINFER_WORKSPACE_BASE: ${FLASHINFER_WORKSPACE_BASE:-}
+  TILELANG_CLEANUP_TEMP_FILES: ${TILELANG_CLEANUP_TEMP_FILES:-}
+  DG_JIT_USE_NVRTC: ${DG_JIT_USE_NVRTC:-}
+  DG_JIT_NVCC_COMPILER: ${DG_JIT_NVCC_COMPILER:-}
+  # CuTeDSL の kernel コンパイル対象。VLLM_* ではないので warning は出ない。
+  # 未指定だと b12x が GB10 native ではない遅い W4A16 経路を JIT することがある。
+  CUTE_DSL_ARCH: ${CUTE_DSL_ARCH:-}
+  # 0731 同梱の encoding_dsv4.py をランタイムに入れる (=1 のときだけ)
+  DSPARK_ENCODING_INSTALL: ${DSPARK_ENCODING_INSTALL:-0}
+  DSPARK_ENCODING_FILE: ${DSPARK_ENCODING_FILE:-}
 
   # ---- ランタイム ----
   NVIDIA_VISIBLE_DEVICES: all
