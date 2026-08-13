@@ -168,3 +168,14 @@ services:
       ROLE: worker
       NODE_RANK: "1"
       VLLM_HOST_IP: ${WORKER_ROCE_IP}
+      # QSFP を直結ではなくリング配線している場合、head と worker で「相手を向いて
+      # いるポート」の名前が違う (例: head=enp1s0f0np0 / worker=enp1s0f1np1)。
+      # .env に WORKER_* を書けばここだけ差し替わる。未設定なら head と同じ値。
+      ROCE_IF_NAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      IB_HCA_NAME: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
+      NCCL_IB_HCA: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
+      NCCL_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      GLOO_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      TP_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      UCX_NET_DEVICES: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-${NCCL_IB_GID_INDEX:-3}}
