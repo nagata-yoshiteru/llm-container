@@ -326,7 +326,17 @@ curl -s http://127.0.0.1:8910/v1/messages \
 
 ### reasoning effort
 
-`low` / `high` / `max` の 3 段階。**未指定だと thinking は一切出ない**(即答モード)。
+`low` / `high` / `max` の 3 段階。既定構成では**未指定だと thinking は一切出ない**
+(即答モード)。
+
+**`anemll-1m.env` では既定が変わる。** `--default-chat-template-kwargs
+{"thinking":true,"reasoning_effort":"low"}` を渡しているので、
+**クライアントが何も指定しなければ thinking on / effort low** で走る。
+切るならリクエスト側で `chat_template_kwargs: {"thinking": false}` (リクエスト優先)。
+サーバ既定を変えるならこの引数を編集する。
+
+**on/off ははっきり効くが、low/high/max は思考量が単調には増えない。**
+effort を上げれば深く考える、という前提でトークン予算を組まないこと。
 
 ```python
 client.chat.completions.create(..., reasoning_effort="high")
@@ -440,8 +450,8 @@ ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose \
 sudo docker compose --env-file .env --env-file presets/anemll-1m.env --profile head up -d
 ```
 
-**未検証プロファイル。** 既定構成は `.env` のまま残っているので、`--env-file` を
-外せば戻る。イメージを跨いだら `vllm-cache/{vllm,triton,torchinductor}` は消すこと。
+既定構成は `.env` のまま残っているので、`--env-file` を外せば戻る。
+イメージを跨いだら `vllm-cache/{vllm,triton,torchinductor}` は消すこと。
 
 #### 速度が出ていないときに最初に見るもの
 
