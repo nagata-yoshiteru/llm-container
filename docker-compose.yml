@@ -1,40 +1,63 @@
+# =============================================================================
+# Qwen/Qwen3.8-27B-FP8 on NVIDIA DGX Spark (GB10 / SM121), 単体ノード
+#
+#   - モデルは公式 FP8 (Qwen/Qwen3.8-27B-FP8, fine-grained fp8 / block 128)。
+#     BF16 版 (Qwen/Qwen3.8-27B) だと 1M context + 同時実行はメモリ的に厳しい。
+#   - ネイティブ 262,144 を static YaRN (factor 4.0) で 1,000,000 token に延伸。
+#     静的な YaRN は「短いテキストの品質を少し落とす」ことがあるので、常に長文を
+#     使うわけでないなら factor 2.0 (=524K) にするか、--hf-overrides を外して
+#     262K に留める。変更はコマンドブロック内のコメントを参照。
+#   - 同時実行は --max-num-seqs 4。1M フル長が 4 本同時に入る KV 容量は GB10 単体では
+#     物理的に無理だが、通常サイズのリクエストは 4 本並列で捌ける (同時性の上限)。
+#     全層のうちフルアテンションは 16/64 層だけなので、1M でも KV は fp8 で ~32GB に収まる。
+#
+# rootful Docker (sudo) 前提:
+#   sudo 経由だと ${HOME} 等のシェル変数は root 側の値になるため使わない。
+#   キャッシュはすべてリポジトリ内の ./vllm-cache/ に相対パスで置く。
+#   初回は Qwen のリポジトリ (gated) から ~28GB を取ってくるので、事前に
+#   .env へ `HF_TOKEN=hf_...` を書いておくこと (compose が自動で読む)。
+# =============================================================================
+
 services:
-  qwen3-coder-next:
+  qwen3.8-27b:
     image: eugr/spark-vllm:latest
-    container_name: qwen3-coder-next
+    container_name: qwen3.8-27b
     restart: unless-stopped
 
     gpus: all
     ipc: host
-    # network_mode: host
-    # privileged: true
+    # 複数ノードにする場合のみ host network + /dev/infiniband 等が必要 (別ブランチ参照)
 
     ports:
       - "0.0.0.0:8910:8910"
 
-    # ulimits:
-    #   nofile:
-    #     soft: 1048576
-    #     hard: 1048576
-    #   memlock:
-    #     soft: -1
-    #     hard: -1
-    #   stack:
-    #     soft: 67108864
-    #     hard: 67108864
-
     volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
-      - ${HOME}/.cache/vllm/torchinductor:/cache/torchinductor
-      - ${HOME}/.cache/vllm/triton:/cache/triton
-      - ${HOME}/.cache/vllm/torch_extensions:/cache/torch_extensions
+      # モデル / JIT キャッシュをリポジトリ内に置く (sudo でも ./ 相対なら動く)
+      - ./vllm-cache/huggingface:/cache/huggingface
+      - ./vllm-cache/vllm:/root/.cache/vllm
+      - ./vllm-cache/triton:/root/.triton
+      - ./vllm-cache/torchinductor:/var/cache/torchinductor
 
     environment:
+      # Qwen は HF の gated repo。値を .env の HF_TOKEN=... に入れること。
       HF_TOKEN: ${HF_TOKEN:-}
-      VLLM_ATTENTION_BACKEND: FLASHINFER
-      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
-      TRITON_CACHE_DIR: /cache/triton
-      TORCH_EXTENSIONS_DIR: /cache/torch_extensions
+      HF_HOME: /cache/huggingface
+
+      VLLM_CACHE_ROOT: /root/.cache/vllm
+      TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
+
+      # 1M context: config の max_position_embeddings=262144 より大きくするので必須
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+
+      # ランタイム JIT (nvcc 並列) がコアを使い切って UMA を食い潰すのを防ぐ
+      MAX_JOBS: "4"
+
+      # GB10 は UMA なので超過すると OOM-kill で OS ごと巻き込む。断片化対策に有効。
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+      # 注意: VLLM_ATTENTION_BACKEND は明示指定しない。
+      # hybrid (linear attention + full attention) と M-RoPE は自動選択に任せ、
+      # 問題が出た時だけ FLASHINFER / TRITON_ATTN を試す。
 
     entrypoint: []
     command:
@@ -50,19 +73,24 @@ services:
         print("python vllm:", vllm.__version__)
         PY
 
-        exec vllm serve Qwen/Qwen3-Coder-Next-FP8 \
+        exec vllm serve Qwen/Qwen3.8-27B-FP8 \
           --host 0.0.0.0 \
           --port 8910 \
-          --served-model-name qwen3-coder-next \
-          --max-model-len 262144 \
+          --served-model-name qwen3.8-27b \
+          --max-model-len 1000000 \
+          --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144, "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}' \
           --gpu-memory-utilization 0.90 \
           --kv-cache-dtype fp8 \
           --max-num-seqs 4 \
           --max-num-batched-tokens 8192 \
+          --reasoning-parser qwen3 \
           --enable-auto-tool-choice \
           --tool-call-parser qwen3_coder \
-          --enable-prefix-caching
-          # 実験用: MTP 投機デコード (Qwen3-Next は重みに MTP ヘッドを含む)。
-          # GB10 では回帰する報告もあるので、外して速いか確認しつつ有効化する。
-          # --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
-
+          --enable-chunked-prefill \
+          --enable-prefix-caching \
+          --load-format safetensors \
+          --skip-mm-profiling
+          # --- 調整ポイント ---
+          # ・いつも長文でないなら YaRN を 524K に: factor 4.0 -> 2.0 (max-model-len は 524288 でも可)
+          # ・1M ではなく 262K ネイティブでいいなら --hf-overrides 行ごと削除。
+          # ・KV が足りず OOM したら --gpu-memory-utilization 0.85 に下げる。
