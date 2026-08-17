@@ -1,21 +1,22 @@
 # =============================================================================
 # Qwen/Qwen3.8-27B-FP8 on NVIDIA DGX Spark (GB10 / SM121), 単体ノード
 #
-#   - モデルは公式 FP8 (Qwen/Qwen3.8-27B-FP8, fine-grained fp8 / block 128)。
-#     BF16 版 (Qwen/Qwen3.8-27B) だと 1M context + 同時実行はメモリ的に厳しい。
-#   - ネイティブ 262,144 を static YaRN (factor 4.0) で 1,000,000 token に延伸。
-#     静的な YaRN は「短いテキストの品質を少し落とす」ことがあるので、常に長文を
-#     使うわけでないなら factor 2.0 (=524K) にするか、--hf-overrides を外して
-#     262K に留める。変更はコマンドブロック内のコメントを参照。
-#   - 同時実行は --max-num-seqs 4。1M フル長が 4 本同時に入る KV 容量は GB10 単体では
-#     物理的に無理だが、通常サイズのリクエストは 4 本並列で捌ける (同時性の上限)。
-#     全層のうちフルアテンションは 16/64 層だけなので、1M でも KV は fp8 で ~32GB に収まる。
+#   レシピ元: https://github.com/0xBakeer/Qwen3.8-27B-FP8-on-a-single-DGX-Spark
+#   DSpark 投機デコード (独立 5 層 drafter, 2.6GB) + prefix caching で
+#   シングルストリーム ~20-58 tok/s を実測 (重みは FP8 のまま、出力非破壊)。
 #
-# rootful Docker (sudo) 前提:
-#   sudo 経由だと ${HOME} 等のシェル変数は root 側の値になるため使わない。
-#   キャッシュはすべてリポジトリ内の ./vllm-cache/ に相対パスで置く。
-#   初回は Qwen のリポジトリ (gated) から ~28GB を取ってくるので、事前に
-#   .env へ `HF_TOKEN=hf_...` を書いておくこと (compose が自動で読む)。
+#   ・8bit (FP8) のまま。4bit は同時実行が増えると利得が消える (c1 +27% -> c8 +10%
+#     -> c16 0.2%) ので、このマシンでは FP8 で十分。
+#   ・max-model-len = 262144 (ネイティブ)。DSpark drafter はネイティブ構成前提で
+#     検証されており、1M (YaRN) と併用は未検証なため一旦 262K に。1M へ戻す手順は
+#     コマンドブロック内のコメント参照。
+#   ・k (num_speculative_tokens): 7 = スループット優先 (c8 aggregate 208.7 tok/s)。
+#     14 = 単ストリーム最速 58.5 tok/s (同時性は c8 で約半分に落ちる)。用途で切替。
+#
+# rootful Docker (sudo) 前提: ${HOME} 等のシェル変数は使わず、キャッシュは
+# ./vllm-cache/ に相対マウント。Qwen と drafter は gated の場合があるので
+# .env の HF_TOKEN=... を推奨。初回起動時に drafter
+# (Doopeworld/Qwen3.8-27B-DSpark-vLLM ~2.6GB) も HF から落としてくる。
 # =============================================================================
 
 services:
@@ -26,28 +27,24 @@ services:
 
     gpus: all
     ipc: host
-    # 複数ノードにする場合のみ host network + /dev/infiniband 等が必要 (別ブランチ参照)
 
     ports:
       - "0.0.0.0:8910:8910"
 
     volumes:
-      # モデル / JIT キャッシュをリポジトリ内に置く (sudo でも ./ 相対なら動く)
+      # モデル / drafter / JIT キャッシュ (sudo でも ./ 相対なら動く)
       - ./vllm-cache/huggingface:/cache/huggingface
       - ./vllm-cache/vllm:/root/.cache/vllm
       - ./vllm-cache/triton:/root/.triton
       - ./vllm-cache/torchinductor:/var/cache/torchinductor
 
     environment:
-      # Qwen は HF の gated repo。値を .env の HF_TOKEN=... に入れること。
+      # Qwen / Doopeworld とも gated の可能性あり。値を .env の HF_TOKEN=... に入れる。
       HF_TOKEN: ${HF_TOKEN:-}
       HF_HOME: /cache/huggingface
 
       VLLM_CACHE_ROOT: /root/.cache/vllm
       TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
-
-      # 1M context: config の max_position_embeddings=262144 より大きくするので必須
-      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
 
       # ランタイム JIT (nvcc 並列) がコアを使い切って UMA を食い潰すのを防ぐ
       MAX_JOBS: "4"
@@ -55,9 +52,7 @@ services:
       # GB10 は UMA なので超過すると OOM-kill で OS ごと巻き込む。断片化対策に有効。
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 
-      # 注意: VLLM_ATTENTION_BACKEND は明示指定しない。
-      # hybrid (linear attention + full attention) と M-RoPE は自動選択に任せ、
-      # 問題が出た時だけ FLASHINFER / TRITON_ATTN を試す。
+      # VLLM_ATTENTION_BACKEND は明示指定しない (hybrid + M-RoPE は自動選択に任せる)
 
     entrypoint: []
     command:
@@ -73,24 +68,30 @@ services:
         print("python vllm:", vllm.__version__)
         PY
 
+        # DSpark は第一候補: MTP より drafter コストが 3.3 倍安く、
+        # 編集/リファクタ系 (accept 98-99%) で特に効く。
         exec vllm serve Qwen/Qwen3.8-27B-FP8 \
           --host 0.0.0.0 \
           --port 8910 \
           --served-model-name qwen3.8-27b \
-          --max-model-len 1000000 \
-          --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144, "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}' \
-          --gpu-memory-utilization 0.90 \
-          --kv-cache-dtype fp8 \
-          --max-num-seqs 4 \
-          --max-num-batched-tokens 8192 \
-          --reasoning-parser qwen3 \
-          --enable-auto-tool-choice \
-          --tool-call-parser qwen3_coder \
-          --enable-chunked-prefill \
+          --max-model-len 262144 \
+          --gpu-memory-utilization 0.85 \
           --enable-prefix-caching \
-          --load-format safetensors \
-          --skip-mm-profiling
-          # --- 調整ポイント ---
-          # ・いつも長文でないなら YaRN を 524K に: factor 4.0 -> 2.0 (max-model-len は 524288 でも可)
-          # ・1M ではなく 262K ネイティブでいいなら --hf-overrides 行ごと削除。
-          # ・KV が足りず OOM したら --gpu-memory-utilization 0.85 に下げる。
+          --reasoning-parser qwen3 \
+          --tool-call-parser qwen3_xml \
+          --enable-auto-tool-choice \
+          --speculative-config '{"method":"dspark","model":"Doopeworld/Qwen3.8-27B-DSpark-vLLM","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+          # --- k (num_speculative_tokens) の切替 ---
+          # 7: スループット優先 (単純生成 20.05 / 編集系 46.8 / c8 集合 208.7)
+          # 14: 単ストリーム最速 58.5 (編集系)。ただし c8 では 119.7 に落ちる
+          #    -> 対話レイテンシ優先なら 7 を 14 に変える
+          # --- 1M context に戻したい場合 (速度でなく長文優先) ---
+          # DSpark drafter はネイティブ構成前提なので --speculative-config 行を外し、
+          # --max-model-len 1000000 に変更 + 以下を復活 (enabled 時 ~10 tok/s に戻る):
+          #   --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn",
+          #     "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0,
+          #     "original_max_position_embeddings": 262144, "mrope_interleaved": true,
+          #     "mrope_section": [11, 11, 10]}}}'
+          # さらに環境変数 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 も必要。
+          # --- もし method dspark がこのイメージに無くて起動失敗する場合 ---
+          # image を vllm/vllm-openai:v0.27.1-aarch64 (レシピ実測版) に差し替え。
