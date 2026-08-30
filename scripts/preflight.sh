@@ -112,11 +112,35 @@ fi
 echo
 echo "== メモリ =="
 AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
+SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo '?')
+
+# メモリ儀式 (README「起動前にやるメモリ儀式」): GB10 の NVRM は MemFree で
+# 割当を判定し page cache は強制 reclamation されない。swappiness が既定の
+# ままだと shard ロード中に UVM livelock / worker 死 (上流実測)。
+# 未設定なら自動で直す (sudo -n できない場合は手動コマンドを出す)。
+if [ "${SWAPPINESS}" != "0" ] || [ "${AVAIL_GB}" -lt 110 ]; then
+    if sudo -n true 2>/dev/null; then
+        warn "swappiness=${SWAPPINESS} / MemAvailable ${AVAIL_GB} GB — リセットを自動実行"
+        sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+        [ "${SWAPPINESS}" != "0" ] && sudo -n sysctl -w vm.swappiness=0
+    else
+        warn "swappiness=${SWAPPINESS} / MemAvailable ${AVAIL_GB} GB — リセットが要ります (sudo 非対話不可):"
+        echo "       sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' && sudo sysctl -w vm.swappiness=0"
+    fi
+fi
+
+# リセット後に実状態を再読み (自動実行できなくても嘘の PASS を出さない)
+AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
+SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo '?')
+if [ "${SWAPPINESS}" != "0" ]; then
+    ng "vm.swappiness=${SWAPPINESS} — swap livelock の危険。0 にしてから起動すること"
+fi
+
 # 重み 約 198GB / TP2 = 約 99GB + MTP head 約 4GB + KV + ランタイム
 if [ "${AVAIL_GB}" -ge 105 ]; then
     ok "MemAvailable ${AVAIL_GB} GB"
 elif [ "${AVAIL_GB}" -ge 95 ]; then
-    warn "MemAvailable ${AVAIL_GB} GB — ギリギリ。他のコンテナを止めて sync && drop_caches 推奨"
+    warn "MemAvailable ${AVAIL_GB} GB — ギリギリ。他のコンテナを止めて再実行"
 else
     ng "MemAvailable ${AVAIL_GB} GB — 足りません。他のコンテナを止めるか再起動してください"
 fi

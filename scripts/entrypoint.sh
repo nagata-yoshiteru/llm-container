@@ -110,7 +110,7 @@ VLLM_CMD=(
     --port "${HOST_PORT:-8910}"
     --max-model-len "${MAX_MODEL_LEN:-262144}"
     --max-num-seqs "${MAX_NUM_SEQS:-6}"
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.85}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.88}"
     --tensor-parallel-size "${TP_SIZE}"
     --distributed-executor-backend mp
     --nnodes "${NNODES}"

@@ -508,6 +508,9 @@ sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'   # 2 台とも
 sudo sysctl -w vm.swappiness=0                          # 2 台とも (再起動で消える)
 ```
 
+`./scripts/preflight.sh` は未設定を検出したら `sudo -n` が使えるときに
+自動で実行します (使えない場合は手動コマンドを提示)。
+
 drop_caches は重みロードで page cache が再充填されるので完全な解決ではないが、
 KV slab の割当競争に勝つ確率が上がる (上流も毎 boot 実行)。
 
