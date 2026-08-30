@@ -83,19 +83,36 @@ echo
 echo "== モデル =="
 if [ -d "${MODEL_PATH}" ]; then
     N=$(ls "${MODEL_PATH}"/model-*.safetensors 2>/dev/null | wc -l)
-    if [ "${N}" -eq 48 ]; then
-        ok "${MODEL_PATH} (48 shard, $(du -sh "${MODEL_PATH}" | cut -f1))"
+    if [ "${N}" -eq 10 ]; then
+        ok "${MODEL_PATH} (10 shard, $(du -sh "${MODEL_PATH}" | cut -f1))"
     else
-        ng "${MODEL_PATH} の shard 数が ${N} です (48 のはず) — scripts/fetch-model.sh を再実行"
+        ng "${MODEL_PATH} の shard 数が ${N} です (10 のはず) — scripts/fetch-model.sh を再実行"
     fi
+    [ -f "${MODEL_PATH}/model_mtp.safetensors" ] \
+        && ok "model_mtp.safetensors あり (MTP head)" \
+        || ng "model_mtp.safetensors がありません (MTP 用 draft head / 約 7.6GB)"
 else
     ng "${MODEL_PATH} がありません — ./scripts/fetch-model.sh"
+fi
+DRAFT_DIR=$(sed -n 's/^DRAFT_PATH=//p' .env | tail -1)
+if [ -n "${DRAFT_DIR}" ] && [ ! -f "${DRAFT_DIR}/config.json" ]; then
+    warn "${DRAFT_DIR} (DFlash2 drafter) が未取得 — presets/dflash2.env を使う場合だけ ./scripts/fetch-model.sh draft"
+fi
+
+echo
+echo "== SM121 kpool パッチ =="
+if [ -f patches/sparse_attn_indexer_kpool_sm121.py ] \
+   && grep -q 'multi_processor_count >= 78' patches/sparse_attn_indexer_kpool_sm121.py; then
+    ok "patches/sparse_attn_indexer_kpool_sm121.py (SM121 ゲート入り)"
+else
+    ng "patches/sparse_attn_indexer_kpool_sm121.py が無い、または SM121 ゲートがない"
+    echo "       ~24K トークン超の decode で engine が死ぬ (persistent_topk)"
 fi
 
 echo
 echo "== メモリ =="
 AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-# 重み 167GB / TP2 = 約 84GB + KV 10GiB + ランタイム
+# 重み 約 198GB / TP2 = 約 99GB + MTP head 約 4GB + KV + ランタイム
 if [ "${AVAIL_GB}" -ge 105 ]; then
     ok "MemAvailable ${AVAIL_GB} GB"
 elif [ "${AVAIL_GB}" -ge 95 ]; then

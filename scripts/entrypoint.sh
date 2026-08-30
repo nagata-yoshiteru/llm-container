@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# DeepSeek-V4-Flash-0731 / dual DGX Spark (GB10, SM121) entrypoint
+# GLM-5.3-Flash-NVFP4 / dual DGX Spark (GB10, SM121) entrypoint
 #
 # ROLE=head   -> vllm serve (rank 0, API サーバを持つ)
 # ROLE=worker -> vllm serve --headless (rank 1, API なし)
@@ -12,9 +12,10 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# compose は未設定の変数を `${VAR:-}` で「空文字がセットされた状態」で渡してくる。
-# vLLM / FlashInfer の一部パーサは「空文字」と「未設定」を区別して前者で落ちる
-# (例: FLASHINFER_CUDA_ARCH_LIST="" -> arch.split(".") で ValueError)。
+# compose は未設定の変数を `${VAR-}` で「空文字がセットされた状態」で渡してくる。
+# vLLM / NCCL / FlashInfer の一部パーサは「空文字」と「未設定」を区別して前者で
+# 落ちる (例: FLASHINFER_CUDA_ARCH_LIST="" -> arch.split(".") で ValueError)
+# また、VLLM_* の未知変数は vLLM が warning に出す。
 # なので空のものは明示的に unset する。
 # ---------------------------------------------------------------------------
 unset_if_empty() {
@@ -28,44 +29,17 @@ unset_if_empty() {
 
 unset_if_empty \
     VLLM_ATTENTION_BACKEND \
-    VLLM_ALLOW_LONG_MAX_MODEL_LEN \
-    VLLM_NCCL_SO_PATH \
-    VLLM_CACHE_ROOT \
-    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS \
-    VLLM_USE_BREAKABLE_CUDAGRAPH \
-    VLLM_USE_DEEP_GEMM_E8M0 \
-    VLLM_MOE_USE_DEEP_GEMM \
-    VLLM_USE_B12X_MOE \
-    VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM \
-    VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M \
-    VLLM_USE_FLASHINFER_SAMPLER \
-    FLASHINFER_CUDA_ARCH_LIST \
-    FLASHINFER_DISABLE_VERSION_CHECK \
-    FLASHINFER_WORKSPACE_BASE \
-    TILELANG_CLEANUP_TEMP_FILES \
-    DG_JIT_USE_NVRTC \
-    DG_JIT_NVCC_COMPILER \
-    CUTE_DSL_ARCH \
-    DSPARK_ENCODING_FILE \
-    TORCH_CUDA_ARCH_LIST \
+    NCCL_IB_ADDR_RANGE \
     NCCL_IGNORE_CPU_AFFINITY \
     NCCL_IB_GID_INDEX \
-    NCCL_NET \
-    NCCL_CROSS_NIC \
-    NCCL_CUMEM_ENABLE \
-    NCCL_IB_ADDR_FAMILY \
-    NCCL_IB_ROCE_VERSION_NUM \
-    MAX_JOBS
+    MAX_JOBS \
+    TORCH_CUDA_ARCH_LIST \
+    FLASHINFER_CUDA_ARCH_LIST \
+    MAX_NUM_BATCHED_TOKENS
 
 # ---------------------------------------------------------------------------
-# LD_LIBRARY_PATH はイメージ側の値を潰さないよう「前に足す」。
-# (bjk110 イメージでは HPC-X の NCCL RDMA plugin を pip 版 NCCL より先に見せる。
-#  anemll イメージでは /usr/local/cuda/lib64 だけを足す)
+# 起動必須変数のチェック
 # ---------------------------------------------------------------------------
-if [ -n "${VLLM_LD_LIBRARY_PATH_EXTRA:-}" ]; then
-    export LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH_EXTRA}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-fi
-
 : "${ROLE:?ROLE must be 'head' or 'worker'}"
 : "${MODEL_CONTAINER_PATH:?MODEL_CONTAINER_PATH must be set}"
 : "${SERVED_MODEL_NAME:?SERVED_MODEL_NAME must be set}"
@@ -93,6 +67,22 @@ echo "[entrypoint] rendezvous=${MASTER_ADDR}:${MASTER_PORT} iface=${ROCE_IF_NAME
 echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
 
 # ---------------------------------------------------------------------------
+# kpool top-k SM121 修正の bind-mount チェック (必須)
+#
+# イメージ標準の sparse_attn_indexer_kpool.py は persistent_topk カーネルを
+# SM 数 78 以上で使うが、GB10 (48 SM / 99KB smem) では ~24K トークン超の
+# decode で CTA が超過し RuntimeError -> EngineDeadError になる。
+# compose が patches/sparse_attn_indexer_kpool_sm121.py を上書き mount する
+# はずなので、ゲートが入っているか確認してない場合は落とす。
+# ---------------------------------------------------------------------------
+KPOOL_PY="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py"
+if [ -f "${KPOOL_PY}" ] && ! grep -q 'multi_processor_count >= 78' "${KPOOL_PY}"; then
+    echo "[entrypoint] ERROR: ${KPOOL_PY} に SM121 ゲートがありません。" >&2
+    echo "[entrypoint]   patches/sparse_attn_indexer_kpool_sm121.py の bind-mount を確認 (24K ctx 超の decode で engine が死ぬ)" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # RDMA プリフライト: HCA が見えていない状態で起動すると NCCL が
 # "unhandled system error" で数分後に死ぬので、先に落とす。
 # ---------------------------------------------------------------------------
@@ -106,54 +96,10 @@ if command -v ibv_devinfo >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 0731 同梱の encoding をランタイムに入れる (DSPARK_ENCODING_INSTALL=1 のときだけ)
-#
-# 0731 は chat template を同梱せず、`encoding/encoding_dsv4.py` が
-# メッセージ整形と reasoning_effort (low/high/max) の解釈を持っている。
-# チェックポイントより古いランタイムだと low が high に潰されるので、
-# encoder を上書きしたうえで wrapper の分岐も直す (どちらも best-effort)。
-# `--tokenizer-mode deepseek_v4` とセットで使うこと。
-# ---------------------------------------------------------------------------
-if [ "${DSPARK_ENCODING_INSTALL:-0}" = "1" ]; then
-    ENCODING_SRC="${DSPARK_ENCODING_FILE:-${MODEL_CONTAINER_PATH}/encoding/encoding_dsv4.py}"
-    VLLM_DIR="$(python3 -c 'import os,vllm;print(os.path.dirname(vllm.__file__))' 2>/dev/null || true)"
-    if [ -f "${ENCODING_SRC}" ] && [ -n "${VLLM_DIR}" ] && [ -d "${VLLM_DIR}/tokenizers" ]; then
-        cp "${ENCODING_SRC}" "${VLLM_DIR}/tokenizers/deepseek_v4_encoding.py"
-        echo "[entrypoint] encoding installed: ${ENCODING_SRC} -> ${VLLM_DIR}/tokenizers/deepseek_v4_encoding.py"
-        python3 - "${VLLM_DIR}" <<'PY' || echo "[entrypoint] WARN: reasoning_effort パッチはスキップ (パターン不一致)" >&2
-import sys
-from pathlib import Path
-
-p = Path(sys.argv[1]) / "tokenizers" / "deepseek_v4.py"
-old = ('elif reasoning_effort in ("max", "xhigh"):\n'
-       '                reasoning_effort = "max"\n'
-       '            else:\n'
-       '                reasoning_effort = "high"')
-new = ('elif reasoning_effort in ("max", "xhigh"):\n'
-       '                reasoning_effort = "max"\n'
-       '            elif reasoning_effort == "high":\n'
-       '                reasoning_effort = "high"\n'
-       '            else:\n'
-       '                reasoning_effort = "low"')
-s = p.read_text()
-if new in s:
-    print("[entrypoint] reasoning_effort パッチは適用済み")
-    raise SystemExit(0)
-if old not in s:
-    raise SystemExit(1)
-p.write_text(s.replace(old, new))
-print("[entrypoint] reasoning_effort パッチを適用した")
-PY
-    else
-        echo "[entrypoint] WARN: DSPARK_ENCODING_INSTALL=1 だが ${ENCODING_SRC} が無い。スキップする" >&2
-    fi
-fi
-
-# ---------------------------------------------------------------------------
 # vllm serve コマンド組み立て
 # ---------------------------------------------------------------------------
 # set -f: SERVED_MODEL_NAME に複数エイリアスを空白区切りで書けるようにしつつ、
-# cudagraph_capture_sizes の [8] などが glob 展開されるのを防ぐ。
+# speculative-config の JSON などが glob 展開されるのを防ぐ。
 set -f
 
 VLLM_CMD=(
@@ -163,9 +109,8 @@ VLLM_CMD=(
     --host 0.0.0.0
     --port "${HOST_PORT:-8910}"
     --max-model-len "${MAX_MODEL_LEN:-262144}"
-    --max-num-seqs "${MAX_NUM_SEQS:-1}"
-    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}"
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.87}"
+    --max-num-seqs "${MAX_NUM_SEQS:-6}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.85}"
     --tensor-parallel-size "${TP_SIZE}"
     --distributed-executor-backend mp
     --nnodes "${NNODES}"
@@ -174,14 +119,20 @@ VLLM_CMD=(
     --master-port "${MASTER_PORT}"
 )
 
+# 検証済みレシピは max-num-batched-tokens を渡さない (ハイブリッド
+# mamba/attention モデルで vLLM の既定が正しい)。設定されていれば渡す。
+if [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]; then
+    VLLM_CMD+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
+fi
+
 [ "${ROLE}" = "worker" ] && VLLM_CMD+=(--headless)
 
 # VLLM_*_ARGS は空白区切りで展開する。
-# JSON を渡す場合は値の内側に空白を入れないこと (例: {"method":"dspark"})。
+# JSON を渡す場合は値の内側に空白を入れないこと (例: {"method":"mtp"})。
 #
-#   VLLM_PARSER_ARGS : reasoning / tool-call パーサ。全構成で共通
-#   VLLM_KV_ARGS     : KV キャッシュ関連。コンテキスト長ごとに変わる (presets/)
-#   VLLM_EXTRA_ARGS  : その他。全構成で共通
+#   VLLM_PARSER_ARGS : reasoning / tool-call パーサ
+#   VLLM_KV_ARGS     : KV キャッシュ関連
+#   VLLM_EXTRA_ARGS  : その他
 for _args in "${VLLM_PARSER_ARGS:-}" "${VLLM_KV_ARGS:-}" "${VLLM_EXTRA_ARGS:-}"; do
     [ -n "${_args}" ] || continue
     # shellcheck disable=SC2206

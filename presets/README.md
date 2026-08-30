@@ -1,107 +1,79 @@
 # presets/
 
-コンテキスト長ごとの **差分だけ**を持つ `.env` オーバーレイ。
+`.env` への**差分だけ**を持つ `.env` オーバーレイ。
 `.env` (IP・パス入り / git 管理外) はそのままに、上書きしたいキーだけを重ねる。
 
 ```bash
-sudo docker compose --env-file .env --env-file presets/256k.env --profile head up -d
+sudo docker compose --env-file .env --env-file presets/dflash2.env --profile head up -d
 ```
 
 `docker compose` は `--env-file` を複数受け取り **後勝ち**。
 **worker 側も同じ組み合わせで起動すること** (片方だけ違うと rendezvous で死ぬ)。
 
-`.env.example` の既定は `1m.env` と同じ内容なので、1M で使うなら指定不要。
-
 ## 一覧
 
-| プリセット | コンテキスト | KV | slots | max_concurrency | 特性 |
-|---|---|---|---|---|---|
-| `128k.env` | 131,072 | 18GiB | 286,458 | 2.19 | prefill の余白が最大 |
-| `256k.env` | 262,144 | 18GiB | 539,285 | 2.06 | **常用向け**。250K 入力でも残 6.7GiB |
-| `1m.env` | 1,048,576 | 20GiB | 1,772,550 | 1.69 | 既定。900K 入力で残 1.9GiB |
-| `anemll-1m.env` | 1,048,576 | nvfp4_ds_mla | 未計測 | 未計測 | **イメージごと差し替え**。上流実測 decode 71〜76 t/s |
+| プリセット | 内容 | decode | 追加要件 |
+|---|---|---|---|
+| (無 / `.env` 既定) | v8 イメージ + MTP-4 + fp8 KV | 約 21.8 t/s | なし (MTP head は checkpoint 同梱) |
+| `dflash2.env` | v11-dflash2 イメージ + DFlash2 drafter + fp8 KV | 約 46.9 t/s (2.15x) | drafter の取得 (`fetch-model.sh draft`) / drafter は非商用ライセンス |
 
-`128k` / `256k` / `1m` の差分は 3 キーのみ
-(`MAX_MODEL_LEN` / `MAX_NUM_BATCHED_TOKENS` / `VLLM_KV_ARGS`)。
-`128k` と `256k` は `MAX_MODEL_LEN` の 1 行しか違わない。
+`dflash2.env` だけが**イメージごと差し替える**プロファイル。
+MTP と DFlash2 は speculative-config の method が違うだけで、他は共通
+(fp8 KV / block-size 2304 / enforce-eager / gmu 0.85)。
 
-`anemll-1m.env` だけは性質が違う。**`VLLM_IMAGE` ごと差し替える**プロファイルで、
-KV dtype (`nvfp4_ds_mla`)・MoE backend (`flashinfer_b12x`)・DSpark k=5 が
-既定イメージ (bjk110 / vLLM 0.25.0) には存在しない。イメージを差し替えずに
-これらのフラグだけ足しても起動しない。詳細はファイル先頭のコメントに書いた。
+## 速度の実測値 (上流 / 同一の 2x Spark ハードウェア)
 
-## ベンチ結果
+| 構成 | decode (C1) | 備考 |
+|---|---:|---|
+| bf16 KV / 非 speculative | 14.3 t/s | 参考値 |
+| fp8 KV + MTP-4 | 21.8 t/s | 既定構成 |
+| **fp8 KV + DFlash2** | **46.9 t/s** | acceptance 74.1% |
 
-TP=2 / DSpark k=7 / `MAX_NUM_SEQS=1` / prefix caching なし。
+DFlash2 は**出力が予測しやすいほど速い**。構造化出力 / ツール引数は
+acceptance ≈ 0.9、自由記述は ≈ 0.33 前後。agentic 用途は高速帯域に入る。
 
-### 入力長 vs 速度
+- `temperature: 0` が +13〜21% 高速 (greedy draft と相性がいい)
+- `chat_template_kwargs: {"enable_thinking": false}` が acceptance +8% だが、
+  その場合 thinking がタグなしで content に出るので**エージェント用途は
+  thinking on + `--reasoning-parser glm45` の組み合わせを推奨**
+- DFlash2 の drafter はテキスト専用。vision リクエストは動くが speculation されない
 
-| 入力 | TTFT | prefill | decode |
-|---:|---:|---:|---:|
-| 3,922 | 2.0s | 1,938 t/s | 40.5 t/s |
-| 15,958 | 9.7s | 1,646 t/s | 62.1 t/s |
-| 63,984 | 35.4s | 1,808 t/s | 47.8 t/s |
-| 131,008 | 72.7s | 1,802 t/s | 60.4 t/s |
-| 249,952 | 149.6s | 1,670 t/s | 49.3 t/s |
-| 499,994 | 372.0s | 1,344 t/s | 65.5 t/s |
-| 900,014 | 874.1s | 1,030 t/s | 55.5 t/s |
-
-### 出力長 vs 速度
-
-| 出力 | 所要 | decode |
-|---:|---:|---:|
-| 13,367 | 237s | 56.4 t/s |
-| 16,384 | 382s | 43.5 t/s |
-| 24,576 | 419s | 59.4 t/s |
-
-**decode は 37.7〜65.5 t/s (18 計測の平均 51.4)。入力・出力の長さでほぼ変わらない。**
-6 分半連続生成しても劣化なし。
-
-**支配的なのは TTFT。** prefill は 900K で半減する (2,000 → 1,030 t/s)。
-
-| 入力 | TTFT の目安 |
-|---|---|
-| 〜16K | 10 秒以内 |
-| 128K | 約 1 分 |
-| 250K | 約 2 分半 |
-| 500K | 約 6 分 |
-| 900K | 約 15 分 |
-
-長尺を投げるならクライアントのタイムアウトを伸ばすこと。
-コールドスタート直後の 1 発目だけ JIT で +8 秒ほど余計にかかる。
+出典: [tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark)
+(BENCH-C1-C6-DFLASH2.md / DFLASH2-SPECULATIVE-DECODING.md)
 
 ## 設定を変えるときの注意
 
-### KV サイズは計算で予測できない
+### KV サイズは固定しないこと
 
-`kv_cache_size_tokens` は `MAX_MODEL_LEN` にも KV バイト数にも比例しない。
-c4a (1/4) / c128a (1/128) 圧縮と 128 token sliding window の効き方が非線形なため。
-実際に 2 回とも外した:
+このモデル + GB10 では `--kv-cache-memory` を**大きな値に固定すると
+warmup で NVRM OOM** になる (上流が 6 回の boot で実証 / 4.14 GiB 固定は
+安定、5.5 GiB 以上は全滅)。理由は GB10 ドライバーが MemAvailable ではなく
+MemFree で割当を判定するため。
 
-- 128K/256K の 2 点から 1M を線形外挿 → 206 万と予測、実測 97 万 (2 倍過大)
-- 18GiB の実測から 20GiB を線形換算 → 108 万と予測、実測 177 万 (1.6 倍過少)
-
-**起動して `/metrics` を読むのが唯一確実。** 判断基準は `max_concurrency >= 1.0`
-(1.0 未満だと `MAX_MODEL_LEN` いっぱいのリクエストが KV に入らない)。
+既定構成は固定値を渡さず、**vLLM プロファイラの建議サイズをそのまま使う**。
+起動ログの `Available KV cache memory` を両 rank で確認し、
+`/metrics` の `kv_cache_max_concurrency >= 1.0` を満たすこと。
 
 ```bash
+sudo docker logs glm53-head 2>&1 | grep -E 'Available KV cache memory|GPU KV cache size'
 curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' \
   | grep -E 'kv_cache_max_concurrency|kv_cache_size_tokens'
 ```
 
-KV が足りなければ起動時に即エラーで落ちるので、試すコストは低い。
+### `--block-size 2304` は変更しない
 
-### 効いてくる制約は KV ではなく prefill の活性化メモリ
+kpool(4)×64=256 と MLA の 128 アラインの両方の倍数でなければならない
+(2304 = 256×9 = 128×18)。それ以外だと DeepGEMM assert で起動不能。
 
-`MemAvailable` の最小値は 250K 入力で 6.7GiB、900K 入力で 1.9GiB。
-KV は固定サイズなので増えないが、prefill 中の活性化メモリは入力長に比例する。
-**ここが天井。** OOM-kill (exit 137) されたら `MAX_NUM_BATCHED_TOKENS` を
-下げるか `256k.env` に落とす。
+### `--enforce-eager` は外さない
 
-GB10 の UVM は解放が遅く、900K を投げたあと `MemAvailable` は 2GiB 程度までしか
-戻らない。長尺の連投は未検証。
+CUDA graph capture はこのパスでは不可 (上流実測)。速度は speculation の
+acceptance で稼ぐ構成。
 
-### `--block-size 256` は外さない
+### DFlash2 を使う場合
 
-未指定 (block_size=4) だと KV の効率が半分になる (`MAX_MODEL_LEN=131072` で
-67,470 → 130,737 B/token)。vLLM 公式 recipe も DeepSeek-V4 に 256 を指定している。
+- drafter のライセンスは **CC-BY-NC-ND-4.0** (非商用・改変禁止)。
+- 初回リクエストで drafter 用カーネルの JIT が走る (cold C1 は約 10 t/s 低め)。
+- acceptance が 0.15 前後に落ちたら aux hidden state の捕捉が壊れている
+  可能性 (crash せずに黙って悪化する)。`/metrics` の
+  `spec_decode_num_accepted_tokens_total ÷ ..._num_draft_tokens_total` を見る。

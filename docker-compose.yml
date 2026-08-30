@@ -1,9 +1,15 @@
 # =============================================================================
-# DeepSeek-V4-Flash-0731 on 2x NVIDIA DGX Spark (GB10 / SM121)
+# RedHatAI/GLM-5.3-Flash-NVFP4 on 2x NVIDIA DGX Spark (GB10 / SM121)
 #
 #   TP=2 (1 GPU/node) / distributed-executor-backend = mp (Ray なし)
 #   NCCL は 200GbE QSFP の RoCEv2 (RDMA) 経由、bootstrap も同じ IF の TCP
-#   native DSpark speculative decoding (k=7)
+#   MTP-4 speculative decoding (checkpoint 同梱の MTP head) / fp8 KV
+#
+#   素の vLLM では GB10 で glm5_next が起動しない (NoPE MLA)。既定の
+#   VLLM_IMAGE (tonyd2wild sm121-v8) は day-0 公式イメージ + SM121 パッチ。
+#   さらに patches/sparse_attn_indexer_kpool_sm121.py を bind-mount しないと
+#   ~24K トークン超の decode で persistent_topk カーネルが engine を殺す
+#   (48 SM / 99KB smem で CTA が超過 → RuntimeError)。
 #
 # API は ${HOST_PORT} (既定 8910) に OpenAI 互換で生える。
 #
@@ -20,12 +26,13 @@ x-vllm-env: &vllm-env
   SERVED_MODEL_NAME: ${SERVED_MODEL_NAME}
   HOST_PORT: ${HOST_PORT:-8910}
   MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
-  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-1}
-  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
-  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.87}
-  VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
-  VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
-  VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
+  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-6}
+  # 空 = フラグを渡さない (検証済みレシピは明示指定しない / vLLM のハイブリッド既定を使う)
+  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS-}
+  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.85}
+  VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS-}
+  VLLM_KV_ARGS: ${VLLM_KV_ARGS-}
+  VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS-}
 
   # ---- トポロジ ----
   TP_SIZE: ${TP_SIZE:-2}
@@ -41,65 +48,39 @@ x-vllm-env: &vllm-env
   # 刺さっていない側の GID index 3 は空なので、必ずケーブル側の HCA に固定する。
   # (`show_gids` で「RoCE v2 かつ IPv4 が enp1s0f0np0 のアドレス」の index を確認)
   NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
+  NCCL_NET: ${NCCL_NET:-IB}
   NCCL_IB_HCA: ${IB_HCA_NAME}
   NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-3}
+  NCCL_IB_ROCE_VERSION_NUM: ${NCCL_IB_ROCE_VERSION_NUM:-2}
+  NCCL_IB_ADDR_FAMILY: ${NCCL_IB_ADDR_FAMILY:-AF_INET}
+  # RoCE サブネット固定で QSFP 以外の IF に NCCL が流れるのを防ぐ
+  NCCL_IB_ADDR_RANGE: ${NCCL_IB_ADDR_RANGE-}
   NCCL_SOCKET_IFNAME: ${ROCE_IF_NAME}
   GLOO_SOCKET_IFNAME: ${ROCE_IF_NAME}
   TP_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  UCX_NET_DEVICES: ${ROCE_IF_NAME}
+  MN_IF_NAME: ${ROCE_IF_NAME}
   NCCL_IGNORE_CPU_AFFINITY: ${NCCL_IGNORE_CPU_AFFINITY:-1}
   NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
+  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-0}
+  NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS:-0}
+  NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-0}
   NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
-  # `:-` ではなく `-` なのは、presets/ 側で「空にして無効化する」ためにわざと。
-  # (`:-` だと空文字も未設定扱いになって既定値に戻ってしまう)
-  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-/usr/lib/aarch64-linux-gnu/libnccl.so.2}
-  NCCL_NET: ${NCCL_NET:-}
-  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-}
-  NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-}
-  NCCL_IB_ADDR_FAMILY: ${NCCL_IB_ADDR_FAMILY:-}
-  NCCL_IB_ROCE_VERSION_NUM: ${NCCL_IB_ROCE_VERSION_NUM:-}
-  # 初回の Triton/DeepGEMM JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
+  # 初回の Triton/CuTeDSL JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
-  # HPC-X の NCCL RDMA plugin を pip 版 NCCL から見えるようにする。
-  # イメージ側の LD_LIBRARY_PATH を潰さないよう、entrypoint が「前に足す」。
-  # 別イメージ (anemll 等) に差し替えるときは presets/ で上書きする。
-  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/opt/hpcx/nccl_rdma_sharp_plugin/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64}
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
 
   # ---- SM121 数値契約 (チューニングではなく必須) ----
-  # 既定イメージ (bjk110 / DeepGEMM FP8 経路) 用。anemll イメージは b12x MoE を
-  # 使うので presets/anemll-1m.env が空にする (空文字は entrypoint が unset する)。
-  VLLM_USE_DEEP_GEMM_E8M0: ${VLLM_USE_DEEP_GEMM_E8M0-1}
-  VLLM_MOE_USE_DEEP_GEMM: ${VLLM_MOE_USE_DEEP_GEMM-0}
-  FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST:-12.1}
+  FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST:-12.1a}
   TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-12.1a}
-
-  # ---- b12x / NVFP4 DS-MLA (anemll イメージのときだけ値が入る) ----
-  # 既定イメージでは未登録の変数なので、空のまま渡すと vLLM が
-  # "Unknown vLLM environment variable" を出す。空文字は entrypoint が unset する。
-  VLLM_USE_B12X_MOE: ${VLLM_USE_B12X_MOE:-}
-  VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: ${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-}
-  VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: ${VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M:-}
-  VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-}
-  FLASHINFER_DISABLE_VERSION_CHECK: ${FLASHINFER_DISABLE_VERSION_CHECK:-}
-  FLASHINFER_WORKSPACE_BASE: ${FLASHINFER_WORKSPACE_BASE:-}
-  TILELANG_CLEANUP_TEMP_FILES: ${TILELANG_CLEANUP_TEMP_FILES:-}
-  DG_JIT_USE_NVRTC: ${DG_JIT_USE_NVRTC:-}
-  DG_JIT_NVCC_COMPILER: ${DG_JIT_NVCC_COMPILER:-}
-  # CuTeDSL の kernel コンパイル対象。VLLM_* ではないので warning は出ない。
-  # 未指定だと b12x が GB10 native ではない遅い W4A16 経路を JIT することがある。
-  CUTE_DSL_ARCH: ${CUTE_DSL_ARCH:-}
-  # 0731 同梱の encoding_dsv4.py をランタイムに入れる (=1 のときだけ)
-  DSPARK_ENCODING_INSTALL: ${DSPARK_ENCODING_INSTALL:-0}
-  DSPARK_ENCODING_FILE: ${DSPARK_ENCODING_FILE:-}
+  FLASHINFER_DISABLE_VERSION_CHECK: ${FLASHINFER_DISABLE_VERSION_CHECK:-1}
+  # 重み 198GB のロード + JIT ウォームアップに 1 時間
+  VLLM_ENGINE_READY_TIMEOUT_S: ${VLLM_ENGINE_READY_TIMEOUT_S:-3600}
+  # backend を手動指定する場合 (既定は空 = vLLM が FLASHINFER_MLA_SPARSE_SM90 を選ぶ)
+  VLLM_ATTENTION_BACKEND: ${VLLM_ATTENTION_BACKEND-}
 
   # ---- ランタイム ----
   NVIDIA_VISIBLE_DEVICES: all
   PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: ${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}
-  VLLM_USE_BREAKABLE_CUDAGRAPH: ${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}
-  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: ${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-256}
-  VLLM_ALLOW_LONG_MAX_MODEL_LEN: ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-}
-  VLLM_ATTENTION_BACKEND: ${VLLM_ATTENTION_BACKEND:-}
   VLLM_CACHE_ROOT: /root/.cache/vllm
   HF_HOME: /cache/huggingface
   HF_HUB_OFFLINE: "1"
@@ -111,11 +92,15 @@ x-vllm-service: &vllm-service
   image: ${VLLM_IMAGE}
   network_mode: host
   ipc: host
-  shm_size: "64gb"
+  shm_size: "32gb"
   entrypoint: ["bash", "/entrypoint.sh"]
   volumes:
     - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
+    - ${DRAFT_PATH:-./models/GLM-5.3-Flash-DFlash2}:/models/GLM-5.3-Flash-DFlash2:ro
     - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+    # SM121 top-k 修正 (必須)。persistent_topk が GB10 (48 SM / 99KB smem) で
+    # ~24K ctx 超の decode を殺すので、修正版モジュールを上書き bind-mount。
+    - ./patches/sparse_attn_indexer_kpool_sm121.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
     - ./vllm-cache/vllm:/root/.cache/vllm
     - ./vllm-cache/triton:/root/.triton
     - ./vllm-cache/torchinductor:/var/cache/torchinductor
@@ -151,7 +136,7 @@ x-vllm-service: &vllm-service
 services:
   head:
     <<: *vllm-service
-    container_name: dsv4-head
+    container_name: glm53-head
     profiles: ["head"]
     environment:
       <<: *vllm-env
@@ -161,7 +146,7 @@ services:
 
   worker:
     <<: *vllm-service
-    container_name: dsv4-worker
+    container_name: glm53-worker
     profiles: ["worker"]
     environment:
       <<: *vllm-env
@@ -177,5 +162,5 @@ services:
       NCCL_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       GLOO_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       TP_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      UCX_NET_DEVICES: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      MN_IF_NAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-${NCCL_IB_GID_INDEX:-3}}
