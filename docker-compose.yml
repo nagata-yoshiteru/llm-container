@@ -1,22 +1,20 @@
 # =============================================================================
 # Qwen/Qwen3.8-27B-FP8 on NVIDIA DGX Spark (GB10 / SM121), 単体ノード
 #
-#   レシピ元: https://github.com/0xBakeer/Qwen3.8-27B-FP8-on-a-single-DGX-Spark
-#   DSpark 投機デコード (独立 5 層 drafter, 2.6GB) + prefix caching で
-#   シングルストリーム ~20-58 tok/s を実測 (重みは FP8 のまま、出力非破壊)。
-#
-#   ・8bit (FP8) のまま。4bit は同時実行が増えると利得が消える (c1 +27% -> c8 +10%
-#     -> c16 0.2%) ので、このマシンでは FP8 で十分。
-#   ・max-model-len = 262144 (ネイティブ)。DSpark drafter はネイティブ構成前提で
-#     検証されており、1M (YaRN) と併用は未検証なため一旦 262K に。1M へ戻す手順は
-#     コマンドブロック内のコメント参照。
-#   ・k (num_speculative_tokens): 7 = スループット優先 (c8 aggregate 208.7 tok/s)。
-#     14 = 単ストリーム最速 58.5 tok/s (同時性は c8 で約半分に落ちる)。用途で切替。
+#   【現設定】 1M context (static YaRN factor 4.0) + DSpark 投機デコードを同居。
+#   ・1M + DSpark の併用は本ブランチの DeepSeek-V4-Flash (=1M, native DSpark k=7,
+#     decode 51.4 t/s 平均) で実績あり。ただし DeepSeek は drafter がチェックポイント
+#     同梱・native 1M なのに対し、Qwen は drafter が別モデル (Doopeworld/... 5層 2.6GB)
+#     + YaRN で 1M に延伸した構成。「特に 262K 超の位置では drafter の推測が弱い
+#     (スループット低下)」ことが予想されるため、実測で評価する。動かなければ下記
+#    コメント手順で DSpark を外し 1M 単体に。
+#  ・FP8 のまま。KV は fp8 (1M では KV が支配的: ~32GB/seq) で gpu-util 0.90。
+#  ・注意 (DeepSeek ブランチ実測より): 天井は KV でなく prefill の活性化メモリ。
+#     OOM-kill (exit 137) されたら --max-num-batched-tokens を下げるか 0.85 に。
 #
 # rootful Docker (sudo) 前提: ${HOME} 等のシェル変数は使わず、キャッシュは
-# ./vllm-cache/ に相対マウント。Qwen と drafter は gated の場合があるので
-# .env の HF_TOKEN=... を推奨。初回起動時に drafter
-# (Doopeworld/Qwen3.8-27B-DSpark-vLLM ~2.6GB) も HF から落としてくる。
+# ./vllm-cache/ に相対マウント。Qwen / drafter は gated の可能性があるので
+# .env の HF_TOKEN=... を推奨。
 # =============================================================================
 
 services:
@@ -46,6 +44,9 @@ services:
       VLLM_CACHE_ROOT: /root/.cache/vllm
       TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
 
+      # 1M context: config の max_position_embeddings=262144 より大きくするので必須
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+
       # ランタイム JIT (nvcc 並列) がコアを使い切って UMA を食い潰すのを防ぐ
       MAX_JOBS: "4"
 
@@ -68,30 +69,32 @@ services:
         print("python vllm:", vllm.__version__)
         PY
 
-        # DSpark は第一候補: MTP より drafter コストが 3.3 倍安く、
-        # 編集/リファクタ系 (accept 98-99%) で特に効く。
         exec vllm serve Qwen/Qwen3.8-27B-FP8 \
           --host 0.0.0.0 \
           --port 8910 \
           --served-model-name qwen3.8-27b \
-          --max-model-len 262144 \
-          --gpu-memory-utilization 0.85 \
+          --max-model-len 1000000 \
+          --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144, "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}' \
+          --gpu-memory-utilization 0.90 \
+          --kv-cache-dtype fp8 \
+          --max-num-seqs 4 \
+          --max-num-batched-tokens 8192 \
+          --enable-chunked-prefill \
           --enable-prefix-caching \
           --reasoning-parser qwen3 \
-          --tool-call-parser qwen3_xml \
           --enable-auto-tool-choice \
+          --tool-call-parser qwen3_xml \
+          --load-format safetensors \
+          --skip-mm-profiling \
           --speculative-config '{"method":"dspark","model":"Doopeworld/Qwen3.8-27B-DSpark-vLLM","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+          # --- 1M + DSpark が動かなかった場合のフォールバック (選択肢) ---
+          # 1) 1M 単体: 最後の --speculative-config 行を削除 (実測 ~10-15 tok/s に戻る)
+          # 2) 速度優先 262K + DSpark (0xBakeer レシピ実測 39-58 t/s):
+          #    --max-model-len 1000000 -> 262144、--hf-overrides 行削除、
+          #    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 削除、gpu-util 0.85 に下げる
           # --- k (num_speculative_tokens) の切替 ---
-          # 7: スループット優先 (単純生成 20.05 / 編集系 46.8 / c8 集合 208.7)
-          # 14: 単ストリーム最速 58.5 (編集系)。ただし c8 では 119.7 に落ちる
-          #    -> 対話レイテンシ優先なら 7 を 14 に変える
-          # --- 1M context に戻したい場合 (速度でなく長文優先) ---
-          # DSpark drafter はネイティブ構成前提なので --speculative-config 行を外し、
-          # --max-model-len 1000000 に変更 + 以下を復活 (enabled 時 ~10 tok/s に戻る):
-          #   --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn",
-          #     "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0,
-          #     "original_max_position_embeddings": 262144, "mrope_interleaved": true,
-          #     "mrope_section": [11, 11, 10]}}}'
-          # さらに環境変数 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 も必要。
+          # 7: スループット優先 / 14: 単ストリーム編集系最速 (58.5 t/s) だが同時性 c8 で半減
+          # --- short-text 品質が気になる場合 (static YaRN 減衰) ---
+          # factor 4.0 -> 2.0 (≈524K) にすると短文への影響を軽減できる
           # --- もし method dspark がこのイメージに無くて起動失敗する場合 ---
           # image を vllm/vllm-openai:v0.27.1-aarch64 (レシピ実測版) に差し替え。
