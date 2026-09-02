@@ -1,14 +1,38 @@
-# DeepSeek-V4-Flash-0731 on 2x DGX Spark
+# DeepSeek-V4-Flash-Vision-Exp on 2x DGX Spark
 
-[deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
-(304B MoE / FP8+FP4 / 167GB) を DGX Spark 2 台に **TP=2** で分割して、
-OpenAI 互換 API を `:8910` に生やす構成。
+[deepseek-ai/DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
+(304B MoE / FP8+FP4 / vision tower BF16 / 168GB) を DGX Spark 2 台に **TP=2** で
+分割して、OpenAI 互換 API を `:8910` に生やす構成。画像入力に対応する。
 
 - 分散バックエンドは **Ray ではなく `mp`** (torch.distributed SPMD)。head/worker が
   それぞれ `vllm serve` を `--nnodes/--node-rank/--master-addr` 付きで起動する。
 - ノード間の NCCL は 200GbE QSFP 直結リンクの **RoCEv2 (RDMA)**。
-- **native DSpark speculative decoding (k=7)** を使う。0731 が同梱している draft
-  モジュールで、蒸留なしで速度を出している本体。
+- **native DSpark speculative decoding (k=3)** を使う。Vision-Exp が同梱している
+  draft モジュールで、蒸留なしで速度を出している本体。
+
+## 0731 から移ってきた人へ
+
+DeepSeek-V4-Flash-0731 の構成は `DGX-Spark-2/deepseek-ai/DeepSeek-V4-Flash-0731`
+ブランチに残してある。ネットワーク・RDMA・compose まわりは全部同じで、変わったのは
+次の 5 点だけ。
+
+| | 0731 | Vision-Exp |
+|---|---|---|
+| イメージ | `ghcr.io/bjk110/vllm-spark` (vLLM 0.25 / SM121 ネイティブ) | `vllm/vllm-openai:deepseekv4-flash-vision-arm64-cu130` (vLLM 0.29 系 pre-release) |
+| 重み | `models/DeepSeek-V4-Flash-0731` (167GB) | `models/DeepSeek-V4-Flash-Vision-Exp` (168GB / 別途 DL) |
+| DSpark | k=7 greedy | **k=3** probabilistic + adaptive verification |
+| cudagraph | `[8]` (=1+7) | `[4]` (=1+3) |
+| mm | `--skip-mm-profiling` | 外した (vision encoder の活性化を見積もらせる) |
+
+**イメージを変えざるを得ないのがポイント。** Vision-Exp の視覚モジュールはまだ
+安定版 wheel に入っておらず (上流 PR #54566)、通常の release で起動すると text-only
+のモデルクラスに解決されて vision のテンソルで落ちる。0731 で使っていた bjk110 の
+SM121 ネイティブビルドにも vision 実装は無い (2026-09-02 時点で vision 対応タグ無し)。
+
+上流イメージでも SM121 (GB10) のカーネルは入っている
+(`TORCH_CUDA_ARCH_LIST=8.7 8.9 9.0 10.0+PTX 12.0 12.1`) ので動くはずだが、
+**bjk110 が Spark 向けに詰めていたチューニングは載っていない**。0731 で出ていた
+decode 37.7〜65.5 t/s がそのまま出る保証はないので、計測し直すこと。
 
 | | head | worker |
 |---|---|---|
@@ -110,7 +134,7 @@ show_gids                        # その IPv4 が載っている行の DEV 名 
 NVIDIA の connect-two-sparks は link-local (169.254.x.x) を振るので、
 **再起動で IP が変わることがある**。`scripts/preflight.sh` が検出する。
 
-### 1. 重みを取得 (2 台とも / 各 167GB, 48 shard)
+### 1. 重みを取得 (2 台とも / 各 168GB, 48 shard)
 
 ```bash
 ./scripts/fetch-model.sh                                       # head
@@ -121,7 +145,11 @@ ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh'
 
 ### 2. イメージを取得 (2 台とも / 約 14GB) — **rootful**
 
-digest 固定。vLLM 0.25.0 / linux-arm64 / sm_121 ネイティブビルド。
+digest 固定。上流 `vllm/vllm-openai:deepseekv4-flash-vision-arm64-cu130` /
+linux-arm64 / CUDA 13.0.1 / vLLM 0.29 系 pre-release。arch list に 12.1 (GB10) を含む。
+
+CUDA 13 で問題が出たら `.env` の `VLLM_IMAGE` を cu129 版の digest に差し替える
+(`.env` のコメントに書いてある)。
 
 ```bash
 IMAGE=$(sed -n 's/^VLLM_IMAGE=//p' .env)
@@ -296,6 +324,39 @@ r = client.chat.completions.create(
 r.choices[0].message.reasoning    # <- ここ
 ```
 
+モデル名は `deepseek-v4-flash-vision` と `deepseek-v4-flash` の**どちらでも通る**
+(`.env` の `SERVED_MODEL_NAME` に両方書いてある)。0731 のときのクライアント設定を
+そのまま使えるようにしてあるだけで、中身は Vision-Exp。
+
+### 画像を投げる
+
+Vision-Exp の本題。OpenAI 互換の `image_url` コンテンツブロックで渡す。
+
+```python
+import base64, pathlib
+
+b64 = base64.b64encode(pathlib.Path("shot.png").read_bytes()).decode()
+r = client.chat.completions.create(
+    model="deepseek-v4-flash-vision",
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "このスクリーンショットで何が起きてる？"},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]}],
+    temperature=1.0, top_p=0.95,
+)
+```
+
+- **前処理はチェックポイント側で固定**されていて、`--mm-processor-kwargs` は受け付けない
+  (`vision_max_n_token=384` / `vision_min_pixels=147456` / `vision_max_wh_ratio=8`)。
+- 1 リクエストあたりの枚数に上限は設けていない。実質の上限は `MAX_MODEL_LEN`。
+  起動時の mm profiling でメモリが足りなくなったら、`VLLM_EXTRA_ARGS` に
+  `--limit-mm-per-prompt {"image":1}` を足す。
+- `file://` の URL を使いたいときだけ `--allowed-local-media-path <dir>` が要る。
+  http(s) と base64 data URL は追加設定なしで通る。
+- 画像込みでも `MAX_NUM_SEQS=1` は変えていない。UMA の余裕がないので、
+  vision encoder の分は prefill の活性化メモリから持っていかれる。
+
 ### Anthropic 互換 (`/v1/messages`) — Claude Code から使う
 
 vLLM は Anthropic Messages API も生やすので、**変換プロキシなしで Claude Code を
@@ -389,6 +450,12 @@ sudo docker compose --env-file .env --env-file presets/256k.env --profile head u
 
 ### 実測
 
+> ⚠ **以下の数値はすべて 0731 + bjk110 イメージ + DSpark k=7 での実測。**
+> Vision-Exp はモデルもイメージも DSpark の深さも違うので、そのままは当てはまらない。
+> 上の `max_concurrency` の表も含め、起動後に `/metrics` で取り直すこと。
+> 特に `num_nextn_predict_layers` が 1 -> 3 に増えているので、KV の 1 token あたりの
+> バイト数は変わっている可能性が高い。
+
 | 入力 | TTFT | prefill | decode |
 |---:|---:|---:|---:|
 | 15,958 | 9.7s | 1,646 t/s | 62.1 t/s |
@@ -420,7 +487,14 @@ curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' 
 
 根拠と外した予測の記録は [`presets/README.md`](presets/README.md) に。
 
-### もっと速くしたい (anemll ランタイムへの差し替え)
+### もっと速くしたい (anemll ランタイムへの差し替え) — ⚠ 0731 専用
+
+> **この節はまるごと DeepSeek-V4-Flash-0731 の話。Vision-Exp では使えない。**
+> `presets/anemll-1m.env` は `VLLM_IMAGE` を anemll 版 (vLLM 0.25 系) に差し替える
+> プロファイルで、そこには Vision-Exp の視覚モジュール実装が入っていない。
+> Vision-Exp で速度を追うなら、anemll 側が vision 対応イメージを出すのを待つか、
+> 上流イメージのまま `--moe-backend` や cudagraph を詰めるかになる。
+> 0731 に戻すときのために残してある。
 
 既定構成の decode は **37.7〜65.5 t/s (平均 51.4)**。一方、同じ 2 台構成で
 **71〜76 t/s** を出している報告があり、その差はチューニングではなく
@@ -476,7 +550,7 @@ acceptance が 25.7% -> 60.2% 変わる (上流実測)。ログは `logger.debug
 | `HOST_PORT` | 8910 | API のポート |
 | `MAX_NUM_SEQS` | 1 | 上げると同時実行できるが、KV を分け合うので実効コンテキストが減る |
 | `GPU_MEMORY_UTILIZATION` | 0.87 | unified memory なので上げすぎるとホストごと OOM |
-| `num_speculative_tokens` | 7 | DSpark の draft 長。**0731 の drafter は 1 パス 5 トークン**なので 5 が正しい。5 にするなら `cudagraph_capture_sizes` も `[8]` -> `[6]` (= 1+k) にすること |
+| `num_speculative_tokens` | 3 | DSpark の draft 長。モデルカードと vLLM recipe がどちらも 3 を指定していて、実測値 (受理率 66.3% / 平均 2.99 tok/forward) が出ているのも深さ 3 だけ。drafter の 1 パスは 5 トークン (`dspark_block_size=5`) なので 5 までは上げられる余地があるが未検証。変えるなら `cudagraph_capture_sizes` も `[1+k]` に合わせること |
 | `NCCL_DEBUG` | WARN | ハンドシェイクを追うときは `INFO` |
 
 `VLLM_EXTRA_ARGS` / `VLLM_PARSER_ARGS` は entrypoint が空白で分割するので、

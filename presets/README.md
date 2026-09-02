@@ -19,7 +19,7 @@ sudo docker compose --env-file .env --env-file presets/256k.env --profile head u
 | `128k.env` | 131,072 | 18GiB | 286,458 | 2.19 | prefill の余白が最大 |
 | `256k.env` | 262,144 | 18GiB | 539,285 | 2.06 | **常用向け**。250K 入力でも残 6.7GiB |
 | `1m.env` | 1,048,576 | 20GiB | 1,772,550 | 1.69 | 既定。900K 入力で残 1.9GiB |
-| `anemll-1m.env` | 1,048,576 | nvfp4_ds_mla | 未計測 | 未計測 | **イメージごと差し替え**。上流実測 decode 71〜76 t/s |
+| `anemll-1m.env` | 1,048,576 | nvfp4_ds_mla | 未計測 | 未計測 | **イメージごと差し替え**。⚠ 0731 専用 (vision 非対応) |
 
 `128k` / `256k` / `1m` の差分は 3 キーのみ
 (`MAX_MODEL_LEN` / `MAX_NUM_BATCHED_TOKENS` / `VLLM_KV_ARGS`)。
@@ -31,6 +31,11 @@ KV dtype (`nvfp4_ds_mla`)・MoE backend (`flashinfer_b12x`)・DSpark k=5 が
 これらのフラグだけ足しても起動しない。詳細はファイル先頭のコメントに書いた。
 
 ## ベンチ結果
+
+> ⚠ **以下はすべて DeepSeek-V4-Flash-0731 / DSpark k=7 / bjk110 イメージでの実測。**
+> 現在の既定は DeepSeek-V4-Flash-Vision-Exp (DSpark k=3 / 上流 vLLM 0.29 イメージ) な
+> ので、そのままは当てはまらない。slots / max_concurrency も含めて計測し直すこと。
+> KV 表の数値も同様。
 
 TP=2 / DSpark k=7 / `MAX_NUM_SEQS=1` / prefix caching なし。
 
