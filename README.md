@@ -10,6 +10,87 @@
 - **native DSpark speculative decoding (k=3)** を使う。Vision-Exp が同梱している
   draft モジュールで、蒸留なしで速度を出している本体。
 
+## ⛔ 現状ブロック中 (2026-09-06)
+
+**この構成は起動しない。上流 FlashInfer の未対応が原因で、設定では回避できない。**
+
+```
+tvm.error.InternalError: Unsupported sparse-MLA prefill configuration:
+  model=DSV4 num_heads=32 topk=512 page_block_size=64 topk_extra=512 extra_page_block_size=64
+```
+
+Vision-Exp は画像 prefill 用に causal-SWA の候補バッファを広げる。
+`sliding_window(128) + vision_max_n_token(384) = 512` で、これが primary topk になる。
+FlashInfer の SM120 **dual-cache prefill** ディスパッチャはこの形を持っていない
+(instantiate されているのは primary topk=128 のみ)。`num_heads=32` は TP=2 の
+64/2 で、これも該当。**チェックポイント由来なので、フラグでは変えられない。**
+
+- 修正は [FlashInfer PR #4850](https://github.com/flashinfer-ai/flashinfer/pull/4850)
+  として存在するが **未マージ**。PR 本文の表に TP=2 / 32 heads /
+  `(topk_extra, extra_page_block_size) = (512, 64)` とあり、この機体のエラーと完全一致する。
+- 昨日出た `v0.6.18.post1` にも入っていない (差分は無関係な 2 コミットのみ)。
+  採用中のイメージは FlashInfer 0.6.18。
+- さらに [issue #4973](https://github.com/flashinfer-ai/flashinfer/issues/4973) が、
+  **パッチを当てても**長いテキストプロンプトで illegal memory access になると報告している。
+  独立した 2 実装で同じ症状。maintainer の返信はまだ無い。
+
+つまり **FlashInfer を自前でパッチしても安定しない**。上流待ちが妥当。
+
+### → コミュニティ移植版に移行した (2026-09-06)
+
+**[MiaAI-Lab のレシピ](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
+をこのリポジトリに取り込んで、これを本線の構成にした。**
+`docker-compose.yml` が移植版のベースになっている (旧 upstream イメージ構成を置き換えた)。
+起動は `./start-deepseek-v4-flash-dspark.sh`。
+
+```
+docker-compose.yml                     移植版のベース (旧構成は git 履歴と 0731 ブランチに)
+.env.dspark                            この機体向けの設定。★git 追跡している (worker へ同期するため)
+start/stop/status/logs/smoke-*.sh      ランチャー一式
+validate-dspark-config.sh              起動前チェック (レンダリング結果を確認できる)
+patches/                               40 個超の hotfix (vision 有効化もここ)
+README.dspark.md                       移植版の元 README
+```
+
+**旧構成の残骸について:** `.env` / `.env.example` / `presets/` / `scripts/entrypoint.sh` は
+上流イメージ構成のもので、この本線からは使わない。上流 (FlashInfer) が直ったときに
+戻せるよう残してある。`scripts/fetch-model.sh` (重み取得) と `scripts/preflight.sh`
+(ネットワーク確認) は移植版でも引き続き使える。`run.sh` は旧構成用なので使わないこと。
+
+なぜ向こうは動くのか: **`--moe-backend flashinfer_b12x` + `--kv-cache-dtype nvfp4_ds_mla`
+を使い、詰まっていた FlashInfer の SM120 sparse-MLA 経路を通らない。** vision は
+`hotfix-dsv4-vision-exp.py` を起動時に注入して有効化する (40 個超の hotfix の 1 つ)。
+dual-HCA と GID 自動解決 (`NCCL_IB_GID_AUTO`) も向こうが標準対応している。
+
+セットアップ済みの内容:
+
+- `.env.dspark` をこの機体向けに設定 (dual-HCA / IP)。ポートは **8888**、
+  rendezvous は **25000** で、旧構成の 8910 / 29501 とぶつからない
+- **重みはローカルの `models/` を直接マウントする。**HF hub キャッシュ形式
+  (`models--.../snapshots/<sha>/`) を用意する必要はない。そのために加えた変更は 2 つだけ:
+  - compose に `${DSPARK_LOCAL_MODEL_DIR:-./models}:/models:ro` を追加
+  - `.env.dspark` で `DSPARK_MODEL_OFFICIAL=/models/DeepSeek-V4-Flash-Vision-Exp` /
+    `DSPARK_REVISION=` (空) / `DSPARK_ENCODING_FILE=` を明示
+
+  ★ 書き換えるのは `DSPARK_MODEL` ではなく **`DSPARK_MODEL_OFFICIAL`**。
+  start スクリプトが `ABLITERATED` を見て `DSPARK_MODEL_OFFICIAL` /
+  `DSPARK_MODEL_ABLITERATED` から `DSPARK_MODEL` を導出し、env の値を上書きするため。
+- `./validate-dspark-config.sh` 通過済み。`vllm serve /models/DeepSeek-V4-Flash-Vision-Exp`
+  になっていることを確認した
+
+このリポジトリ側は **0731 用の設定として維持**する
+(`git checkout DGX-Spark-2/deepseek-ai/DeepSeek-V4-Flash-0731`)。
+上流 (FlashInfer PR #4850 / issue #4973) が解決したら、こちらに戻す。
+
+**移植版の注意:** vision の既知欠落 (双方向 attention・`bias_vl`) は残る
+(→「コミュニティ移植版という選択肢」)。既定が `DEFAULT_THINKING=low` なので、
+クライアントが何も指定しないと thinking on で走る。
+
+**ここまでで検証できたこと** (次に再開するとき無駄にしないために): イメージ選択・vision
+モデルとしての解決・重みロード・dual-HCA での NCCL rendezvous・`--moe-backend marlin`・
+`--reasoning-config`・KV サイズ決定 (`max_concurrency >= 1.0`) は**すべて通っている**。
+残っているのはこの FlashInfer カーネル 1 点だけ。
+
 ## 0731 から移ってきた人へ
 
 DeepSeek-V4-Flash-0731 の構成は `DGX-Spark-2/deepseek-ai/DeepSeek-V4-Flash-0731`
@@ -769,6 +850,7 @@ acceptance が 25.7% -> 60.2% 変わる (上流実測)。ログは `logger.debug
 | CUDAGraph のところで両ノードとも固まる | **NVIDIA ドライバ 590.x は GB10 で CUDAGraph デッドロックを起こす**という報告がある。580.x を使うこと (このマシンは 580.173.02 で該当しない) |
 | decode が想定の 1/4 くらいに見える | 投機デコードをストリーミングで測っている。`stream: false` で測り直す (→ 「計測するときの注意」) |
 | 起動して安定していたのに、途中のリクエストで突然エンジンごと落ちる | ウォームアップが踏まなかった MoE / batch shape に当たって**推論中に JIT が走り**、`execute_model` の既定デッドライン 300 秒を超えて「worker が死んだ」と誤判定されている。`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800` を設定済み (compose の既定)。なお本物のハングは GPU 使用率 96% / 消費電力 18W 程度 (collective の spin-wait) で見分けられる — JIT 中は電力がアイドル近くまで落ちる |
+| `tvm.error.InternalError: Unsupported sparse-MLA prefill configuration: model=DSV4 num_heads=32 topk=512 ... topk_extra=512 extra_page_block_size=64` | **設定では直せない。** FlashInfer の SM120 dual-cache prefill が Vision-Exp の形 (primary topk = sliding_window 128 + vision_max_n_token 384) を持っていない。→ 冒頭の「⛔ 現状ブロック中」。`--block-size` や autotune 無効化では回避できない (autotune を切っても実 prefill で同じ経路を通る) |
 | `ValueError: Adaptive verification trims verification requests on device, which the DeepseekV4IndexerBackend attention backend does not support` | `--speculative-config` の `enable_adaptive_verification` を **false** にする (対応済み)。モデルカードは `true` を指定しているが、それは 4xGB300 向けのコマンド。GB10 では DeepSeek-V4 の sparse indexer を使う attention backend に解決され、こちらは device 側で verification request を削る操作に対応していない。KV 初期化の直後に出るので、ここまで来ていれば重みロード・vision 解決・NCCL は通っている |
 | モデルロードは通るのに TP ハンドシェイクで無言でハングする | `NCCL_IB_GID_INDEX` のピン留めがずれた可能性。特に dual-HCA では index が動く (→ 「QSFP を 2 枚使う」)。`.env` の該当行を空にして NCCL に選ばせる |
 | JIT 由来の `FileExistsError` / `runtime != nullptr` / FlashInfer の ABI 不一致 | JIT キャッシュを 2 ノードで共有すると両 rank が同じディレクトリに書いて壊れる。`vllm-cache/` は**ノードローカル**にすること (この compose は repo 直下なので既にローカル)。一度壊したら消す |

@@ -163,6 +163,66 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
+# MiaAI-Lab 移植版の hotfix 適用 (DSPARK_APPLY_HOTFIXES=1 のときだけ)
+#
+# Vision-Exp を GB10 で動かすのに必須。上流イメージだと FlashInfer の SM120
+# sparse-MLA dual-cache prefill が無くて起動できない (README の「⛔ 現状ブロック中」)。
+# anemll イメージ + b12x 経路ならそこを通らずに済み、vision は
+# hotfix-dsv4-vision-exp.py をランタイムに当てて有効化する。
+#
+# 適用順は移植版の compose に合わせてある。**順番を変えないこと**
+# (後段の hotfix が前段の書き換え結果を前提にしている)。
+# すべて fail-closed: 1 つでも失敗したら起動しない。黙って劣化する方が危険なので。
+# ---------------------------------------------------------------------------
+if [ "${DSPARK_APPLY_HOTFIXES:-0}" = "1" ]; then
+    HOTFIX_DIR=/opt/dspark-patches
+    if [ ! -d "${HOTFIX_DIR}" ]; then
+        echo "[entrypoint] ERROR: DSPARK_APPLY_HOTFIXES=1 だが ${HOTFIX_DIR} が無い。" >&2
+        echo "[entrypoint]   compose の ./patches マウントを確認すること。" >&2
+        exit 1
+    fi
+
+    apply_py() { echo "[entrypoint] hotfix(py): $1"; python3 "${HOTFIX_DIR}/$1" || exit 1; }
+    apply_sh() { echo "[entrypoint] hotfix(sh): $1"; bash    "${HOTFIX_DIR}/$1" || exit 1; }
+
+    # encoding_dsv4.py 由来の引数エンコード修正。上の DSPARK_ENCODING_INSTALL で
+    # encoder を入れた後に当てる必要がある。
+    if [ "${DSPARK_ENCODING_INSTALL:-0}" = "1" ]; then
+        apply_py hotfix-encoding-dsv4-issue21.py
+    else
+        echo "[entrypoint] WARN: DSPARK_ENCODING_INSTALL=0 なので issue21 はスキップ" >&2
+    fi
+
+    apply_py hotfix-dsv4-issue55-tool-truncation.py
+    [ "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" = "1" ]     || apply_sh hotfix-nvfp4-ds-mla-issue22.sh
+    [ "${DSPARK_SKIP_SPIN_WAIT_HOTFIX:-0}" = "1" ]   || apply_sh hotfix-gb10-spin-wait.sh
+    [ "${DSPARK_SKIP_ISSUE117_HOTFIX:-0}" = "1" ]    || apply_py hotfix-vllm-issue117-shm-ring-buffer.py
+
+    if [ "${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then
+        for _hf in hotfix-dsv4-mtp-buffer-50312.sh \
+                   hotfix-dsv4-skip-topk-49486.sh \
+                   hotfix-dsv4-dense-prefill-indexer-48407.sh \
+                   hotfix-dsv4-skip-empty-c128-48957.sh \
+                   hotfix-dsv4-flashmla-workspace-50298.sh \
+                   hotfix-dsv4-grammar-advance.sh; do
+            apply_sh "${_hf}"
+        done
+    fi
+
+    # ★ vision 本体。これが当たらないと Vision-Exp は text-only になる。
+    apply_py hotfix-dsv4-vision-exp.py
+
+    apply_py hotfix-vllm-empty-encoder-output.py
+    apply_py hotfix-dsv4-issue27-partial-prefill-concurrency.py
+    apply_py hotfix-dsv4-issue43-decode-fairness-and-diag.py
+    apply_py hotfix-dsv4-issue26-hybrid-swa-min.py
+    apply_py hotfix-dsv4-issue133-triton-specialization.py
+    [ "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" = "1" ] || apply_py hotfix-dsv4-suppress-stops-in-reasoning.py
+
+    echo "[entrypoint] hotfix 適用完了"
+fi
+
+# ---------------------------------------------------------------------------
 # vllm serve コマンド組み立て
 # ---------------------------------------------------------------------------
 # set -f: SERVED_MODEL_NAME に複数エイリアスを空白区切りで書けるようにしつつ、

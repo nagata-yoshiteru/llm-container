@@ -99,6 +99,21 @@ x-vllm-env: &vllm-env
   DSPARK_ENCODING_INSTALL: ${DSPARK_ENCODING_INSTALL:-0}
   DSPARK_ENCODING_FILE: ${DSPARK_ENCODING_FILE:-}
 
+  # ---- MiaAI-Lab 移植版の hotfix 適用 (Vision-Exp を動かすのに必須) ----
+  # =1 で entrypoint が patches/ の hotfix をコンテナ起動時に当てる。vision の
+  # 有効化 (hotfix-dsv4-vision-exp.py) もこの中。既定イメージでは 0 のまま。
+  # 詳細は presets/anemll-vision-1m.env と README の「⛔ 現状ブロック中」。
+  DSPARK_APPLY_HOTFIXES: ${DSPARK_APPLY_HOTFIXES:-0}
+  # 個別に外したいときだけ 1 にする (既定は全部当てる)。
+  DSPARK_SKIP_HOTFIX: ${DSPARK_SKIP_HOTFIX:-0}
+  VLLM_USE_B12X_WO_PROJECTION: ${VLLM_USE_B12X_WO_PROJECTION:-}
+  # b12x / TileLang / DeepGEMM の JIT キャッシュ。イメージ既定はコンテナ内の
+  # ホームなので再作成で消える。既存の vllm-cache/ マウントの下に逃がす。
+  TILELANG_CACHE_DIR: ${TILELANG_CACHE_DIR:-/root/.cache/vllm/tilelang}
+  TRITON_CACHE_DIR: ${TRITON_CACHE_DIR:-/root/.triton/cache}
+  DG_JIT_CACHE_DIR: ${DG_JIT_CACHE_DIR:-/root/.cache/vllm/deepgemm}
+  B12X_CUTE_COMPILE_CACHE_DIR: ${B12X_CUTE_COMPILE_CACHE_DIR:-/root/.cache/vllm/b12x-cute}
+
   # ---- ランタイム ----
   NVIDIA_VISIBLE_DEVICES: all
   PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -123,6 +138,8 @@ x-vllm-service: &vllm-service
   volumes:
     - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
     - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+    # MiaAI-Lab 移植版の hotfix 群。DSPARK_APPLY_HOTFIXES=1 のときだけ使われる。
+    - ./patches:/opt/dspark-patches:ro
     - ./vllm-cache/vllm:/root/.cache/vllm
     - ./vllm-cache/triton:/root/.triton
     - ./vllm-cache/torchinductor:/var/cache/torchinductor
