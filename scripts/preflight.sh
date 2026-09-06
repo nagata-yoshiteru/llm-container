@@ -28,7 +28,13 @@ env_get() {
 for k in VLLM_IMAGE MODEL_PATH HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX; do
     printf -v "$k" '%s' "$(env_get "$k")"
 done
-: "${NCCL_IB_GID_INDEX:=3}"
+# ROCE_IF_NAME / IB_HCA_NAME は dual-HCA だとカンマ区切りになる
+# (例: enp1s0f0np0,enP2p1s0f0np0)。配列に割っておく。
+IFS=',' read -ra ROCE_IFS <<< "${ROCE_IF_NAME}"
+IFS=',' read -ra IB_HCAS  <<< "${IB_HCA_NAME}"
+
+# NCCL_IB_GID_INDEX は dual-HCA では「意図的に未設定」が正解なので、
+# 空を既定値で埋めない (埋めると固定してあるかのように見えてしまう)。
 
 echo "== ホスト =="
 echo "  hostname: $(hostname)  arch: $(uname -m)"
@@ -36,15 +42,22 @@ nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sed 's/^/  GP
 
 echo
 echo "== RoCE リンク =="
-LOCAL_IPS=$(ip -4 -o addr show dev "${ROCE_IF_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-if [ -z "${LOCAL_IPS}" ]; then
-    ng "${ROCE_IF_NAME} に IPv4 が付いていません (netplan / ケーブルを確認)"
-else
-    ok "${ROCE_IF_NAME} = ${LOCAL_IPS}"
-    if ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER_ROCE_IP}"; then
-        ng "実 IP が .env の HEAD_ROCE_IP(${HEAD_ROCE_IP}) / WORKER_ROCE_IP(${WORKER_ROCE_IP}) と一致しません"
+[ "${#ROCE_IFS[@]}" -gt 1 ] && echo "  (dual-HCA: ${#ROCE_IFS[@]} 本構成)"
+LOCAL_IPS=""
+for IFN in "${ROCE_IFS[@]}"; do
+    IPS=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    if [ -z "${IPS}" ]; then
+        ng "${IFN} に IPv4 が付いていません (netplan / ケーブルを確認)"
+    else
+        ok "${IFN} = ${IPS}"
+        LOCAL_IPS="${LOCAL_IPS}${LOCAL_IPS:+$'\n'}${IPS}"
     fi
+done
+if [ -n "${LOCAL_IPS}" ] && ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER_ROCE_IP}"; then
+    ng "どの IF の IP も .env の HEAD_ROCE_IP(${HEAD_ROCE_IP}) / WORKER_ROCE_IP(${WORKER_ROCE_IP}) と一致しません"
 fi
+# dual-HCA の 2 本目は rendezvous には使わない (NCCL が勝手に束ねる) ので、
+# .env の HEAD/WORKER_ROCE_IP と一致しなくてよい。IP が付いてさえいればよい。
 
 for PEER in "${HEAD_ROCE_IP}" "${WORKER_ROCE_IP}"; do
     if echo "${LOCAL_IPS}" | grep -qx "${PEER}"; then continue; fi
@@ -57,27 +70,47 @@ done
 
 echo
 echo "== RDMA / GID =="
-if ibv_devinfo -d "${IB_HCA_NAME}" 2>/dev/null | grep -q PORT_ACTIVE; then
-    ok "${IB_HCA_NAME} PORT_ACTIVE"
+for HCA in "${IB_HCAS[@]}"; do
+    if ibv_devinfo -d "${HCA}" 2>/dev/null | grep -q PORT_ACTIVE; then
+        ok "${HCA} PORT_ACTIVE"
+    else
+        ng "${HCA} が PORT_ACTIVE ではありません (ケーブルが刺さっている方の HCA か確認)"
+    fi
+done
+
+if [ -z "${NCCL_IB_GID_INDEX}" ]; then
+    ok "GID index は未固定 (NCCL に選ばせる) — dual-HCA ではこれが正解"
+    # 参考情報として、各 HCA の RoCEv2/IPv4 の行だけ出しておく
+    for HCA in "${IB_HCAS[@]}"; do
+        show_gids 2>/dev/null | awk -v d="${HCA}" '$1==d && /v2/ && $5 ~ /^[0-9]+\./ {
+            printf "       %s index %s -> %s (v2)\n", $1, $3, $5 }'
+    done
 else
-    ng "${IB_HCA_NAME} が PORT_ACTIVE ではありません (ケーブルが刺さっている方の HCA か確認)"
-fi
-GID_LINE=$(show_gids 2>/dev/null | awk -v d="${IB_HCA_NAME}" -v i="${NCCL_IB_GID_INDEX}" '$1==d && $3==i')
-if [ -n "${GID_LINE}" ] && echo "${GID_LINE}" | grep -q 'v2'; then
-    ok "GID index ${NCCL_IB_GID_INDEX} = RoCEv2 ($(echo "${GID_LINE}" | awk '{print $5}'))"
-else
-    ng "${IB_HCA_NAME} の GID index ${NCCL_IB_GID_INDEX} が RoCEv2/IPv4 ではありません: show_gids で確認"
+    warn "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} を固定している。リンクイベントで index が"
+    warn "  ずれると片方の HCA だけ無言でハングする (README「QSFP を 2 枚使う」)"
+    for HCA in "${IB_HCAS[@]}"; do
+        GID_LINE=$(show_gids 2>/dev/null | awk -v d="${HCA}" -v i="${NCCL_IB_GID_INDEX}" '$1==d && $3==i')
+        if [ -n "${GID_LINE}" ] && echo "${GID_LINE}" | grep -q 'v2'; then
+            ok "${HCA} GID index ${NCCL_IB_GID_INDEX} = RoCEv2 ($(echo "${GID_LINE}" | awk '{print $5}'))"
+        else
+            ng "${HCA} の GID index ${NCCL_IB_GID_INDEX} が RoCEv2/IPv4 ではありません: show_gids で確認"
+        fi
+    done
 fi
 [ -e /dev/infiniband/uverbs0 ] && ok "/dev/infiniband あり" || ng "/dev/infiniband がありません"
 
-MTU=$(cat "/sys/class/net/${ROCE_IF_NAME}/mtu" 2>/dev/null)
-ACTIVE_MTU=$(ibv_devinfo -d "${IB_HCA_NAME}" 2>/dev/null | awk '/active_mtu/ {print $2; exit}')
-if [ "${MTU:-0}" -ge 9000 ]; then
-    ok "MTU ${MTU} (RoCE path MTU ${ACTIVE_MTU:-?})"
-else
-    warn "MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 9000 に上げると path MTU が 4096 になる"
-    warn "  手順は README の「セットアップ 4. MTU を 9000 に上げる」。両ノードで揃えること"
-fi
+for i in "${!ROCE_IFS[@]}"; do
+    IFN="${ROCE_IFS[$i]}"
+    HCA="${IB_HCAS[$i]:-${IB_HCAS[0]}}"
+    MTU=$(cat "/sys/class/net/${IFN}/mtu" 2>/dev/null)
+    ACTIVE_MTU=$(ibv_devinfo -d "${HCA}" 2>/dev/null | awk '/active_mtu/ {print $2; exit}')
+    if [ "${MTU:-0}" -ge 9000 ]; then
+        ok "${IFN} MTU ${MTU} (RoCE path MTU ${ACTIVE_MTU:-?})"
+    else
+        warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 9000 に上げると path MTU が 4096 になる"
+        warn "  手順は README の「セットアップ 4. MTU を 9000 に上げる」。両ノードで揃えること"
+    fi
+done
 
 echo
 echo "== モデル =="

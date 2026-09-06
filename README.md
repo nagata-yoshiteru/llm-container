@@ -769,6 +769,7 @@ acceptance が 25.7% -> 60.2% 変わる (上流実測)。ログは `logger.debug
 | CUDAGraph のところで両ノードとも固まる | **NVIDIA ドライバ 590.x は GB10 で CUDAGraph デッドロックを起こす**という報告がある。580.x を使うこと (このマシンは 580.173.02 で該当しない) |
 | decode が想定の 1/4 くらいに見える | 投機デコードをストリーミングで測っている。`stream: false` で測り直す (→ 「計測するときの注意」) |
 | 起動して安定していたのに、途中のリクエストで突然エンジンごと落ちる | ウォームアップが踏まなかった MoE / batch shape に当たって**推論中に JIT が走り**、`execute_model` の既定デッドライン 300 秒を超えて「worker が死んだ」と誤判定されている。`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800` を設定済み (compose の既定)。なお本物のハングは GPU 使用率 96% / 消費電力 18W 程度 (collective の spin-wait) で見分けられる — JIT 中は電力がアイドル近くまで落ちる |
+| `ValueError: Adaptive verification trims verification requests on device, which the DeepseekV4IndexerBackend attention backend does not support` | `--speculative-config` の `enable_adaptive_verification` を **false** にする (対応済み)。モデルカードは `true` を指定しているが、それは 4xGB300 向けのコマンド。GB10 では DeepSeek-V4 の sparse indexer を使う attention backend に解決され、こちらは device 側で verification request を削る操作に対応していない。KV 初期化の直後に出るので、ここまで来ていれば重みロード・vision 解決・NCCL は通っている |
 | モデルロードは通るのに TP ハンドシェイクで無言でハングする | `NCCL_IB_GID_INDEX` のピン留めがずれた可能性。特に dual-HCA では index が動く (→ 「QSFP を 2 枚使う」)。`.env` の該当行を空にして NCCL に選ばせる |
 | JIT 由来の `FileExistsError` / `runtime != nullptr` / FlashInfer の ABI 不一致 | JIT キャッシュを 2 ノードで共有すると両 rank が同じディレクトリに書いて壊れる。`vllm-cache/` は**ノードローカル**にすること (この compose は repo 直下なので既にローカル)。一度壊したら消す |
 | block size 関連のエラーで起動しない | `VLLM_EXTRA_ARGS` から `--block-size 256` を外す |
