@@ -55,6 +55,7 @@ unset_if_empty \
     NCCL_CUMEM_ENABLE \
     NCCL_IB_ADDR_FAMILY \
     NCCL_IB_ROCE_VERSION_NUM \
+    NCCL_IB_MERGE_NICS \
     MAX_JOBS
 
 # ---------------------------------------------------------------------------
@@ -97,12 +98,24 @@ echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
 # "unhandled system error" で数分後に死ぬので、先に落とす。
 # ---------------------------------------------------------------------------
 if command -v ibv_devinfo >/dev/null 2>&1; then
-    if ! ibv_devinfo -d "${IB_HCA_NAME}" 2>/dev/null | grep -q "PORT_ACTIVE"; then
-        echo "[entrypoint] ERROR: HCA ${IB_HCA_NAME} is not PORT_ACTIVE inside the container." >&2
+    # IB_HCA_NAME はカンマ区切りで複数書ける (dual-HCA / NCCL_IB_MERGE_NICS=1)。
+    # 1 本ずつ PORT_ACTIVE を確認する。
+    _hca_ok=1
+    IFS=',' read -ra _HCA_LIST <<< "${IB_HCA_NAME}"
+    for _hca in "${_HCA_LIST[@]}"; do
+        [ -n "${_hca}" ] || continue
+        if ibv_devinfo -d "${_hca}" 2>/dev/null | grep -q "PORT_ACTIVE"; then
+            echo "[entrypoint] RDMA OK: ${_hca} PORT_ACTIVE"
+        else
+            echo "[entrypoint] ERROR: HCA ${_hca} is not PORT_ACTIVE inside the container." >&2
+            _hca_ok=0
+        fi
+    done
+    if [ "${_hca_ok}" != "1" ]; then
         echo "[entrypoint]   --device /dev/infiniband と /sys/class/infiniband のマウントを確認。" >&2
+        echo "[entrypoint]   dual-HCA にしたなら、2 本目に IP が振られているかも確認 (README 参照)。" >&2
         exit 1
     fi
-    echo "[entrypoint] RDMA OK: ${IB_HCA_NAME} PORT_ACTIVE"
 fi
 
 # ---------------------------------------------------------------------------

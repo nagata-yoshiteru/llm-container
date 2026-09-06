@@ -19,7 +19,9 @@ sudo docker compose --env-file .env --env-file presets/256k.env --profile head u
 | `128k.env` | 131,072 | 18GiB | 286,458 | 2.19 | prefill の余白が最大 |
 | `256k.env` | 262,144 | 18GiB | 539,285 | 2.06 | **常用向け**。250K 入力でも残 6.7GiB |
 | `1m.env` | 1,048,576 | 20GiB | 1,772,550 | 1.69 | 既定。900K 入力で残 1.9GiB |
-| `anemll-1m.env` | 1,048,576 | nvfp4_ds_mla | 未計測 | 未計測 | **イメージごと差し替え**。⚠ 0731 専用 (vision 非対応) |
+| `throughput-256k.env` | 262,144 | 18GiB | 未計測 | 未計測 | **同時実行 6**。単発より合計を取る構成。⚠ 未検証 |
+| `512k-x3.env` | 524,288 | 20GiB | 約 1,030,000 (推定) | 約 1.97 (推定) | **同時実行 3**。⚠ フル 512K は 3 本入らない (下記) |
+| `anemll-1m.env` | 1,048,576 | nvfp4_ds_mla | 未計測 | 未計測 | **イメージごと差し替え**。⚠ 単体では vision 非対応 (0731 用) |
 
 `128k` / `256k` / `1m` の差分は 3 キーのみ
 (`MAX_MODEL_LEN` / `MAX_NUM_BATCHED_TOKENS` / `VLLM_KV_ARGS`)。

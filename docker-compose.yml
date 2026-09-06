@@ -42,7 +42,7 @@ x-vllm-env: &vllm-env
   # (`show_gids` で「RoCE v2 かつ IPv4 が enp1s0f0np0 のアドレス」の index を確認)
   NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
   NCCL_IB_HCA: ${IB_HCA_NAME}
-  NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-3}
+  NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX-}
   NCCL_SOCKET_IFNAME: ${ROCE_IF_NAME}
   GLOO_SOCKET_IFNAME: ${ROCE_IF_NAME}
   TP_SOCKET_IFNAME: ${ROCE_IF_NAME}
@@ -58,6 +58,13 @@ x-vllm-env: &vllm-env
   NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-}
   NCCL_IB_ADDR_FAMILY: ${NCCL_IB_ADDR_FAMILY:-}
   NCCL_IB_ROCE_VERSION_NUM: ${NCCL_IB_ROCE_VERSION_NUM:-}
+  # dual-HCA (QSFP は 2 枚の NIC に見える) で 2 本を 1 本に束ねる。
+  # `-` なので .env で空にすれば entrypoint が unset する。
+  NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS-}
+  # execute_model RPC の既定デッドラインは 300 秒。ウォームアップが踏まなかった
+  # MoE / batch shape に当たって推論中に CuTeDSL/TileLang の JIT が走ると、
+  # worker が生きているのに「死んだ」と判定されてエンジンごと落ちる。
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
   # 初回の Triton/DeepGEMM JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
   # HPC-X の NCCL RDMA plugin を pip 版 NCCL から見えるようにする。
@@ -178,4 +185,4 @@ services:
       GLOO_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       TP_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       UCX_NET_DEVICES: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-${NCCL_IB_GID_INDEX:-3}}
+      NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX-${NCCL_IB_GID_INDEX-}}

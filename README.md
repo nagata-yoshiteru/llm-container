@@ -487,14 +487,207 @@ curl -s http://127.0.0.1:8910/metrics | grep 'cache_config_info{' | tr ',' '\n' 
 
 根拠と外した予測の記録は [`presets/README.md`](presets/README.md) に。
 
+### QSFP を 2 枚使う (dual-HCA) — 帯域がほぼ倍
+
+**GB10 の QSFP ケージは PCIe x4 が 2 本で、2 枚の独立した NIC に見える。**
+片方しか設定していないと帯域を半分捨てている。上流報告では nccl-tests の busbw が
+**98 → 161 Gb/s (+64%)**、単発 decode で **+8% (135 tok/s)**。
+
+vLLM 公式 recipe の GB10 プロファイルも、まさにこの構成を指定している
+(`IB_IF="rocep1s0f0,roceP2p1s0f0"` — この機体と同じデバイス名)。
+
+```
+rocep1s0f0   / enp1s0f0np0    ACTIVE 200Gb/s  192.168.0.2/24  MTU 9000
+roceP2p1s0f0 / enP2p1s0f0np0  ACTIVE 200Gb/s  192.168.1.2/24  MTU 9000
+```
+
+別サブネットに分離済み、両リンクとも worker へ jumbo frame (8972B / DF) が通ることを確認済み。
+netplan は `/etc/netplan/41-cx7-second.yaml` で永続化。
+
+PCIe はどちらも Gen5 x4 (`32.0 GT/s` / `width=4`) なので、第 2 コントローラを
+Gen5 x2 で配線する古い BIOS の既知問題には該当しない。確認コマンド:
+
+```bash
+ibdev2netdev                     # ACTIVE なのに IP が無い組があるか
+for n in enp1s0f0np0 enP2p1s0f0np0; do
+  p=$(readlink -f /sys/class/net/$n/device)
+  echo "$n $(cat $p/current_link_speed) width=$(cat $p/current_link_width)"
+done
+```
+
+**手順 (両ノードとも / vLLM を止めてから / SSH は `$WORKER_MGMT` 経由で)**
+
+1. 2 本目に **1 本目とは別サブネット**の IP と MTU 9000 を振る。netplan の
+   drop-in で永続化すること。**`nmcli` のプロファイルは `/run` に置かれて再起動で
+   消える**ので使わない。
+
+   ```yaml
+   # /etc/netplan/41-cx7-second.yaml
+   network:
+     version: 2
+     renderer: NetworkManager
+     ethernets:
+       enP2p1s0f0np0:
+         dhcp4: no
+         addresses: [192.168.1.2/24]    # worker は 192.168.1.1/24
+         mtu: 9000
+   ```
+
+   ```bash
+   sudo netplan try        # apply ではなく try
+   ```
+
+2. 両側 MTU 9000 を確認。片側だけ 9000 だと大きい転送で
+   `IBV_WC_RETRY_EXC_ERR(12)` になる。**ファームウェア更新の再起動で片側が 1500 に
+   戻る**事例があるので、再起動後は必ず見ること。
+
+3. `.env` の dual-HCA ブロックを有効化する (コメントアウトで用意してある)。
+   `IB_HCA_NAME` / `ROCE_IF_NAME` をカンマ区切りにして `NCCL_IB_MERGE_NICS=1`。
+   **`NCCL_IB_GID_INDEX` は必ず空にすること** (下記)。
+
+4. 初回起動は **NCCL トポロジが変わったので JIT が再チューニングされる。約 36 分**
+   かかった報告がある。20 分で切るウォッチドッグを持っていると「ハングした」と
+   誤判定するので注意。
+
+**⚠ dual-HCA では `NCCL_IB_GID_INDEX` を固定してはいけない**
+
+GID テーブルの index はリンクイベント (リンク上下 / 2 枚目の起動 / 再起動) で
+**動く**。上流では両 HCA を上げた状態で **30 分のうちに 3 → 4 にずれた**実例がある。
+厄介なのは、書いた時点では正しく検証できてしまうこと。ずれると片方の HCA だけ
+`ibv_modify_qp failed with 61` になり、**モデルロード後に TP ハンドシェイクが無言で
+ハングする**。最近の NCCL は RoCEv2/IPv4 の GID をデバイスごとに自力で選ぶので、
+**未設定が正解**。
+
+なお「空文字は 0 と解釈されて `fe80` link-local GID を掴むのでピン留めより悪い」と
+上流が警告しているが、**この repo の entrypoint は空の変数を unset する**ので
+その罠は踏まない (`.env` で行を空にすれば OK)。
+
+### イメージ選択の現状 (2026-09-06 調査)
+
+**Vision-Exp が動く「Spark 最適化イメージ」は、まだ存在しない。**
+速いイメージと vision が入っているイメージが、いまのところ別物になっている。
+
+| イメージ | GB10 最適化 | vision | 判定 |
+|---|---|---|---|
+| `vllm/vllm-openai:deepseekv4-flash-vision-arm64-cu130` (**採用中**) | △ 汎用 (`12.1`) | ✅ 参照実装 | これしかない |
+| `eugr/spark-vllm-b12x:latest` | ✅ **`12.1a` 専用ビルド + B12X** | ❌ 記載なし | vision 待ち |
+| `ghcr.io/bjk110/vllm-spark` | ✅ SM121 ネイティブ | ❌ | 0731 用 |
+| `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` | ✅ | △ 要 hotfix 注入 | 移植版経由なら |
+
+**`eugr/spark-vllm-b12x` が本命候補だが、まだ使えない。** vLLM 公式 recipe の GB10
+プロファイルが指定しているイメージで、`TORCH_CUDA_ARCH_LIST=12.1a` と GB10 専用に
+ビルドされている (採用中の上流イメージは `12.1` で `a` 無しの汎用)。しかし
+**vLLM main ではなくフォークの dev ブランチ (`local-inference-lab/vllm`) から
+ビルドされていて、リポジトリにも NVIDIA フォーラムにも Vision-Exp の動作報告が無い**。
+フォーラムでも「b12x で vision は動くのか」という質問に誰も答えていない。
+
+**ただし見通しは良い。** 上流 PR #54566 (`[New model][Multimodal] Add
+DeepSeek-V4-Flash-Vision-Exp support`) は **2026-09-02 に main へマージ済み**。
+最新リリースは v0.28.0 (08-26) なのでまだ stable には入っていないが、次の
+リリースが出れば b12x 側もリベースで拾える可能性が高い。
+
+定期的に見るなら:
+
+```bash
+# b12x に vision が入ったか (Vision-Exp / DeepseekV4V の記載を探す)
+curl -s https://api.github.com/repos/eugr/spark-vllm-docker/commits?per_page=20 \
+  | grep -io 'vision[^"]*' | head
+# 上流の vision イメージが更新されたか
+curl -s 'https://hub.docker.com/v2/repositories/vllm/vllm-openai/tags/?name=deepseekv4-flash-vision' \
+  | python3 -c 'import sys,json;[print(r["name"],r["last_updated"][:10]) for r in json.load(sys.stdin)["results"]]'
+```
+
+### Vision-Exp をもっと速くしたい (コミュニティ移植版という選択肢)
+
+**2 台 DGX Spark 向けに Vision-Exp を詰めた移植版が既に 2 つある。** どちらも
+既定の上流イメージより速いが、**vision の品質バグが報告されている**ので、
+速度と正しさのトレードオフになる。
+
+| | 既定 (このリポジトリ) | コミュニティ移植版 |
+|---|---|---|
+| イメージ | 上流 `deepseekv4-flash-vision` (PR #54566 の参照実装) | anemll 0.1.1 / tonyd2wild 系に vision ファイルを注入 |
+| decode | 未計測 | 62〜83 tok/s (MiaAI-Lab 報告) |
+| KV @1M | 未計測 | 2.33M tokens (nvfp4_ds_mla) |
+| vision の正しさ | 参照実装のまま | ⚠ 既知の欠落あり (下記) |
+| 手間 | `.env` だけ | ファイル一式の bind mount + hotfix |
+
+- [MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
+  — anemll 0.1.1 に起動時 hotfix で ViT + Aligner を注入。`MAX_NUM_SEQS=6` /
+  `nvfp4_ds_mla` / `flashinfer_b12x` / `LIMIT_MM_PER_PROMPT={"image":8}`。
+  画像は **`user` ロールにしか置けない** (他ロールだと 400 が返り、その履歴が
+  残る限り以後も失敗し続ける)。
+- [tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark)
+  — vLLM 0.21 系に vision ファイル 4 つ + パッチ 2 つを bind mount。
+  KV 2.79M tokens @ gmu 0.85 を報告。
+
+**⚠ 移植版の vision 品質バグ (2026-09-02 時点で未修正)**
+
+tonyd2wild の README が自ら明記している欠落が 2 つ:
+① 画像スパン内の双方向 attention が未実装、② 画像用の MoE routing bias
+(`bias_vl`) が欠落。どちらも**テキストには影響せず画像だけ劣化する**。
+[HF の discussion](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/discussions/10)
+でも「画像トークンの expert 選択が 43 層すべてで平均 6 個中 5 個外れている」という
+報告が出ている (未決着)。**簡単な画像テストはバグがあっても通る**ので、
+スモークテストが通ったことは正しさの証明にならない。
+
+上流イメージを使っている限りこの問題は踏まない。**画像の精度が要るなら既定のまま、
+速度が要るなら移植版**、という切り分けになる。
+
+### DSpark の k は「イメージごとに」制約が違う
+
+k の正解が資料によって 3 / 5 / 6 とバラバラだが、**ランタイムごとに drafter の
+`n_predict` が違う**ためで、矛盾ではない。
+
+| ランタイム | 制約 | 妥当な k |
+|---|---|---|
+| 上流 `deepseekv4-flash-vision` (**このリポジトリ**) | モデルカード / vLLM recipe が指定 | **3** |
+| tonyd2wild 系 (vLLM 0.21) | `n_predict=5` で割り切れること。k=6 は boot 拒否 | 5 |
+| anemll 0.25.2 系 | `n_predict` が 1 に解決。k=7 も通る。未指定だと k=1 になる | 5〜7 |
+
+tonyd2wild の issue #48 は「k=3 推奨」を**撤回**している。ただしその A/B は
+DSpark shared-expert ローダのパッチ (Patch 4) を当てずに測っていて、パッチ無しでは
+acceptance が半減する、という文脈。**上流イメージにその問題があるかは未確認**なので、
+ここでは公式の k=3 のままにしてある。
+
+**そして撤回の根拠は「数え上げプロンプト」だった。** HF discussion #11 に
+2 台 Spark での workload 別実測が出ていて、k=5 の優位はほぼ合成ベンチ限定:
+
+| workload | 採択率 @k=5 | tok/step | 採択率 @k=3 | tok/step |
+|---|---|---|---|---|
+| count-to-300 | 0.974 | 5.88 | 0.997 | 4.00 |
+| code | 0.464 | 3.31 | 0.642 | 2.93 |
+| prose | 0.180 | 1.90 | 0.286 | 1.86 |
+
+steps/s は k=5 で 14.6〜15.6、k=3 で 16.0〜17.3。掛け合わせると **code はほぼ互角、
+prose は k=3 の方がわずかに速い**。k=5 が大きく勝つのは数え上げだけ。
+**実用ワークロードでは k=3 で損をしていない**ということなので、この構成はこのままでよい。
+
+なお同スレッドでは、Vision-Exp の採択率は 0731 より構造的に低く
+(code / prose で **tok/s にして 12〜17% 減**) 、これはモデル固有だろうと結論している。
+**0731 と同じ速度は出ない前提**で見積もること。
+
+`--max-cudagraph-capture-size` は共通で `max_num_seqs × (k+1)`。
+このリポジトリは `1 × (3+1) = 4`。
+
+### 計測するときの注意 (これを知らないと 4 倍間違える)
+
+**`stream: false` で測ること。** 投機デコードは 1 ステップにつき SSE チャンクを
+1 つしか出さないので、ストリーミングの delta を数えると **tok/s ではなく steps/s** を
+測ってしまう。同一リクエストで 14.7 と 60.1 という差が報告されている。
+
+**コールドスタートのペナルティは約 30%** で、アイドル後にも再発する。
+短いウォームアップでは足りず、500〜700 トークン級の生成が要る。
+
+**decode が遅いときはまず acceptance を見る。** `tok/s = steps/s × 1 step あたりの
+採択トークン数`なので、acceptance が半分なら速度も半分。出力品質は完璧なままなので
+モデルが遅いように見える。prose での acceptance が 25% 前後なのは
+この vision 版の素の特性だと報告されている。
+
 ### もっと速くしたい (anemll ランタイムへの差し替え) — ⚠ 0731 専用
 
-> **この節はまるごと DeepSeek-V4-Flash-0731 の話。Vision-Exp では使えない。**
-> `presets/anemll-1m.env` は `VLLM_IMAGE` を anemll 版 (vLLM 0.25 系) に差し替える
-> プロファイルで、そこには Vision-Exp の視覚モジュール実装が入っていない。
-> Vision-Exp で速度を追うなら、anemll 側が vision 対応イメージを出すのを待つか、
-> 上流イメージのまま `--moe-backend` や cudagraph を詰めるかになる。
-> 0731 に戻すときのために残してある。
+> **この節は DeepSeek-V4-Flash-0731 の話。** `presets/anemll-1m.env` 単体では
+> Vision-Exp は動かない (anemll イメージに視覚モジュールが無い)。Vision-Exp で
+> 速度を追う場合は上の「コミュニティ移植版」を参照。
 
 既定構成の decode は **37.7〜65.5 t/s (平均 51.4)**。一方、同じ 2 台構成で
 **71〜76 t/s** を出している報告があり、その差はチューニングではなく
@@ -572,6 +765,12 @@ acceptance が 25.7% -> 60.2% 変わる (上流実測)。ログは `logger.debug
 | prefill が遅い | 2 台の driver / kernel / firmware バージョンが揃っているか。上流はここを揃えるだけで prefill +140% と報告している。あと MTU が 1500 のままなら 9000 に上げる (→ セットアップ 4.) |
 | `ping -M do -s 8972` が通らない | 片側の MTU が 1500 のまま。両ノードとも 9000 になっているか確認 (→ セットアップ 4.) |
 | `unknown reasoning parser` 等で起動しない | `.env` の `VLLM_PARSER_ARGS` を空にして素の起動をまず通す |
+| 画像を渡すと落ちる / vision のテンソルで `KeyError` 等 | text-only のモデルクラスに解決されている。① `vllm-cache/vllm/modelinfos` を**両ノードとも**消す (アーキ判定がキャッシュされる)。② それでもダメなら `VLLM_EXTRA_ARGS` に `--hf-overrides {"architectures":["DeepseekV4VForConditionalGeneration"]}` を足す (コミュニティ移植版で使われている手) |
+| CUDAGraph のところで両ノードとも固まる | **NVIDIA ドライバ 590.x は GB10 で CUDAGraph デッドロックを起こす**という報告がある。580.x を使うこと (このマシンは 580.173.02 で該当しない) |
+| decode が想定の 1/4 くらいに見える | 投機デコードをストリーミングで測っている。`stream: false` で測り直す (→ 「計測するときの注意」) |
+| 起動して安定していたのに、途中のリクエストで突然エンジンごと落ちる | ウォームアップが踏まなかった MoE / batch shape に当たって**推論中に JIT が走り**、`execute_model` の既定デッドライン 300 秒を超えて「worker が死んだ」と誤判定されている。`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800` を設定済み (compose の既定)。なお本物のハングは GPU 使用率 96% / 消費電力 18W 程度 (collective の spin-wait) で見分けられる — JIT 中は電力がアイドル近くまで落ちる |
+| モデルロードは通るのに TP ハンドシェイクで無言でハングする | `NCCL_IB_GID_INDEX` のピン留めがずれた可能性。特に dual-HCA では index が動く (→ 「QSFP を 2 枚使う」)。`.env` の該当行を空にして NCCL に選ばせる |
+| JIT 由来の `FileExistsError` / `runtime != nullptr` / FlashInfer の ABI 不一致 | JIT キャッシュを 2 ノードで共有すると両 rank が同じディレクトリに書いて壊れる。`vllm-cache/` は**ノードローカル**にすること (この compose は repo 直下なので既にローカル)。一度壊したら消す |
 | block size 関連のエラーで起動しない | `VLLM_EXTRA_ARGS` から `--block-size 256` を外す |
 
 ログ:
@@ -586,6 +785,25 @@ ssh -t "$WORKER" 'sudo docker logs -f dsv4-worker'
 ## 出典
 
 この構成は以下の実機レポートを組み合わせたもの。
+
+### Vision-Exp 関連 (2026-09-02 時点)
+
+- [vLLM Recipes: DeepSeek-V4-Flash-Vision-Exp](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) —
+  公式推奨フラグ。vision は PR #54566 の pre-release イメージ限定という記述もここ。
+  GB200 以外の実測は無く、GB10 / DGX Spark の構成は載っていない
+- [tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark) —
+  2 台 Spark 向け vision 移植。k=3 撤回の経緯 (issue #48)、cudagraph サイズの公式、
+  vision の既知欠落 (双方向 attention / `bias_vl`)、`stream: false` で測れという指摘
+- [HF discussions #10: Waiting for 2x NVIDIA DGX Sparks supported](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/discussions/10) —
+  2 台 Spark での動作報告。`--hf-overrides` によるアーキ指定と `modelinfos` 消去、
+  画像トークンの MoE routing バグ報告 (未決着)
+- [MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark) —
+  anemll 0.1.1 に hotfix で vision を注入する 2 台構成。decode 62〜83 tok/s
+- [hazyumps/deepseek-v4-flash-gb10](https://github.com/hazyumps/deepseek-v4-flash-gb10) —
+  0731 のみだが GB10 2 台のチューニングが濃い。ドライバ 590.x の CUDAGraph
+  デッドロック、NCCL 2.30.4 の `shm_broadcast` デッドロック回避
+
+### 0731 時代からのもの
 
 - [bjk110/spark_vllm_docker](https://github.com/bjk110/spark_vllm_docker) — 使っているイメージと、
   native DSpark k=7 / 固定 FP8 KV という検証済みの組み合わせの出所
