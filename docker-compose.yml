@@ -1,100 +1,161 @@
 # =============================================================================
-# Qwen/Qwen3.8-27B-FP8 on NVIDIA DGX Spark (GB10 / SM121), 単体ノード
+# nvidia/Qwen3.8-Flash-Next-NVFP4 on 2x NVIDIA DGX Spark (GB10 / SM121)
 #
-#   【現設定】 1M context (static YaRN factor 4.0) + DSpark 投機デコードを同居。
-#   ・1M + DSpark の併用は本ブランチの DeepSeek-V4-Flash (=1M, native DSpark k=7,
-#     decode 51.4 t/s 平均) で実績あり。ただし DeepSeek は drafter がチェックポイント
-#     同梱・native 1M なのに対し、Qwen は drafter が別モデル (Doopeworld/... 5層 2.6GB)
-#     + YaRN で 1M に延伸した構成。「特に 262K 超の位置では drafter の推測が弱い
-#     (スループット低下)」ことが予想されるため、実測で評価する。動かなければ下記
-#    コメント手順で DSpark を外し 1M 単体に。
-#  ・FP8 のまま。KV は fp8 (1M では KV が支配的: ~32GB/seq) で gpu-util 0.90。
-#  ・注意 (DeepSeek ブランチ実測より): 天井は KV でなく prefill の活性化メモリ。
-#     OOM-kill (exit 137) されたら --max-num-batched-tokens を下げるか 0.85 に。
+#   TP=2 (1 GPU/node) / distributed-executor-backend = mp (Ray なし)
+#   NCCL は 200GbE QSFP の RoCEv2 (RDMA) 経由、bootstrap も同じ IF の TCP
+#   MTP 投機デコード (k=3) + 1M context (static YaRN factor 4.0)
 #
-# rootful Docker (sudo) 前提: ${HOME} 等のシェル変数は使わず、キャッシュは
-# ./vllm-cache/ に相対マウント。Qwen / drafter は gated の可能性があるので
-# .env の HF_TOKEN=... を推奨。
+# API は ${HOST_PORT} (既定 8910) に OpenAI 互換で生える。
+#
+#   worker 側 (先に起動):  sudo docker compose --profile worker up -d
+#   head 側   (後で起動):  sudo docker compose --profile head   up -d
 # =============================================================================
 
+x-vllm-env: &vllm-env
+  # ---- モデル / サービング ----
+  MODEL_CONTAINER_PATH: ${MODEL_CONTAINER_PATH}
+  SERVED_MODEL_NAME: ${SERVED_MODEL_NAME}
+  HOST_PORT: ${HOST_PORT:-8910}
+  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-1048576}
+  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-4}
+  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
+  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.85}
+  VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
+  VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
+  VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
+
+  # ---- トポロジ ----
+  TP_SIZE: ${TP_SIZE:-2}
+  NNODES: ${NNODES:-2}
+  MASTER_PORT: ${MASTER_PORT:-29501}
+  HEAD_ROCE_IP: ${HEAD_ROCE_IP}
+  WORKER_ROCE_IP: ${WORKER_ROCE_IP}
+  ROCE_IF_NAME: ${ROCE_IF_NAME}
+  IB_HCA_NAME: ${IB_HCA_NAME}
+
+  # ---- NCCL / RoCE ----
+  # dual-HCA 前提 (GB10 の QSFP ケージは PCIe x4 が 2 本 = 2 枚の独立 NIC に
+  # 見える)。IB_HCA_NAME / ROCE_IF_NAME をカンマ区切りで 2 本書き、
+  # NCCL_IB_MERGE_NICS=1 で束ねる。詳細と実測値は .env.example を参照。
+  #
+  # ★ NCCL_IB_GID_INDEX は固定しないこと。GID テーブルの index はリンク
+  #   イベントで動き、ずれると片方の HCA だけ ibv_modify_qp failed (61) で
+  #   モデルロード後に TP ハンドシェイクが無言でハングする。
+  #   `:-` ではなく `-` にしてあるので、.env で空にすれば「未設定」がそのまま
+  #   コンテナまで届き、entrypoint が unset する。
+  NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
+  NCCL_IB_HCA: ${IB_HCA_NAME}
+  NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX-}
+  NCCL_SOCKET_IFNAME: ${ROCE_IF_NAME}
+  GLOO_SOCKET_IFNAME: ${ROCE_IF_NAME}
+  TP_SOCKET_IFNAME: ${ROCE_IF_NAME}
+  UCX_NET_DEVICES: ${ROCE_IF_NAME}
+  NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS-}
+  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC-}
+  NCCL_IGNORE_CPU_AFFINITY: ${NCCL_IGNORE_CPU_AFFINITY:-1}
+  NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
+  NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
+  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-/usr/lib/aarch64-linux-gnu/libnccl.so.2}
+
+  # execute_model RPC の既定デッドラインは 300 秒。ウォームアップが踏まなかった
+  # MoE / batch shape に当たって推論中に JIT が走ると、worker が生きているのに
+  # 「死んだ」と判定されてエンジンごと落ちる。
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
+  # 初回の Triton JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
+  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
+  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/usr/local/cuda/lib64:/usr/local/nvidia/lib64}
+
+  # ---- SM121 / GB10 数値契約 ----
+  #
+  # ★ VLLM_USE_DEEP_GEMM=0 は必須。GB10 (sm_121) では DeepGEMM の block-FP8
+  #   経路が選ばれうるが正しく実行されない。0 にすると動作する CUTLASS の
+  #   block-FP8 実装に落ちる。このチェックポイントは MTP の routed experts が
+  #   128x128 block FP8 なので、この経路を確実に踏む。
+  #
+  # ★ 他ブランチから持ってこないこと:
+  #     VLLM_NVFP4_GEMM_BACKEND   (Nemotron ブランチで使用)
+  #     VLLM_USE_FLASHINFER_MOE_FP4 (同上)
+  #   どちらも現在の vLLM main には**もう存在しない**。書いても
+  #   "Unknown vLLM environment variable" が出るだけで効かない。
+  VLLM_USE_DEEP_GEMM: ${VLLM_USE_DEEP_GEMM:-0}
+  # 1M は config の max_position_embeddings=262144 を超えるので必須
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
+
+  # ---- ランタイム ----
+  NVIDIA_VISIBLE_DEVICES: all
+  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  VLLM_CACHE_ROOT: /root/.cache/vllm
+  TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
+  TRITON_CACHE_DIR: /root/.triton/cache
+  HF_HOME: /cache/huggingface
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  # ランタイム JIT が nproc 分の nvcc を撒いて UMA を食い潰すのを防ぐ
+  MAX_JOBS: ${MAX_JOBS:-4}
+
+x-vllm-service: &vllm-service
+  image: ${VLLM_IMAGE}
+  network_mode: host
+  ipc: host
+  shm_size: "64gb"
+  entrypoint: ["bash", "/entrypoint.sh"]
+  volumes:
+    - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
+    - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+    - ./vllm-cache/vllm:/root/.cache/vllm
+    - ./vllm-cache/triton:/root/.triton
+    - ./vllm-cache/torchinductor:/var/cache/torchinductor
+    - ./vllm-cache/huggingface:/cache/huggingface
+    - /sys/class/infiniband:/sys/class/infiniband:ro
+  devices:
+    - /dev/infiniband:/dev/infiniband
+    # /etc/nvidia-container-runtime/config.toml が no-cgroups=true だと
+    # nvidia-container-cli が device cgroup の許可リストを更新しない。
+    # コンテナ内にノードは現れるがアクセスが弾かれ、vLLM が
+    # "Failed to infer device type" で死ぬ。明示的に渡して cgroup を通す。
+    - /dev/nvidia0:/dev/nvidia0
+    - /dev/nvidiactl:/dev/nvidiactl
+    - /dev/nvidia-uvm:/dev/nvidia-uvm
+    - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+    stack:
+      soft: 67108864
+      hard: 67108864
+  gpus: all
+  # 意図的に restart させない。EngineCore の初期化失敗で無限再起動すると
+  # GB10 の unified memory を食い潰してホストごと巻き込む。
+  restart: "no"
+
 services:
-  qwen3.8-27b:
-    image: eugr/spark-vllm:latest
-    container_name: qwen3.8-27b
-    restart: unless-stopped
-
-    gpus: all
-    ipc: host
-
-    ports:
-      - "0.0.0.0:8910:8910"
-
-    volumes:
-      # モデル / drafter / JIT キャッシュ (sudo でも ./ 相対なら動く)
-      - ./vllm-cache/huggingface:/cache/huggingface
-      - ./vllm-cache/vllm:/root/.cache/vllm
-      - ./vllm-cache/triton:/root/.triton
-      - ./vllm-cache/torchinductor:/var/cache/torchinductor
-
+  head:
+    <<: *vllm-service
+    container_name: qwen38-flash-next-head
+    profiles: ["head"]
     environment:
-      # Qwen / Doopeworld とも gated の可能性あり。値を .env の HF_TOKEN=... に入れる。
-      HF_TOKEN: ${HF_TOKEN:-}
-      HF_HOME: /cache/huggingface
+      <<: *vllm-env
+      ROLE: head
+      NODE_RANK: "0"
+      VLLM_HOST_IP: ${HEAD_ROCE_IP}
 
-      VLLM_CACHE_ROOT: /root/.cache/vllm
-      TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
-
-      # 1M context: config の max_position_embeddings=262144 より大きくするので必須
-      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-
-      # ランタイム JIT (nvcc 並列) がコアを使い切って UMA を食い潰すのを防ぐ
-      MAX_JOBS: "4"
-
-      # GB10 は UMA なので超過すると OOM-kill で OS ごと巻き込む。断片化対策に有効。
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-
-      # VLLM_ATTENTION_BACKEND は明示指定しない (hybrid + M-RoPE は自動選択に任せる)
-
-    entrypoint: []
-    command:
-      - /bin/bash
-      - -lc
-      - |
-        set -eux
-
-        which vllm
-        vllm -v || true
-        python3 - <<'PY'
-        import vllm
-        print("python vllm:", vllm.__version__)
-        PY
-
-        exec vllm serve Qwen/Qwen3.8-27B-FP8 \
-          --host 0.0.0.0 \
-          --port 8910 \
-          --served-model-name qwen3.8-27b \
-          --max-model-len 1000000 \
-          --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144, "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}' \
-          --gpu-memory-utilization 0.90 \
-          --kv-cache-dtype fp8 \
-          --max-num-seqs 4 \
-          --max-num-batched-tokens 8192 \
-          --enable-chunked-prefill \
-          --enable-prefix-caching \
-          --reasoning-parser qwen3 \
-          --enable-auto-tool-choice \
-          --tool-call-parser qwen3_xml \
-          --load-format safetensors \
-          --skip-mm-profiling \
-          --speculative-config '{"method":"dspark","model":"Doopeworld/Qwen3.8-27B-DSpark-vLLM","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
-          # --- 1M + DSpark が動かなかった場合のフォールバック (選択肢) ---
-          # 1) 1M 単体: 最後の --speculative-config 行を削除 (実測 ~10-15 tok/s に戻る)
-          # 2) 速度優先 262K + DSpark (0xBakeer レシピ実測 39-58 t/s):
-          #    --max-model-len 1000000 -> 262144、--hf-overrides 行削除、
-          #    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 削除、gpu-util 0.85 に下げる
-          # --- k (num_speculative_tokens) の切替 ---
-          # 7: スループット優先 / 14: 単ストリーム編集系最速 (58.5 t/s) だが同時性 c8 で半減
-          # --- short-text 品質が気になる場合 (static YaRN 減衰) ---
-          # factor 4.0 -> 2.0 (≈524K) にすると短文への影響を軽減できる
-          # --- もし method dspark がこのイメージに無くて起動失敗する場合 ---
-          # image を vllm/vllm-openai:v0.27.1-aarch64 (レシピ実測版) に差し替え。
+  worker:
+    <<: *vllm-service
+    container_name: qwen38-flash-next-worker
+    profiles: ["worker"]
+    environment:
+      <<: *vllm-env
+      ROLE: worker
+      NODE_RANK: "1"
+      VLLM_HOST_IP: ${WORKER_ROCE_IP}
+      # QSFP をリング配線していて worker 側のポート名が head と違う場合だけ
+      # .env に WORKER_* を書く。未設定なら head と同じ値。
+      ROCE_IF_NAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      IB_HCA_NAME: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
+      NCCL_IB_HCA: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
+      NCCL_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      GLOO_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      TP_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      UCX_NET_DEVICES: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
+      NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX-${NCCL_IB_GID_INDEX-}}
