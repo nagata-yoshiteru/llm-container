@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# nvidia/Qwen3.8-Flash-Next-NVFP4
-#   / 1 host + 2x RTX PRO 6000 Blackwell (GB202, SM120) entrypoint
+# nvidia/Qwen3.8-Flash-Next-NVFP4 / 単一ホスト + SM12x GPU 複数枚 entrypoint
 #
-# 単一ノード TP=2。`vllm serve` を 1 つ立てるだけ。
+# 単一ノードなので `vllm serve` を 1 つ立てるだけ。TP は TP_SIZE で決まる。
 # 分散バックエンドは Ray ではなく mp (torch.distributed SPMD) で、rank 間は
-# 同一ホスト内のプロセス間通信 + NCCL over PCIe P2P。
+# 同一ホスト内のプロセス間通信 + NCCL。
 #
 # DGX Spark x2 ブランチにあった ROLE / NODE_RANK / MASTER_ADDR / --headless /
 # RDMA プリフライトは全部要らなくなったので落としてある。

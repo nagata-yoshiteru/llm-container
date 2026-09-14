@@ -1,9 +1,9 @@
 # =============================================================================
-# nvidia/Qwen3.8-Flash-Next-NVFP4 on 1x workstation + 2x RTX PRO 6000 Blackwell
-#                                                     (GB202 / SM120 / 96 GB each)
+# nvidia/Qwen3.8-Flash-Next-NVFP4 / 単一ホスト + SM12x GPU 複数枚
+#   (RTX PRO 6000 Blackwell 等。既定値は 96 GB 級カード 2 枚を想定)
 #
-#   TP=2 (同一ホスト内の 2 GPU) / distributed-executor-backend = mp
-#   GPU 間は PCIe P2P。RDMA も RoCE も Ray も要らない。
+#   TP=TP_SIZE (同一ホスト内の GPU) / distributed-executor-backend = mp
+#   GPU 間は NVLink か PCIe。RDMA も RoCE も Ray も要らない。
 #   MTP 投機デコード (k=3) + 1M context (static YaRN factor 4.0)
 #
 # API は ${HOST_PORT} (既定 8910) に OpenAI 互換で生える。
@@ -46,17 +46,18 @@ services:
       VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
       VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
 
-      # ---- NCCL (単一ノード / PCIe P2P) ----
+      # ---- NCCL (単一ノード) ----
       #
-      # RDMA HCA は無いので IB を明示的に切る。切らないと NCCL が起動のたびに
-      # 存在しない HCA を探しに行って数秒無駄にし、ログにノイズが出る。
+      # RDMA を使わない構成なので IB を明示的に切る。切らないと NCCL が起動の
+      # たびに存在しない HCA を探しに行って数秒無駄にし、ログにノイズが出る。
       #
-      # NVLS は NVSwitch 前提の機能。このマシンには NVLink そのものが無い。
+      # NVLS は NVSwitch 前提の機能。NVLink の無い機体では無効にしておく。
       #
-      # ★ NCCL_P2P_DISABLE は**設定しない**のが正解。このマシンは
-      #   `nvidia-smi topo -p2p r` が両方向 OK を返す = PCIe P2P が生きている。
-      #   切ると all-reduce が host bounce 経由になって目に見えて遅くなる。
-      #   P2P 絡みでハングしたときだけ .env で 1 にして切り分けること。
+      # ★ NCCL_P2P_DISABLE は .env 側で決める (ここでは素通し)。
+      #   NVLink の無い Blackwell ワークステーション機では P2P 経路が壊れていて
+      #   最初の collective でハングするため 1 が必須。NVLink 機では逆に
+      #   切ると遅くなるだけなので未設定にする。判断は preflight.sh が出す。
+      #   詳しい経緯と上流 issue は .env.example の NCCL の節を読むこと。
       NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-1}
       NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
       NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE-}
@@ -129,7 +130,9 @@ services:
     # 設定) だと nvidia-container-cli が device cgroup の許可リストを更新せず、
     # コンテナ内にノードは見えるのにアクセスが弾かれて vLLM が
     # "Failed to infer device type" で死ぬ。明示的に渡して cgroup を通す。
-    # ★ 2 GPU なので nvidia0 と nvidia1 の両方が要る。
+    # ★ /dev/nvidiaN は**使う GPU の枚数だけ**並べること。下は 2 枚構成の例で、
+    #   4 枚なら nvidia2 / nvidia3 の行を足す。`ls /dev/nvidia[0-9]*` で確認。
+    #   足りないと entrypoint の GPU 枚数チェックで止まる。
     devices:
       - /dev/nvidia0:/dev/nvidia0
       - /dev/nvidia1:/dev/nvidia1
@@ -137,6 +140,13 @@ services:
       - /dev/nvidia-uvm:/dev/nvidia-uvm
       - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
 
+    # ★ memlock は意図的に指定していない。RDMA (ibverbs) を使う構成でのみ必要で、
+    #   GPU 間が PCIe / NVLink だけなら要らない (CUDA の pinned host memory は
+    #   ドライバ側の経路で確保され RLIMIT_MEMLOCK に計上されない)。
+    #   rootless Docker では、ホストの `ulimit -Hl` を超える値を書くと
+    #   ハード rlimit の引き上げに CAP_SYS_RESOURCE が要るため
+    #   "error setting rlimit type 8: operation not permitted" で起動できない。
+    #   stack は soft を上げるだけなのでハード上限 (通常 unlimited) 以内に収まる。
     ulimits:
       stack:
         soft: 67108864

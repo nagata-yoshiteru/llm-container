@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 起動前チェック (1 host + 2x RTX PRO 6000 Blackwell / SM120)
+# 起動前チェック (単一ホスト / SM12x GPU を複数枚)
+#
+#   実機の GPU 枚数・VRAM・PCIe 配線・NVLink の有無を読んで、.env の設定と
+#   噛み合っているかを判定する。値をハードコードしていないので、枚数や VRAM が
+#   違う機体でもそのまま使える。
 #
 #   ./scripts/preflight.sh          … 通常のチェック
 #   PREFLIGHT_DEEP=1 ./scripts/preflight.sh
@@ -10,7 +14,7 @@
 # ここで赤が出た状態で起動すると、だいたい 10〜20 分待たされた挙句
 # CUDA OOM か「起動はするが出力が壊れている」で終わる。
 #
-# 前半 = このマシンのハードウェア / Docker 環境。
+# 前半 = ハードウェア / Docker 環境 (機体ごとに違う部分)。
 # 後半 = Qwen3.8-Flash-Next-NVFP4 固有。こちらは「設定ミスでも起動はするが
 #        黙って品質だけ壊れる」経路が複数あるので重点的に見る。
 # =============================================================================
@@ -89,7 +93,10 @@ done < <(nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader)
 N_DISTINCT=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sort -u | grep -c .)
 [ "${N_DISTINCT}" -eq 1 ] || ng "GPU の型番/VRAM が揃っていません。TP には同一構成が必要です"
 
-# 既に何かが VRAM を掴んでいないか
+# 既に何かが VRAM を掴んでいないか。
+# ただし「このスタック自身が起動中」は正常なので区別する。
+SELF_UP=0
+docker compose ps --status running --quiet 2>/dev/null | grep -q . && SELF_UP=1
 while IFS=, read -r IDX USED; do
     USED=$(echo "${USED}" | tr -dc '0-9')
     if [ "${USED:-0}" -lt 1024 ]; then
@@ -97,34 +104,80 @@ while IFS=, read -r IDX USED; do
     elif [ "${USED:-0}" -lt 4096 ]; then
         warn "GPU${IDX} が既に ${USED} MiB 使用中 (デスクトップ / ブラウザ?)"
         warn "  GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-?} の余白を食います"
+    elif [ "${SELF_UP}" = "1" ]; then
+        # 自分自身が起動中なだけ。起動後に様子を見るために回すこともあるので
+        # これは異常ではない。
+        warn "GPU${IDX} が ${USED} MiB 使用中 — このスタック自身が起動中です"
     else
         ng "GPU${IDX} が既に ${USED} MiB 使用中 — 他のプロセスを止めてください"
     fi
 done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader)
 
 echo
-echo "== GPU 間の接続 =="
-# P2P が死んでいると NCCL の all-reduce がホスト経由の bounce buffer に落ちる。
-# ★ 凡例 ("CNS = Chipset not supported" 等) まで grep すると必ず引っかかるので、
-#   行頭が GPU<N> の**マトリクス本体だけ**を見る。
-P2P=$(nvidia-smi topo -p2p r 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
-      | grep -E '^[[:space:]]*GPU[0-9]')
-if [ -z "${P2P}" ]; then
-    warn "nvidia-smi topo -p2p r を解釈できませんでした"
-elif echo "${P2P}" | grep -qE '[[:space:]](CNS|GNS|TNS|NS|U)([[:space:]]|$)'; then
-    warn "PCIe P2P が使えない組み合わせがあります:"
-    echo "${P2P}" | sed 's/^/       /'
-    warn "  NCCL はホスト経由にフォールバックします (遅いが動きます)"
-elif echo "${P2P}" | grep -q 'OK'; then
-    ok "PCIe P2P 有効 — .env の NCCL_P2P_DISABLE は空のままにすること"
-    [ -n "${NCCL_P2P_DISABLE}" ] && \
-        warn "  なのに NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} が設定されています。遅くなります"
+echo "== NCCL P2P =="
+# ★★ ここは nvidia-smi の言うことを信じてはいけない ★★
+#
+# NVLink の無い Blackwell ワークステーション機 (RTX PRO 6000 等を PCIe だけで
+# 複数枚) では NCCL の P2P 経路がドライバ/NCCL レベルで壊れており、最初の
+# collective で 100% ハングする (NVIDIA/nccl #1999, vllm #33041, sglang #15181)。
+# それでも
+#     nvidia-smi topo -p2p r   -> OK
+#     can_device_access_peer() -> true
+# と出るので、これらを根拠に NCCL_P2P_DISABLE を外すと刺さる。
+#
+# 一方 NVLink / NVSwitch で繋がっている機体では P2P は正常に効くので、
+# 切ると素直に遅くなるだけ。よって「topo が OK か」ではなく
+# 「NVLink があるか」で必要な設定が変わる。
+if [ "${N_GPU}" -le 1 ] || [ "${TP_SIZE}" = "1" ]; then
+    ok "GPU 1 枚構成なので collective が走らない — NCCL_P2P_DISABLE は不問"
+elif nvidia-smi topo -m 2>/dev/null | grep -qE '(^|[[:space:]])NV[0-9]+([[:space:]]|$)'; then
+    HAS_NVLINK=1
+    if [ "${NCCL_P2P_DISABLE}" = "1" ]; then
+        warn "NVLink があるのに NCCL_P2P_DISABLE=1 です。all-reduce が"
+        warn "  ホストメモリ経由に落ちて遅くなります。外すことを検討してください"
+    else
+        ok "NVLink 接続 — P2P はそのまま使える (NCCL_P2P_DISABLE は未設定が正解)"
+    fi
+elif [ "${NCCL_P2P_DISABLE}" = "1" ]; then
+    ok "PCIe のみ + NCCL_P2P_DISABLE=1 (この構成では必須。topo の OK 表示は当てにならない)"
 else
-    warn "nvidia-smi topo -p2p r を解釈できませんでした"
+    ng "NVLink が無い複数 GPU 構成なのに NCCL_P2P_DISABLE が 1 ではありません"
+    echo "       この構成では起動しても NCCL init でハングする可能性が高いです。"
+    echo "       症状: ログが \`vLLM is using nccl==...\` で止まり、VRAM は 1 GiB のまま"
+    echo "             GPU util だけ 100% (スピン待ち)。何時間待っても進みません。"
+    echo "       Blackwell ワークステーション機の既知の不具合:"
+    echo "         NVIDIA/nccl #1999 / vllm-project/vllm #33041 / sgl-project/sglang #15181"
+    echo "       .env に NCCL_P2P_DISABLE=1 を設定してください"
 fi
+# vLLM 独自 all-reduce も CUDA IPC/P2P 前提なので、P2P を切るなら一緒に切る。
+if echo "${VLLM_EXTRA_ARGS}" | grep -q -- '--disable-custom-all-reduce'; then
+    ok "--disable-custom-all-reduce あり (P2P を切った環境では実質必須)"
+else
+    warn "--disable-custom-all-reduce がありません。vLLM 独自 all-reduce は CUDA IPC/P2P"
+    warn "  前提なので、worker 初期化中にハングする報告があります。足しておくのが無難"
+fi
+# 参考情報として topo も出す (判定には使わない)
+nvidia-smi topo -p2p r 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E '^[[:space:]]*GPU[0-9]' | sed 's/^/       (参考) /'
+
+# --- GPU が刺さっていないか --------------------------------------------------
+# NCCL ハングを踏むと、コンテナを落としてもドライバ内にカーネルが残り、
+# 「プロセスは無いのに util 100%」という状態になる。この状態で再起動しても
+# また刺さるので、先にリセットさせる。
+NPROC_GPU=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
+while IFS=, read -r IDX UTIL; do
+    UTIL=$(echo "${UTIL}" | tr -dc '0-9')
+    if [ "${UTIL:-0}" -ge 50 ] && [ "${NPROC_GPU}" -eq 0 ]; then
+        ng "GPU${IDX} が util ${UTIL}% なのに compute プロセスがありません (wedged)"
+        echo "       前回の NCCL ハングの残骸です。このまま起動しても また刺さります。"
+        echo "         sudo nvidia-smi -r -i ${IDX}      # 画面出力が乗っていると失敗します"
+        echo "       ダメならリブート。"
+    fi
+done < <(nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader)
 
 # --- PCIe リンク幅 -----------------------------------------------------------
-# ★ このマシン最大の性能要因。GPU0 は Gen3 x4 のブリッジ配下に居る。
+# ★ 見落としやすい性能要因。物理的に x16 の形をしたスロットでも、チップセット
+#   配下の x4 / x8 にしか配線されていないことがある。
 #   アイドル時は速度 (GT/s) が Gen1 まで落ちるのが正常なので、**幅だけ**見る。
 #   幅は上流ブリッジの LnkCap を読む (GPU 側の max_link_width は
 #   「GPU が対応する最大」でスロット配線を反映しない)。
@@ -132,7 +185,9 @@ echo
 echo "== PCIe リンク幅 (上流ブリッジの LnkCap) =="
 while IFS=, read -r IDX BUSID; do
     BUSID=$(echo "${BUSID}" | tr -d ' ' | tr 'A-F' 'a-f')
-    SYSID="${BUSID#0000}"                       # 00000000:04:00.0 -> 0000:04:00.0
+    # nvidia-smi は 8 桁ドメインで返すが sysfs は 4 桁 (例 00000000:NN:00.0 ->
+    # 0000:NN:00.0) なので先頭を削る
+    SYSID="${BUSID#0000}"
     DEVDIR="/sys/bus/pci/devices/${SYSID}"
     if [ ! -d "${DEVDIR}" ]; then
         warn "GPU${IDX} (${SYSID}) を sysfs で見つけられません"
