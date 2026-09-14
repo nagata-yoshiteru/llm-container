@@ -1,161 +1,168 @@
 # =============================================================================
-# nvidia/Qwen3.8-Flash-Next-NVFP4 on 2x NVIDIA DGX Spark (GB10 / SM121)
+# nvidia/Qwen3.8-Flash-Next-NVFP4 on 1x workstation + 2x RTX PRO 6000 Blackwell
+#                                                     (GB202 / SM120 / 96 GB each)
 #
-#   TP=2 (1 GPU/node) / distributed-executor-backend = mp (Ray なし)
-#   NCCL は 200GbE QSFP の RoCEv2 (RDMA) 経由、bootstrap も同じ IF の TCP
+#   TP=2 (同一ホスト内の 2 GPU) / distributed-executor-backend = mp
+#   GPU 間は PCIe P2P。RDMA も RoCE も Ray も要らない。
 #   MTP 投機デコード (k=3) + 1M context (static YaRN factor 4.0)
 #
 # API は ${HOST_PORT} (既定 8910) に OpenAI 互換で生える。
 #
-#   worker 側 (先に起動):  sudo docker compose --profile worker up -d
-#   head 側   (後で起動):  sudo docker compose --profile head   up -d
+#   起動:  ./scripts/preflight.sh && sudo docker compose up -d
+#   ログ:  sudo docker compose logs -f
+#   停止:  sudo docker compose down
+#
+# ---------------------------------------------------------------------------
+# DGX Spark x2 ブランチからの差分 (なぜ消えたか)
+#
+#   ・head / worker profile        -> 1 ノードなのでサービスは 1 つ
+#   ・NNODES / NODE_RANK / MASTER_* -> マルチノード rendezvous が不要
+#   ・NCCL_IB_* / ROCE_* / GID     -> RDMA を使わない。NCCL は PCIe P2P を使う
+#   ・/dev/infiniband, /sys/class/infiniband マウント -> 同上
+#   ・network_mode: host           -> ポートマッピングで足りる
+#   ・VLLM_NCCL_SO_PATH            -> aarch64 のパスだった。x86_64 では
+#                                     イメージ同梱の NCCL に任せる
+#
+#   逆に SM12x ファミリ (GB10 = sm_121 / RTX PRO 6000 = sm_120) 共通の
+#   数値まわりの約束事はそのまま引き継いでいる。下の「SM12x 数値契約」参照。
 # =============================================================================
 
-x-vllm-env: &vllm-env
-  # ---- モデル / サービング ----
-  MODEL_CONTAINER_PATH: ${MODEL_CONTAINER_PATH}
-  SERVED_MODEL_NAME: ${SERVED_MODEL_NAME}
-  HOST_PORT: ${HOST_PORT:-8910}
-  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-1048576}
-  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-4}
-  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
-  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.85}
-  VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
-  VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
-  VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
-
-  # ---- トポロジ ----
-  TP_SIZE: ${TP_SIZE:-2}
-  NNODES: ${NNODES:-2}
-  MASTER_PORT: ${MASTER_PORT:-29501}
-  HEAD_ROCE_IP: ${HEAD_ROCE_IP}
-  WORKER_ROCE_IP: ${WORKER_ROCE_IP}
-  ROCE_IF_NAME: ${ROCE_IF_NAME}
-  IB_HCA_NAME: ${IB_HCA_NAME}
-
-  # ---- NCCL / RoCE ----
-  # dual-HCA 前提 (GB10 の QSFP ケージは PCIe x4 が 2 本 = 2 枚の独立 NIC に
-  # 見える)。IB_HCA_NAME / ROCE_IF_NAME をカンマ区切りで 2 本書き、
-  # NCCL_IB_MERGE_NICS=1 で束ねる。詳細と実測値は .env.example を参照。
-  #
-  # ★ NCCL_IB_GID_INDEX は固定しないこと。GID テーブルの index はリンク
-  #   イベントで動き、ずれると片方の HCA だけ ibv_modify_qp failed (61) で
-  #   モデルロード後に TP ハンドシェイクが無言でハングする。
-  #   `:-` ではなく `-` にしてあるので、.env で空にすれば「未設定」がそのまま
-  #   コンテナまで届き、entrypoint が unset する。
-  NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
-  NCCL_IB_HCA: ${IB_HCA_NAME}
-  NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX-}
-  NCCL_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  GLOO_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  TP_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  UCX_NET_DEVICES: ${ROCE_IF_NAME}
-  NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS-}
-  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC-}
-  NCCL_IGNORE_CPU_AFFINITY: ${NCCL_IGNORE_CPU_AFFINITY:-1}
-  NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
-  NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
-  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-/usr/lib/aarch64-linux-gnu/libnccl.so.2}
-
-  # execute_model RPC の既定デッドラインは 300 秒。ウォームアップが踏まなかった
-  # MoE / batch shape に当たって推論中に JIT が走ると、worker が生きているのに
-  # 「死んだ」と判定されてエンジンごと落ちる。
-  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
-  # 初回の Triton JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
-  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
-  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/usr/local/cuda/lib64:/usr/local/nvidia/lib64}
-
-  # ---- SM121 / GB10 数値契約 ----
-  #
-  # ★ VLLM_USE_DEEP_GEMM=0 は必須。GB10 (sm_121) では DeepGEMM の block-FP8
-  #   経路が選ばれうるが正しく実行されない。0 にすると動作する CUTLASS の
-  #   block-FP8 実装に落ちる。このチェックポイントは MTP の routed experts が
-  #   128x128 block FP8 なので、この経路を確実に踏む。
-  #
-  # ★ 他ブランチから持ってこないこと:
-  #     VLLM_NVFP4_GEMM_BACKEND   (Nemotron ブランチで使用)
-  #     VLLM_USE_FLASHINFER_MOE_FP4 (同上)
-  #   どちらも現在の vLLM main には**もう存在しない**。書いても
-  #   "Unknown vLLM environment variable" が出るだけで効かない。
-  VLLM_USE_DEEP_GEMM: ${VLLM_USE_DEEP_GEMM:-0}
-  # 1M は config の max_position_embeddings=262144 を超えるので必須
-  VLLM_ALLOW_LONG_MAX_MODEL_LEN: ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
-
-  # ---- ランタイム ----
-  NVIDIA_VISIBLE_DEVICES: all
-  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-  VLLM_CACHE_ROOT: /root/.cache/vllm
-  TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
-  TRITON_CACHE_DIR: /root/.triton/cache
-  HF_HOME: /cache/huggingface
-  HF_HUB_OFFLINE: "1"
-  TRANSFORMERS_OFFLINE: "1"
-  # ランタイム JIT が nproc 分の nvcc を撒いて UMA を食い潰すのを防ぐ
-  MAX_JOBS: ${MAX_JOBS:-4}
-
-x-vllm-service: &vllm-service
-  image: ${VLLM_IMAGE}
-  network_mode: host
-  ipc: host
-  shm_size: "64gb"
-  entrypoint: ["bash", "/entrypoint.sh"]
-  volumes:
-    - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
-    - ./scripts/entrypoint.sh:/entrypoint.sh:ro
-    - ./vllm-cache/vllm:/root/.cache/vllm
-    - ./vllm-cache/triton:/root/.triton
-    - ./vllm-cache/torchinductor:/var/cache/torchinductor
-    - ./vllm-cache/huggingface:/cache/huggingface
-    - /sys/class/infiniband:/sys/class/infiniband:ro
-  devices:
-    - /dev/infiniband:/dev/infiniband
-    # /etc/nvidia-container-runtime/config.toml が no-cgroups=true だと
-    # nvidia-container-cli が device cgroup の許可リストを更新しない。
-    # コンテナ内にノードは現れるがアクセスが弾かれ、vLLM が
-    # "Failed to infer device type" で死ぬ。明示的に渡して cgroup を通す。
-    - /dev/nvidia0:/dev/nvidia0
-    - /dev/nvidiactl:/dev/nvidiactl
-    - /dev/nvidia-uvm:/dev/nvidia-uvm
-    - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
-  ulimits:
-    memlock:
-      soft: -1
-      hard: -1
-    stack:
-      soft: 67108864
-      hard: 67108864
-  gpus: all
-  # 意図的に restart させない。EngineCore の初期化失敗で無限再起動すると
-  # GB10 の unified memory を食い潰してホストごと巻き込む。
-  restart: "no"
-
 services:
-  head:
-    <<: *vllm-service
-    container_name: qwen38-flash-next-head
-    profiles: ["head"]
-    environment:
-      <<: *vllm-env
-      ROLE: head
-      NODE_RANK: "0"
-      VLLM_HOST_IP: ${HEAD_ROCE_IP}
+  vllm:
+    image: ${VLLM_IMAGE}
+    container_name: qwen38-flash-next
 
-  worker:
-    <<: *vllm-service
-    container_name: qwen38-flash-next-worker
-    profiles: ["worker"]
     environment:
-      <<: *vllm-env
-      ROLE: worker
-      NODE_RANK: "1"
-      VLLM_HOST_IP: ${WORKER_ROCE_IP}
-      # QSFP をリング配線していて worker 側のポート名が head と違う場合だけ
-      # .env に WORKER_* を書く。未設定なら head と同じ値。
-      ROCE_IF_NAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      IB_HCA_NAME: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
-      NCCL_IB_HCA: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
-      NCCL_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      GLOO_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      TP_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      UCX_NET_DEVICES: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
-      NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX-${NCCL_IB_GID_INDEX-}}
+      # ---- モデル / サービング ----
+      MODEL_CONTAINER_PATH: ${MODEL_CONTAINER_PATH}
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME}
+      HOST_PORT: ${HOST_PORT:-8910}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-1048576}
+      MAX_NUM_SEQS: ${MAX_NUM_SEQS:-8}
+      MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-16384}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.92}
+      TP_SIZE: ${TP_SIZE:-2}
+      VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
+      VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
+      VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
+
+      # ---- NCCL (単一ノード / PCIe P2P) ----
+      #
+      # RDMA HCA は無いので IB を明示的に切る。切らないと NCCL が起動のたびに
+      # 存在しない HCA を探しに行って数秒無駄にし、ログにノイズが出る。
+      #
+      # NVLS は NVSwitch 前提の機能。このマシンには NVLink そのものが無い。
+      #
+      # ★ NCCL_P2P_DISABLE は**設定しない**のが正解。このマシンは
+      #   `nvidia-smi topo -p2p r` が両方向 OK を返す = PCIe P2P が生きている。
+      #   切ると all-reduce が host bounce 経由になって目に見えて遅くなる。
+      #   P2P 絡みでハングしたときだけ .env で 1 にして切り分けること。
+      NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-1}
+      NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
+      NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE-}
+      NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE-}
+      NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
+
+      # execute_model RPC の既定デッドラインは 300 秒。ウォームアップが踏まなかった
+      # MoE / batch shape に当たって推論中に JIT が走ると、worker が生きているのに
+      # 「死んだ」と判定されてエンジンごと落ちる。
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
+      # 初回の torch.compile / Triton JIT は数分 CPU を占有する。
+      # NCCL watchdog に殺されないよう延長。
+      TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
+      VLLM_WORKER_MULTIPROC_METHOD: ${VLLM_WORKER_MULTIPROC_METHOD-}
+
+      # ---- SM12x 数値契約 (GB10 ブランチから継承) ----
+      #
+      # ★ VLLM_USE_DEEP_GEMM=0 は維持する。DeepGEMM は sm_90a / sm_100a 向けで
+      #   SM12x には対応カーネルが無い。現行 vLLM は capability を見て自分で
+      #   外すはずだが、選ばれた場合に黙って壊れる経路なので明示的に殺しておく。
+      #   このチェックポイントは MTP の routed experts が 128x128 block FP8 なので
+      #   block-FP8 経路は確実に踏む。
+      #
+      # ★ 他ブランチから持ってこないこと:
+      #     VLLM_NVFP4_GEMM_BACKEND   (Nemotron ブランチで使用)
+      #     VLLM_USE_FLASHINFER_MOE_FP4 (同上)
+      #   どちらも現在の vLLM main には**もう存在しない**。書いても
+      #   "Unknown vLLM environment variable" が出るだけで効かない。
+      VLLM_USE_DEEP_GEMM: ${VLLM_USE_DEEP_GEMM:-0}
+      # 1M は config の max_position_embeddings=262144 を超えるので必須
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
+      # SM120 の NVFP4 MoE 切り分け用 (既定は未設定)。.env の解説を読むこと。
+      VLLM_MOE_FORCE_MARLIN: ${VLLM_MOE_FORCE_MARLIN-}
+
+      # ---- ランタイム ----
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      VLLM_CACHE_ROOT: /root/.cache/vllm
+      TORCHINDUCTOR_CACHE_DIR: /var/cache/torchinductor
+      TRITON_CACHE_DIR: /root/.triton/cache
+      HF_HOME: /cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      # ランタイム JIT が nproc 分 (=32) の nvcc を撒いてホスト RAM を食うのを防ぐ
+      MAX_JOBS: ${MAX_JOBS:-8}
+
+    entrypoint: ["bash", "/entrypoint.sh"]
+
+    # host ネットワークは要らない。LAN に出したくなければ .env の
+    # API_BIND_ADDR を 127.0.0.1 にする。
+    ports:
+      - "${API_BIND_ADDR:-0.0.0.0}:${HOST_PORT:-8910}:${HOST_PORT:-8910}"
+
+    volumes:
+      - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
+      - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+      - ./vllm-cache/vllm:/root/.cache/vllm
+      - ./vllm-cache/triton:/root/.triton
+      - ./vllm-cache/torchinductor:/var/cache/torchinductor
+      - ./vllm-cache/huggingface:/cache/huggingface
+
+    # TP=2 の worker 間は共有メモリで殴り合うので host IPC を使う。
+    # (ipc: host を付けると shm_size は無視されるため書いていない)
+    ipc: host
+
+    gpus: all
+
+    # /etc/nvidia-container-runtime/config.toml が no-cgroups=true (rootless 用
+    # 設定) だと nvidia-container-cli が device cgroup の許可リストを更新せず、
+    # コンテナ内にノードは見えるのにアクセスが弾かれて vLLM が
+    # "Failed to infer device type" で死ぬ。明示的に渡して cgroup を通す。
+    # ★ 2 GPU なので nvidia0 と nvidia1 の両方が要る。
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidia1:/dev/nvidia1
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
+
+    # 意図的に restart させない。EngineCore の初期化失敗で無限再起動すると、
+    # 124 GiB のチェックポイントを毎回読み直して NVMe とページキャッシュを
+    # 延々と叩き続ける。安定してから unless-stopped に変えること。
+    restart: "no"
+
+    # 初回起動は torch.compile + CUDA graph capture で 10〜20 分かかる。
+    # start_period を短くすると起動中に unhealthy 判定されるので注意。
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import sys, urllib.request
+          try:
+              sys.exit(0 if urllib.request.urlopen(
+                  "http://127.0.0.1:${HOST_PORT:-8910}/health", timeout=5
+              ).status == 200 else 1)
+          except Exception:
+              sys.exit(1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30m

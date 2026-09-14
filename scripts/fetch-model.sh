@@ -2,12 +2,12 @@
 # =============================================================================
 # nvidia/Qwen3.8-Flash-Next-NVFP4 を .env の MODEL_PATH に revision 固定で落とす。
 #
-#   ★ **2 台とも** で実行すること。TP=2 の各ノードが自分のローカルにある
-#     チェックポイントを読む (compose が :ro でマウントする)。
+#   単一ノード (2x RTX PRO 6000) 構成なので、実行するのは 1 回だけ。
+#   TP=2 の 2 プロセスは同じコンテナから同じマウントを読む。
 #
 #   使い方:  ./scripts/fetch-model.sh
 #
-#   sudo は不要。docker も使わない。約 124 GiB / 1 台。
+#   sudo は不要。docker も使わない。約 124 GiB。
 # =============================================================================
 set -euo pipefail
 
@@ -55,7 +55,7 @@ echo "[fetch] repo=${MODEL_REPO}"
 echo "[fetch] rev =${MODEL_REVISION}"
 echo "[fetch] dest=${MODEL_PATH}"
 
-# --max-workers は UMA の帯域と NVMe を食い潰さない程度に。
+# --max-workers は NVMe とページキャッシュを食い潰さない程度に。
 # HF_TOKEN は gated ではないので空でよい (レート制限回避には効く)。
 HF_TOKEN="${HF_TOKEN:-}" "${HF_BIN}" download \
     "${MODEL_REPO}" \
@@ -74,4 +74,4 @@ for f in config.json model.safetensors.index.json tokenizer.json; do
 done
 
 echo "[fetch] 完了: $(du -sh "${MODEL_PATH}" | cut -f1)"
-echo "[fetch] ★ もう 1 台でも同じコマンドを実行すること。"
+echo "[fetch] 次: ./scripts/preflight.sh"

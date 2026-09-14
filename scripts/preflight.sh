@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 起動前チェック。head / worker 両方で実行する。
+# 起動前チェック (1 host + 2x RTX PRO 6000 Blackwell / SM120)
 #
-#   ./scripts/preflight.sh
+#   ./scripts/preflight.sh          … 通常のチェック
+#   PREFLIGHT_DEEP=1 ./scripts/preflight.sh
+#                                   … 上に加えてイメージを 1 回起動し、
+#                                     CUDA arch list に sm_120 が居るかまで見る
 #
-# ここで赤が出た状態で起動すると、だいたい 5〜10 分待たされた挙句
-# NCCL の "unhandled system error" か OOM-kill で死ぬ。
+# ここで赤が出た状態で起動すると、だいたい 10〜20 分待たされた挙句
+# CUDA OOM か「起動はするが出力が壊れている」で終わる。
 #
-# このブランチ (Qwen3.8-Flash-Next-NVFP4 / TP=2) 固有の検査を後半に足してある。
-# このモデルは「設定ミスでも起動はするが黙って品質だけ壊れる」経路が複数ある
-# ので、そこを重点的に見る。
+# 前半 = このマシンのハードウェア / Docker 環境。
+# 後半 = Qwen3.8-Flash-Next-NVFP4 固有。こちらは「設定ミスでも起動はするが
+#        黙って品質だけ壊れる」経路が複数あるので重点的に見る。
 # =============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -27,95 +30,132 @@ fi
 # .env は docker compose の書式 (クォートなし・空白を含む値あり) なので
 # source せず、必要なキーだけリテラルに読む。
 env_get() {
-    sed -n "s/^$1=//p" .env | tail -1
+    local v
+    v=$(sed -n "s/^$1=//p" .env | tail -1)
+    # 空白を含む値は 'シングルクォート' で括ってある。docker compose は展開時に
+    # 剥がすので、ここでも剥がしておく。剥がさないと下の JSON 検査が末尾の
+    # クォートを JSON の一部とみなして誤検知する。
+    case "${v}" in
+        \'*\') v=${v#\'}; v=${v%\'} ;;
+        \"*\") v=${v#\"}; v=${v%\"} ;;
+    esac
+    printf '%s' "${v}"
 }
-for k in VLLM_IMAGE MODEL_PATH HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME \
-         NCCL_IB_GID_INDEX TP_SIZE MAX_MODEL_LEN VLLM_KV_ARGS VLLM_EXTRA_ARGS \
-         VLLM_PARSER_ARGS VLLM_USE_DEEP_GEMM VLLM_ALLOW_LONG_MAX_MODEL_LEN; do
+for k in VLLM_IMAGE MODEL_PATH TP_SIZE MAX_MODEL_LEN MAX_NUM_SEQS \
+         MAX_NUM_BATCHED_TOKENS GPU_MEMORY_UTILIZATION \
+         VLLM_KV_ARGS VLLM_EXTRA_ARGS VLLM_PARSER_ARGS \
+         VLLM_USE_DEEP_GEMM VLLM_ALLOW_LONG_MAX_MODEL_LEN \
+         NCCL_P2P_DISABLE VLLM_MOE_FORCE_MARLIN; do
     printf -v "$k" '%s' "$(env_get "$k")"
 done
-# ROCE_IF_NAME / IB_HCA_NAME は dual-HCA だとカンマ区切りになる
-# (例: enp1s0f0np0,enP2p1s0f0np0)。配列に割っておく。
-IFS=',' read -ra ROCE_IFS <<< "${ROCE_IF_NAME}"
-IFS=',' read -ra IB_HCAS  <<< "${IB_HCA_NAME}"
-
-# NCCL_IB_GID_INDEX は dual-HCA では「意図的に未設定」が正解なので、
-# 空を既定値で埋めない (埋めると固定してあるかのように見えてしまう)。
+TP_SIZE=${TP_SIZE:-2}
 
 echo "== ホスト =="
-echo "  hostname: $(hostname)  arch: $(uname -m)"
-nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sed 's/^/  GPU: /'
-
-echo
-echo "== RoCE リンク =="
-[ "${#ROCE_IFS[@]}" -gt 1 ] && echo "  (dual-HCA: ${#ROCE_IFS[@]} 本構成)"
-LOCAL_IPS=""
-for IFN in "${ROCE_IFS[@]}"; do
-    IPS=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-    if [ -z "${IPS}" ]; then
-        ng "${IFN} に IPv4 が付いていません (netplan / ケーブルを確認)"
-    else
-        ok "${IFN} = ${IPS}"
-        LOCAL_IPS="${LOCAL_IPS}${LOCAL_IPS:+$'\n'}${IPS}"
-    fi
-done
-if [ -n "${LOCAL_IPS}" ] && ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER_ROCE_IP}"; then
-    ng "どの IF の IP も .env の HEAD_ROCE_IP(${HEAD_ROCE_IP}) / WORKER_ROCE_IP(${WORKER_ROCE_IP}) と一致しません"
-fi
-# dual-HCA の 2 本目は rendezvous には使わない (NCCL が勝手に束ねる) ので、
-# .env の HEAD/WORKER_ROCE_IP と一致しなくてよい。IP が付いてさえいればよい。
-
-for PEER in "${HEAD_ROCE_IP}" "${WORKER_ROCE_IP}"; do
-    if echo "${LOCAL_IPS}" | grep -qx "${PEER}"; then continue; fi
-    if ping -c 2 -W 2 "${PEER}" >/dev/null 2>&1; then
-        ok "peer ${PEER} に疎通"
-    else
-        ng "peer ${PEER} に ping が通りません"
-    fi
-done
-
-echo
-echo "== RDMA / GID =="
-for HCA in "${IB_HCAS[@]}"; do
-    if ibv_devinfo -d "${HCA}" 2>/dev/null | grep -q PORT_ACTIVE; then
-        ok "${HCA} PORT_ACTIVE"
-    else
-        ng "${HCA} が PORT_ACTIVE ではありません (ケーブルが刺さっている方の HCA か確認)"
-    fi
-done
-
-if [ -z "${NCCL_IB_GID_INDEX}" ]; then
-    ok "GID index は未固定 (NCCL に選ばせる) — dual-HCA ではこれが正解"
-    for HCA in "${IB_HCAS[@]}"; do
-        show_gids 2>/dev/null | awk -v d="${HCA}" '$1==d && /v2/ && $5 ~ /^[0-9]+\./ {
-            printf "       %s index %s -> %s (v2)\n", $1, $3, $5 }'
-    done
+echo "  hostname: $(hostname)  arch: $(uname -m)  cpus: $(nproc)"
+if [ "$(uname -m)" = "x86_64" ]; then
+    ok "x86_64 (DGX Spark ブランチの aarch64 前提はこのブランチでは全部外してある)"
 else
-    warn "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} を固定している。リンクイベントで index が"
-    warn "  ずれると片方の HCA だけ無言でハングする"
-    for HCA in "${IB_HCAS[@]}"; do
-        GID_LINE=$(show_gids 2>/dev/null | awk -v d="${HCA}" -v i="${NCCL_IB_GID_INDEX}" '$1==d && $3==i')
-        if [ -n "${GID_LINE}" ] && echo "${GID_LINE}" | grep -q 'v2'; then
-            ok "${HCA} GID index ${NCCL_IB_GID_INDEX} = RoCEv2 ($(echo "${GID_LINE}" | awk '{print $5}'))"
-        else
-            ng "${HCA} の GID index ${NCCL_IB_GID_INDEX} が RoCEv2/IPv4 ではありません: show_gids で確認"
-        fi
-    done
+    ng "$(uname -m) — このブランチは x86_64 前提です"
 fi
-[ -e /dev/infiniband/uverbs0 ] && ok "/dev/infiniband あり" || ng "/dev/infiniband がありません"
 
-for i in "${!ROCE_IFS[@]}"; do
-    IFN="${ROCE_IFS[$i]}"
-    HCA="${IB_HCAS[$i]:-${IB_HCAS[0]}}"
-    MTU=$(cat "/sys/class/net/${IFN}/mtu" 2>/dev/null)
-    ACTIVE_MTU=$(ibv_devinfo -d "${HCA}" 2>/dev/null | awk '/active_mtu/ {print $2; exit}')
-    if [ "${MTU:-0}" -ge 9000 ]; then
-        ok "${IFN} MTU ${MTU} (RoCE path MTU ${ACTIVE_MTU:-?})"
+echo
+echo "== GPU =="
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    ng "nvidia-smi がありません (ドライバ未導入)"
+    exit 1
+fi
+nvidia-smi --query-gpu=index,name,compute_cap,memory.total,memory.used,driver_version \
+    --format=csv,noheader | sed 's/^/  /'
+
+N_GPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c .)
+if [ "${N_GPU}" -ge "${TP_SIZE}" ]; then
+    ok "GPU ${N_GPU} 枚 (TP_SIZE=${TP_SIZE})"
+else
+    ng "GPU が ${N_GPU} 枚しかありません (TP_SIZE=${TP_SIZE})"
+fi
+
+# compute capability。sm_120 (RTX PRO 6000) / sm_121 (GB10) はどちらも
+# vLLM の is_device_capability_family(120) にマッチする同じ SM12x ファミリ。
+while IFS=, read -r IDX CC; do
+    CC=$(echo "${CC}" | tr -d ' ')
+    case "${CC}" in
+        12.0) ok "GPU${IDX} compute_cap ${CC} (sm_120 / SM12x ファミリ)" ;;
+        12.*) ok "GPU${IDX} compute_cap ${CC} (SM12x ファミリ)" ;;
+        *)    warn "GPU${IDX} compute_cap ${CC} — この .env は SM12x 向けに書かれています" ;;
+    esac
+done < <(nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader)
+
+# 混在構成だと TP のシャードが揃わない
+N_DISTINCT=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sort -u | grep -c .)
+[ "${N_DISTINCT}" -eq 1 ] || ng "GPU の型番/VRAM が揃っていません。TP には同一構成が必要です"
+
+# 既に何かが VRAM を掴んでいないか
+while IFS=, read -r IDX USED; do
+    USED=$(echo "${USED}" | tr -dc '0-9')
+    if [ "${USED:-0}" -lt 1024 ]; then
+        ok "GPU${IDX} 使用中 ${USED} MiB"
+    elif [ "${USED:-0}" -lt 4096 ]; then
+        warn "GPU${IDX} が既に ${USED} MiB 使用中 (デスクトップ / ブラウザ?)"
+        warn "  GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-?} の余白を食います"
     else
-        warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 9000 に上げると path MTU が 4096 になる"
-        warn "  両ノードで揃えること"
+        ng "GPU${IDX} が既に ${USED} MiB 使用中 — 他のプロセスを止めてください"
     fi
-done
+done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader)
+
+echo
+echo "== GPU 間の接続 =="
+# P2P が死んでいると NCCL の all-reduce がホスト経由の bounce buffer に落ちる。
+# ★ 凡例 ("CNS = Chipset not supported" 等) まで grep すると必ず引っかかるので、
+#   行頭が GPU<N> の**マトリクス本体だけ**を見る。
+P2P=$(nvidia-smi topo -p2p r 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+      | grep -E '^[[:space:]]*GPU[0-9]')
+if [ -z "${P2P}" ]; then
+    warn "nvidia-smi topo -p2p r を解釈できませんでした"
+elif echo "${P2P}" | grep -qE '[[:space:]](CNS|GNS|TNS|NS|U)([[:space:]]|$)'; then
+    warn "PCIe P2P が使えない組み合わせがあります:"
+    echo "${P2P}" | sed 's/^/       /'
+    warn "  NCCL はホスト経由にフォールバックします (遅いが動きます)"
+elif echo "${P2P}" | grep -q 'OK'; then
+    ok "PCIe P2P 有効 — .env の NCCL_P2P_DISABLE は空のままにすること"
+    [ -n "${NCCL_P2P_DISABLE}" ] && \
+        warn "  なのに NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} が設定されています。遅くなります"
+else
+    warn "nvidia-smi topo -p2p r を解釈できませんでした"
+fi
+
+# --- PCIe リンク幅 -----------------------------------------------------------
+# ★ このマシン最大の性能要因。GPU0 は Gen3 x4 のブリッジ配下に居る。
+#   アイドル時は速度 (GT/s) が Gen1 まで落ちるのが正常なので、**幅だけ**見る。
+#   幅は上流ブリッジの LnkCap を読む (GPU 側の max_link_width は
+#   「GPU が対応する最大」でスロット配線を反映しない)。
+echo
+echo "== PCIe リンク幅 (上流ブリッジの LnkCap) =="
+while IFS=, read -r IDX BUSID; do
+    BUSID=$(echo "${BUSID}" | tr -d ' ' | tr 'A-F' 'a-f')
+    SYSID="${BUSID#0000}"                       # 00000000:04:00.0 -> 0000:04:00.0
+    DEVDIR="/sys/bus/pci/devices/${SYSID}"
+    if [ ! -d "${DEVDIR}" ]; then
+        warn "GPU${IDX} (${SYSID}) を sysfs で見つけられません"
+        continue
+    fi
+    BRIDGE=$(basename "$(dirname "$(readlink -f "${DEVDIR}")")")
+    BW=$(cat "/sys/bus/pci/devices/${BRIDGE}/max_link_width" 2>/dev/null)
+    BS=$(cat "/sys/bus/pci/devices/${BRIDGE}/max_link_speed" 2>/dev/null)
+    CW=$(cat "${DEVDIR}/current_link_width" 2>/dev/null)
+    LABEL="GPU${IDX} ${SYSID} <- ${BRIDGE}: cap ${BS:-?} x${BW:-?} / 現在 x${CW:-?}"
+    if [ "${BW:-0}" -ge 16 ]; then
+        ok "${LABEL}"
+    elif [ "${BW:-0}" -ge 8 ]; then
+        warn "${LABEL} — x8。TP/EP の通信が半分の帯域になります"
+    else
+        warn "${LABEL}"
+        echo "       ★ このスロットは x${BW:-?} しか配線されていません。"
+        echo "         TP=2 の all-reduce と EP の all-to-all がここに律速されます。"
+        echo "         CPU 直結の x16 スロットが空いているなら挿し替えるのが、"
+        echo "         .env のどの値をいじるより効きます。BIOS の PCIe bifurcation も確認。"
+        echo "         (挿し替えられないなら .env の「MTP を外す場合」を検討)"
+    fi
+done < <(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader)
 
 echo
 echo "== モデル =="
@@ -149,68 +189,141 @@ else
 fi
 
 echo
-echo "== メモリ =="
-# TP=2 なので 1 台あたり: 重み 123.5/2 = 約 62 GiB + KV 24 GiB + ランタイム。
-# GPU_MEMORY_UTILIZATION 0.85 x 121 GiB = 約 103 GiB を vLLM が確保しにいく。
-AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-if [ "${AVAIL_GB}" -ge 105 ]; then
-    ok "MemAvailable ${AVAIL_GB} GB"
-elif [ "${AVAIL_GB}" -ge 98 ]; then
-    warn "MemAvailable ${AVAIL_GB} GB — ギリギリ。他のコンテナを止めて sync && drop_caches 推奨"
+echo "== VRAM 収支 =="
+# 重み 123.5 GiB を TP_SIZE で割ったもの + 活性化 + CUDA graph + KV。
+VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+UTIL=${GPU_MEMORY_UTILIZATION:-0.92}
+read -r VRAM_GIB BUDGET_GIB WEIGHT_GIB REST_GIB <<< "$(
+    awk -v m="${VRAM_MIB}" -v u="${UTIL}" -v tp="${TP_SIZE}" 'BEGIN{
+        v=m/1024; b=v*u; w=123.5/tp; printf "%.1f %.1f %.1f %.1f", v, b, w, b-w }'
+)"
+echo "  VRAM ${VRAM_GIB} GiB/GPU x ${UTIL} = ${BUDGET_GIB} GiB を vLLM が確保"
+echo "  うち重み ${WEIGHT_GIB} GiB -> 活性化 + CUDA graph + KV に ${REST_GIB} GiB"
+if awk -v r="${REST_GIB}" 'BEGIN{exit !(r < 6)}'; then
+    ng "残り ${REST_GIB} GiB では KV が取れません"
+    echo "       GPU_MEMORY_UTILIZATION を上げるか、TP_SIZE / GPU を増やすこと"
+elif awk -v r="${REST_GIB}" 'BEGIN{exit !(r < 12)}'; then
+    warn "残り ${REST_GIB} GiB — KV がかなり細くなります"
 else
-    ng "MemAvailable ${AVAIL_GB} GB — 足りません。他のコンテナを止めるか再起動してください"
+    # KV は残りから活性化 + CUDA graph の概算 (5 GiB) を引いたもの。
+    # KV は 24 KiB/token (全体) なので TP で割って KiB/token/GPU。
+    ok "$(awk -v r="${REST_GIB}" -v tp="${TP_SIZE}" -v ml="${MAX_MODEL_LEN:-1048576}" 'BEGIN{
+        kv = r - 5;
+        tok = kv * 1048576 / (24.0 / tp);
+        printf "KV 概算 %.0f GiB/GPU = 約 %.2fM token (%s token を %.1f 本)",
+               kv, tok/1e6, ml, tok/ml }')"
 fi
-RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
-[ -n "${RUNNING}" ] && warn "rootless docker で起動中: ${RUNNING}"
+if [ "${TP_SIZE}" = "1" ]; then
+    ng "TP_SIZE=1 — 重み 123.5 GiB は 1 枚 (${VRAM_GIB} GiB) には載りません"
+fi
 
 echo
-echo "== rootful docker =="
-[ -e /dev/nvidia0 ] && ok "/dev/nvidia0 あり" || ng "/dev/nvidia0 がありません (ドライバを確認)"
-
-if grep -qs nvidia /etc/docker/daemon.json; then
-    ok "rootful daemon に nvidia ランタイム登録済み"
+echo "== ホスト RAM / ディスク =="
+AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
+# 専有 VRAM なのでホスト RAM は主にページキャッシュ用。UMA だった DGX Spark と
+# 違い、ここが埋まっていても致命傷にはならない (ロードが遅くなるだけ)。
+if [ "${AVAIL_GB}" -ge 32 ]; then
+    ok "MemAvailable ${AVAIL_GB} GB"
 else
-    ng "/etc/docker/daemon.json に nvidia ランタイムがありません"
-    echo "       sudo nvidia-ctk runtime configure --runtime=docker"
-    echo "       sudo systemctl restart docker"
+    warn "MemAvailable ${AVAIL_GB} GB — チェックポイントのページキャッシュが効かず初回ロードが遅くなります"
 fi
+DISK_GB=$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9')
+[ "${DISK_GB:-0}" -ge 20 ] && ok "空きディスク ${DISK_GB} GB" \
+                           || warn "空きディスク ${DISK_GB} GB — キャッシュの置き場に注意"
 
-if grep -qsE '^\s*no-cgroups\s*=\s*true' /etc/nvidia-container-runtime/config.toml; then
-    warn "no-cgroups=true (rootless 用の設定)。rootful では /dev/nvidia* の明示渡しが必要"
-    warn "  compose の devices: で対応済み。それでも NVML が死ぬなら privileged: true を足す"
-fi
-
-if sudo -n docker info >/dev/null 2>&1; then
-    ok "sudo docker 利用可"
-    sudo -n docker info 2>/dev/null | grep -qi 'runtimes:.*nvidia' \
-        && ok "docker info に nvidia ランタイムあり" \
-        || ng "docker info に nvidia ランタイムがありません"
-    sudo -n docker image inspect "${VLLM_IMAGE}" >/dev/null 2>&1 \
-        && ok "イメージ取得済み" \
-        || warn "イメージ未取得 — sudo docker pull ${VLLM_IMAGE}"
+echo
+echo "== Docker / NVIDIA Container Toolkit =="
+if ! command -v docker >/dev/null 2>&1; then
+    ng "docker がありません"
 else
-    warn "sudo docker が非対話で叩けません — 以下を手で確認すること:"
-    echo "       sudo docker info | grep -i runtimes        # nvidia が出ること"
-    echo "       sudo docker run --rm --gpus all ${VLLM_IMAGE} nvidia-smi"
+    ok "docker $(docker --version | awk '{print $3}' | tr -d ,)"
 fi
+
+# GPU をコンテナに渡すには NVIDIA Container Toolkit が要る。
+# 素の docker の --gpus だけでは動かない。
+if command -v nvidia-ctk >/dev/null 2>&1 || command -v nvidia-container-cli >/dev/null 2>&1; then
+    ok "nvidia-container-toolkit 導入済み"
+else
+    ng "nvidia-container-toolkit がありません (これが無いと --gpus / gpus: all が効きません)"
+    echo "       curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \\"
+    echo "         | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+    echo "       curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \\"
+    echo "         | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \\"
+    echo "         | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+    echo "       sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit"
+    echo "       sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"
+fi
+
+CTX=$(docker context show 2>/dev/null)
+ok "docker context = ${CTX:-default}"
+if [ "${CTX}" = "rootless" ]; then
+    # rootless では nvidia-container-cli が device cgroup を触れないので、
+    # no-cgroups=true にしたうえで compose 側が /dev/nvidia* を明示的に渡す。
+    if grep -qsE '^\s*no-cgroups\s*=\s*true' \
+         "${HOME}/.config/nvidia-container-runtime/config.toml" \
+         /etc/nvidia-container-runtime/config.toml; then
+        ok "no-cgroups=true (rootless に必要な設定)。/dev/nvidia* は compose の devices: で明示渡し"
+    else
+        warn "rootless なのに no-cgroups=true が見つかりません。GPU が渡らない場合は:"
+        echo "       nvidia-ctk config --set nvidia-container-cli.no-cgroups --in-place"
+    fi
+fi
+
+# --- rlimit ------------------------------------------------------------------
+# ★ rootless で一番踏みやすい罠。ハード rlimit の引き上げには初期 user
+#   namespace の CAP_SYS_RESOURCE が要るので、rootless では**ホストのハード上限を
+#   1 バイトでも超える ulimits を compose に書いた時点で起動できない**:
+#     error setting rlimit type 8: operation not permitted   (type 8 = MEMLOCK)
+#   このブランチは RDMA を使わないので memlock は compose から外してある。
+HARD_MEMLOCK=$(ulimit -Hl)
+if grep -qE '^\s*memlock:' docker-compose.yml; then
+    if [ "${CTX}" = "rootless" ] && [ "${HARD_MEMLOCK}" != "unlimited" ]; then
+        ng "compose に memlock の ulimit があり、rootless のハード上限は ${HARD_MEMLOCK} KB です"
+        echo "       このまま起動すると runc が type 8 (RLIMIT_MEMLOCK) で EPERM になります。"
+        echo "       RDMA を使わないこのブランチでは memlock は不要なので、"
+        echo "       docker-compose.yml の ulimits から丸ごと消すのが正解です"
+    else
+        ok "compose の memlock ulimit は現在の権限で設定可能"
+    fi
+else
+    ok "compose に memlock の ulimit なし (RDMA を使わないので不要 / rootless でも起動できる)"
+fi
+if [ "$(ulimit -Hs)" = "unlimited" ]; then
+    ok "stack のハード上限は unlimited (compose の stack: 64 MiB は通る)"
+else
+    warn "stack のハード上限が $(ulimit -Hs) KB です。compose の stack (65536 KB) を超えるなら下げること"
+fi
+
+# compose の `gpus: all` は daemon.json への runtime 登録を**必要としない**。
+# moby 組み込みの nvidia device driver が OCI prestart hook を直接差し込むので、
+# nvidia-container-runtime-hook のバイナリさえあれば素の runc でも GPU が通る。
+# (rootless で daemon.json を置いていなくても動くのはこのため)
+if command -v nvidia-container-runtime-hook >/dev/null 2>&1; then
+    ok "nvidia-container-runtime-hook あり — \`gpus: all\` は runtime 登録なしで通る"
+else
+    ng "nvidia-container-runtime-hook がありません — \`gpus: all\` が GPU を渡せません"
+fi
+if docker info 2>/dev/null | grep -qi 'runtimes:.*nvidia'; then
+    ok "daemon に nvidia ランタイムも登録済み (--runtime=nvidia も使える)"
+fi
+
+for DK in "docker" "sudo -n docker"; do
+    if ${DK} info >/dev/null 2>&1; then
+        ${DK} image inspect "${VLLM_IMAGE}" >/dev/null 2>&1 \
+            && ok "\`${DK}\` でイメージ取得済み" \
+            || warn "\`${DK}\` でイメージ未取得 — ${DK} pull ${VLLM_IMAGE}"
+    fi
+done
+for D in /dev/nvidia0 /dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm; do
+    [ -e "${D}" ] && ok "${D} あり" || ng "${D} がありません"
+done
 
 # =============================================================================
-# ここから下は Qwen3.8-Flash-Next-NVFP4 / TP=2 固有。
+# ここから下は Qwen3.8-Flash-Next-NVFP4 固有。
 # どれも「起動はするのに黙って壊れる」類なので、必ず緑にしてから起動すること。
 # =============================================================================
 echo
 echo "== このモデル固有の設定 =="
-
-# --- 1台構成の検出 -----------------------------------------------------------
-# 重みだけで 123.5 GiB あり、DGX Spark 1 台 (121 GiB) には物理的に載らない。
-# VLLM_PLE_CPU_OFFLOAD は pinned host memory を確保するので UMA では逃げ場に
-# ならない (swap にも落ちない)。詳細は docker-compose.yml 冒頭。
-if [ "${TP_SIZE:-2}" = "1" ]; then
-    ng "TP_SIZE=1 — このチェックポイントは重み 123.5 GiB で 1 台 (121 GiB) には載りません"
-    echo "       PLE (47.7 GiB) を NVFP4 化した派生版を使うか、TP_SIZE=2 に戻すこと"
-else
-    ok "TP_SIZE=${TP_SIZE} (2 台に分散)"
-fi
 
 # --- イメージのバージョン ----------------------------------------------------
 # 必要な修正:
@@ -246,24 +359,37 @@ else
     ok "--quantization は未指定 (MIXED_PRECISION -> modelopt_mixed に自動解決)"
 fi
 
-# --- expert parallel ---------------------------------------------------------
+# --- expert parallel と MTP の整合 -------------------------------------------
 # MTP の routed experts は 128x128 ブロック FP8。moe_intermediate_size=640 を
 # TP=2 で割ると 320 になり 128 の倍数でなくなる。EP なら expert 数 (512) 側を
 # 割るので各 expert の幅 640 が保たれる。
-if echo "${VLLM_EXTRA_ARGS}" | grep -q -- '--enable-expert-parallel'; then
-    ok "--enable-expert-parallel あり (TP=2 の MTP に必須)"
+# 本体側の routed experts は NVFP4 (16 要素ブロック) なので 320 でも割り切れる。
+# つまり「MTP を使うなら EP 必須 / MTP を使わないなら EP 不要」。
+HAS_EP=0; HAS_MTP=0
+echo "${VLLM_EXTRA_ARGS}" | grep -q -- '--enable-expert-parallel' && HAS_EP=1
+echo "${VLLM_EXTRA_ARGS}" | grep -q '"method":"mtp"' && HAS_MTP=1
+
+if [ "${HAS_MTP}" = "1" ] && [ "${HAS_EP}" = "1" ]; then
+    K=$(echo "${VLLM_EXTRA_ARGS}" | sed -n 's/.*"num_speculative_tokens":\([0-9]*\).*/\1/p')
+    ok "MTP 投機デコード k=${K:-?} + --enable-expert-parallel (TP=${TP_SIZE} では必須の組)"
+    warn "  EP の all-to-all は PCIe を往復します。上の「PCIe リンク幅」が x16 でない側が"
+    warn "  あるなら、.env の「MTP を外す場合」(MTP と EP をセットで外す) と比較すること"
+elif [ "${HAS_MTP}" = "1" ] && [ "${HAS_EP}" = "0" ]; then
+    ng "MTP が有効なのに --enable-expert-parallel がありません"
+    echo "       TP=${TP_SIZE} では MTP の 128x128 FP8 ブロックが割り切れず壊れます"
+    echo "       (moe_intermediate_size 640 / ${TP_SIZE} は 128 の倍数ではない)"
+elif [ "${HAS_MTP}" = "0" ] && [ "${HAS_EP}" = "1" ]; then
+    warn "MTP 無しで EP だけ有効です。本体の NVFP4 experts には EP は不要なので、"
+    warn "  --enable-expert-parallel を外すと all-to-all が消えて PCIe が楽になります"
 else
-    ng "--enable-expert-parallel がありません"
-    echo "       TP=2 では MTP の 128x128 FP8 ブロックが割り切れず壊れます"
-    echo "       (moe_intermediate_size 640 / 2 = 320 は 128 の倍数ではない)"
+    warn "MTP 投機デコードが無効です (EP も無し)。decode 速度が数割落ちる代わりに"
+    warn "  GPU 間通信は all-reduce だけになります。x4 リンク環境では妥当な選択"
 fi
 
-# --- 投機デコード ------------------------------------------------------------
-if echo "${VLLM_EXTRA_ARGS}" | grep -q '"method":"mtp"'; then
-    K=$(echo "${VLLM_EXTRA_ARGS}" | sed -n 's/.*"num_speculative_tokens":\([0-9]*\).*/\1/p')
-    ok "MTP 投機デコード k=${K:-?}"
-else
-    warn "MTP 投機デコードが無効です。decode 速度が数割落ちます"
+# Marlin 強制と MTP の併用は受理率を落とすという報告がある
+if [ -n "${VLLM_MOE_FORCE_MARLIN}" ] && [ "${HAS_MTP}" = "1" ]; then
+    warn "VLLM_MOE_FORCE_MARLIN と MTP を併用しています。Marlin は dequant 経路なので"
+    warn "  drafter の受理率が落ちて逆に遅くなるという報告があります。外して比較すること"
 fi
 
 # --- 1M context の整合 -------------------------------------------------------
@@ -292,39 +418,47 @@ else
     ok "MAX_MODEL_LEN=${MML} (native 262144 以内)"
 fi
 
-# --- KV 容量の妥当性 ---------------------------------------------------------
-# full_attention_interval=4 なので 48 層中 12 層だけが full attention。
-#   12 層 x 2 kv-head x 256 head_dim x 2 (K+V) x 2 B = 24 KiB/token (全体)
-#   TP=2 で 12 KiB/token/node
+# --- KV の指定方法 -----------------------------------------------------------
+# 専有 VRAM では vLLM の起動時プロファイルが正しく効くので、DGX Spark (UMA)
+# と違って --kv-cache-memory-bytes の固定は不要。
 KVB=$(echo "${VLLM_KV_ARGS}" | sed -n 's/.*--kv-cache-memory-bytes \([0-9]*\).*/\1/p')
 if [ -n "${KVB}" ]; then
     KV_GIB=$((KVB / 1073741824))
-    SEQS=$(awk -v kv="${KVB}" -v ml="${MML}" 'BEGIN{printf "%.1f", kv/(ml*12288)}')
-    ok "KV ${KV_GIB} GiB/node = ${MML} token を ${SEQS} 本分 (12 KiB/token/node)"
+    SEQS=$(awk -v kv="${KVB}" -v ml="${MML}" -v tp="${TP_SIZE}" \
+           'BEGIN{printf "%.1f", kv/(ml*24576/tp)}')
+    ok "KV を ${KV_GIB} GiB/GPU に固定 = ${MML} token を ${SEQS} 本分"
+    warn "  専有 VRAM では自動プロファイルが効くので、固定しない方が安全です"
     awk -v s="${SEQS}" 'BEGIN{ if (s < 1.0) exit 1 }' || \
-        ng "  1 本も張れません。--kv-cache-memory-bytes を上げるか MAX_MODEL_LEN を下げること"
+        ng "  1 本も張れません。値を上げるか MAX_MODEL_LEN を下げること"
 else
-    warn "--kv-cache-memory-bytes が未指定。UMA では自動プロファイルが当てにならないので固定推奨"
+    ok "--kv-cache-memory-bytes 未指定 (起動時プロファイルに任せる = 専有 VRAM での正解)"
 fi
 # KV の fp8 化は未検証 (チェックポイントに KV 量子化メタデータが無い)
 echo "${VLLM_KV_ARGS}" | grep -q -- '--kv-cache-dtype' && \
     warn "--kv-cache-dtype が指定されています。この QSA 実装での fp8 KV は未検証です"
 
-# --- GB10 の数値契約 ---------------------------------------------------------
+# --- SM12x の数値契約 --------------------------------------------------------
 if [ "${VLLM_USE_DEEP_GEMM}" = "0" ]; then
-    ok "VLLM_USE_DEEP_GEMM=0 (GB10 では必須)"
+    ok "VLLM_USE_DEEP_GEMM=0 (DeepGEMM は sm_90a/sm_100a 向けで SM12x 用カーネルが無い)"
 else
     ng "VLLM_USE_DEEP_GEMM が 0 ではありません"
-    echo "       GB10 では DeepGEMM の block-FP8 経路が正しく動きません。"
-    echo "       このチェックポイントは MTP が 128x128 block FP8 なので必ず踏みます"
+    echo "       このチェックポイントは MTP が 128x128 block FP8 なので block-FP8 経路を"
+    echo "       必ず踏みます。SM12x で選ばれると黙って壊れます"
 fi
 
-# --- 廃止された環境変数 ------------------------------------------------------
-# 他ブランチ (Nemotron / DeepSeek) からコピーしてきたときに残りがち。
+# --- 廃止された / このブランチでは有害な環境変数 -----------------------------
 for dead in VLLM_NVFP4_GEMM_BACKEND VLLM_USE_FLASHINFER_MOE_FP4 \
             VLLM_USE_DEEP_GEMM_E8M0 VLLM_MOE_USE_DEEP_GEMM; do
     if grep -qE "^${dead}=" .env; then
         warn "${dead} が .env にあります — 現行 vLLM には存在しないか、この構成には無関係です"
+    fi
+done
+for gone in VLLM_NCCL_SO_PATH HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME \
+            NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_IB_MERGE_NICS NNODES MASTER_PORT; do
+    if grep -qE "^${gone}=" .env; then
+        ng "${gone} が .env に残っています — DGX Spark x2 ブランチの遺物です"
+        echo "       単一ノードのこのブランチでは不要 (VLLM_NCCL_SO_PATH は"
+        echo "       aarch64 のパスなので x86_64 では NCCL のロードに失敗します)"
     fi
 done
 
@@ -362,6 +496,24 @@ echo "${VLLM_PARSER_ARGS}" | grep -q -- '--reasoning-parser qwen3' \
 echo "${VLLM_PARSER_ARGS}" | grep -q -- '--tool-call-parser qwen3_xml' \
     && ok "--tool-call-parser qwen3_xml" \
     || warn "--tool-call-parser qwen3_xml が無い — tool 呼び出しが解釈されません"
+
+# --- イメージの中身まで見る (PREFLIGHT_DEEP=1) -------------------------------
+# amd64 ビルドの CUDA arch list に sm_120 が無いと PTX JIT 経由になり、
+# 起動が極端に遅くなる (数十分) か、カーネルによっては動かない。
+if [ "${PREFLIGHT_DEEP:-0}" = "1" ]; then
+    echo
+    echo "== イメージの CUDA arch list (PREFLIGHT_DEEP=1) =="
+    DK=docker
+    docker image inspect "${VLLM_IMAGE}" >/dev/null 2>&1 || DK="sudo docker"
+    ARCHES=$(${DK} run --rm --entrypoint python3 "${VLLM_IMAGE}" \
+             -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>&1 | tail -1)
+    echo "  ${ARCHES}"
+    case "${ARCHES}" in
+        *sm_120*) ok "sm_120 のバイナリを同梱" ;;
+        *ERROR*|*Traceback*) warn "arch list を取得できませんでした" ;;
+        *) ng "arch list に sm_120 がありません — PTX JIT に落ちて起動が極端に遅くなります" ;;
+    esac
+fi
 
 echo
 [ "${RC}" -eq 0 ] && echo "==> preflight PASS" || echo "==> preflight FAIL"

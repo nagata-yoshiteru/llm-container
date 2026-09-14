@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# nvidia/Qwen3.8-Flash-Next-NVFP4 / dual DGX Spark (GB10, SM121) entrypoint
+# nvidia/Qwen3.8-Flash-Next-NVFP4
+#   / 1 host + 2x RTX PRO 6000 Blackwell (GB202, SM120) entrypoint
 #
-# ROLE=head   -> vllm serve (rank 0, API サーバを持つ)
-# ROLE=worker -> vllm serve --headless (rank 1, API なし)
+# 単一ノード TP=2。`vllm serve` を 1 つ立てるだけ。
+# 分散バックエンドは Ray ではなく mp (torch.distributed SPMD) で、rank 間は
+# 同一ホスト内のプロセス間通信 + NCCL over PCIe P2P。
 #
-# 分散バックエンドは Ray ではなく mp (torch.distributed SPMD)。
-# head/worker が同じ `vllm serve` を --nnodes/--node-rank/--master-addr 付きで
-# 起動し、MASTER_ADDR:MASTER_PORT で rendezvous する。
+# DGX Spark x2 ブランチにあった ROLE / NODE_RANK / MASTER_ADDR / --headless /
+# RDMA プリフライトは全部要らなくなったので落としてある。
 # =============================================================================
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# compose は未設定の変数を `${VAR:-}` で「空文字がセットされた状態」で渡してくる。
+# compose は未設定の変数を `${VAR-}` で「空文字がセットされた状態」で渡してくる。
 # vLLM / NCCL の一部パーサは「空文字」と「未設定」を区別して前者で落ちる。
 # なので空のものは明示的に unset する。
 # ---------------------------------------------------------------------------
@@ -27,44 +28,47 @@ unset_if_empty() {
 
 unset_if_empty \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN \
-    VLLM_NCCL_SO_PATH \
     VLLM_USE_DEEP_GEMM \
-    NCCL_IB_GID_INDEX \
-    NCCL_IB_MERGE_NICS \
-    NCCL_CROSS_NIC \
-    NCCL_IGNORE_CPU_AFFINITY \
+    VLLM_MOE_FORCE_MARLIN \
+    VLLM_WORKER_MULTIPROC_METHOD \
+    NCCL_P2P_DISABLE \
+    NCCL_CUMEM_ENABLE \
     MAX_JOBS
 
-# イメージ側の値を潰さないよう「前に足す」
-if [ -n "${VLLM_LD_LIBRARY_PATH_EXTRA:-}" ]; then
-    export LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH_EXTRA}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-fi
-
-: "${ROLE:?ROLE must be 'head' or 'worker'}"
 : "${MODEL_CONTAINER_PATH:?MODEL_CONTAINER_PATH must be set}"
 : "${SERVED_MODEL_NAME:?SERVED_MODEL_NAME must be set}"
 : "${TP_SIZE:=2}"
-: "${MASTER_PORT:=29501}"
-: "${NNODES:=${TP_SIZE}}"
 
-for v in HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME; do
-    if [ -z "${!v:-}" ]; then
-        echo "[entrypoint] ERROR: ${v} is required (see .env.example)" >&2
+echo "[entrypoint] single-node tp=${TP_SIZE}"
+echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
+
+# ---------------------------------------------------------------------------
+# GPU プリフライト
+#
+# device cgroup を通し損ねていると (no-cgroups=true + devices: 書き忘れ)、
+# vLLM は "Failed to infer device type" という分かりにくいエラーで死ぬ。
+# TP_SIZE より GPU が少ない場合も、モデルロードを全部終えたあとに
+# 割り当てで落ちるので時間を無駄にする。どちらもここで落とす。
+# ---------------------------------------------------------------------------
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if ! GPU_LIST=$(nvidia-smi --query-gpu=index,name,memory.total,compute_cap \
+                    --format=csv,noheader 2>&1); then
+        echo "[entrypoint] ERROR: コンテナ内で nvidia-smi が動きません:" >&2
+        echo "${GPU_LIST}" | sed 's/^/[entrypoint]   /' >&2
+        echo "[entrypoint]   compose の devices: に /dev/nvidia0 /dev/nvidia1 が" >&2
+        echo "[entrypoint]   両方あるか、nvidia-container-toolkit が入っているか確認。" >&2
         exit 1
     fi
-done
+    echo "${GPU_LIST}" | sed 's/^/[entrypoint] GPU: /'
 
-: "${MASTER_ADDR:=${HEAD_ROCE_IP}}"
-if [ "${ROLE}" = "head" ]; then
-    : "${NODE_RANK:=0}"
-else
-    : "${NODE_RANK:=1}"
+    N_GPU=$(echo "${GPU_LIST}" | grep -c .)
+    if [ "${N_GPU}" -lt "${TP_SIZE}" ]; then
+        echo "[entrypoint] ERROR: GPU が ${N_GPU} 個しか見えていません (TP_SIZE=${TP_SIZE})。" >&2
+        echo "[entrypoint]   NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES と" >&2
+        echo "[entrypoint]   compose の devices: を確認すること。" >&2
+        exit 1
+    fi
 fi
-export MASTER_ADDR MASTER_PORT NNODES NODE_RANK
-
-echo "[entrypoint] role=${ROLE} rank=${NODE_RANK}/${NNODES} tp=${TP_SIZE}"
-echo "[entrypoint] rendezvous=${MASTER_ADDR}:${MASTER_PORT} iface=${ROCE_IF_NAME} hca=${IB_HCA_NAME} gid=${NCCL_IB_GID_INDEX:-<unset>}"
-echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
 
 # ---------------------------------------------------------------------------
 # モデルのプリフライト。HF_HUB_OFFLINE=1 なので、マウントが空だと
@@ -73,34 +77,10 @@ echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
 for f in config.json model.safetensors.index.json tokenizer.json; do
     if [ ! -f "${MODEL_CONTAINER_PATH}/${f}" ]; then
         echo "[entrypoint] ERROR: ${MODEL_CONTAINER_PATH}/${f} が無い。" >&2
-        echo "[entrypoint]   scripts/fetch-model.sh を **両ノードで** 実行すること。" >&2
+        echo "[entrypoint]   scripts/fetch-model.sh を実行すること。" >&2
         exit 1
     fi
 done
-
-# ---------------------------------------------------------------------------
-# RDMA プリフライト: HCA が見えていない状態で起動すると NCCL が
-# "unhandled system error" で数分後に死ぬので、先に落とす。
-# IB_HCA_NAME はカンマ区切りで複数書ける (dual-HCA / NCCL_IB_MERGE_NICS=1)。
-# ---------------------------------------------------------------------------
-if command -v ibv_devinfo >/dev/null 2>&1; then
-    _hca_ok=1
-    IFS=',' read -ra _HCA_LIST <<< "${IB_HCA_NAME}"
-    for _hca in "${_HCA_LIST[@]}"; do
-        [ -n "${_hca}" ] || continue
-        if ibv_devinfo -d "${_hca}" 2>/dev/null | grep -q "PORT_ACTIVE"; then
-            echo "[entrypoint] RDMA OK: ${_hca} PORT_ACTIVE"
-        else
-            echo "[entrypoint] ERROR: HCA ${_hca} is not PORT_ACTIVE inside the container." >&2
-            _hca_ok=0
-        fi
-    done
-    if [ "${_hca_ok}" != "1" ]; then
-        echo "[entrypoint]   --device /dev/infiniband と /sys/class/infiniband のマウントを確認。" >&2
-        echo "[entrypoint]   dual-HCA なら 2 本目に IP が振られているかも確認 (.env.example 参照)。" >&2
-        exit 1
-    fi
-fi
 
 # ---------------------------------------------------------------------------
 # vllm serve コマンド組み立て
@@ -116,18 +96,12 @@ VLLM_CMD=(
     --host 0.0.0.0
     --port "${HOST_PORT:-8910}"
     --max-model-len "${MAX_MODEL_LEN:-1048576}"
-    --max-num-seqs "${MAX_NUM_SEQS:-4}"
-    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}"
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.85}"
+    --max-num-seqs "${MAX_NUM_SEQS:-8}"
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-16384}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.92}"
     --tensor-parallel-size "${TP_SIZE}"
     --distributed-executor-backend mp
-    --nnodes "${NNODES}"
-    --node-rank "${NODE_RANK}"
-    --master-addr "${MASTER_ADDR}"
-    --master-port "${MASTER_PORT}"
 )
-
-[ "${ROLE}" = "worker" ] && VLLM_CMD+=(--headless)
 
 # VLLM_*_ARGS は空白区切りで展開する。
 # JSON を渡す場合は値の内側に空白を入れないこと (例: {"method":"mtp"})。
