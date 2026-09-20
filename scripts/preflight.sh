@@ -25,7 +25,7 @@ fi
 env_get() {
     sed -n "s/^$1=//p" .env | tail -1
 }
-for k in VLLM_IMAGE MODEL_PATH HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX; do
+for k in VLLM_IMAGE MODEL_PATH ENGRAM_PATH HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX; do
     printf -v "$k" '%s' "$(env_get "$k")"
 done
 # ROCE_IF_NAME / IB_HCA_NAME は dual-HCA だとカンマ区切りになる
@@ -116,23 +116,38 @@ echo
 echo "== モデル =="
 if [ -d "${MODEL_PATH}" ]; then
     N=$(ls "${MODEL_PATH}"/model-*.safetensors 2>/dev/null | wc -l)
-    if [ "${N}" -eq 48 ]; then
-        ok "${MODEL_PATH} (48 shard, $(du -sh "${MODEL_PATH}" | cut -f1))"
+    if [ "${N}" -eq 39 ]; then
+        ok "${MODEL_PATH} (EXL3 ${N} shard, $(du -sh "${MODEL_PATH}" | cut -f1))"
     else
-        ng "${MODEL_PATH} の shard 数が ${N} です (48 のはず) — scripts/fetch-model.sh を再実行"
+        ng "${MODEL_PATH} の shard 数が ${N} です (EXL3 は 39) — scripts/fetch-model.sh exl3 を再実行"
     fi
 else
     ng "${MODEL_PATH} がありません — ./scripts/fetch-model.sh"
+fi
+# Engram: 量子化されないテーブル (ネイティブ shard 47+48 + embed-only slim index)
+if [ -d "${ENGRAM_PATH}" ] \
+    && [ -f "${ENGRAM_PATH}/model-00047-of-00048.safetensors" ] \
+    && [ -f "${ENGRAM_PATH}/model-00048-of-00048.safetensors" ]; then
+    if grep -qs dsv41_engram_src "${ENGRAM_PATH}/model.safetensors.index.json" 2>/dev/null; then
+        ok "${ENGRAM_PATH} (shard 47+48 / embed-only index)"
+    else
+        warn "${ENGRAM_PATH} に shard 47/48 はあるが index が embed-only ではない —"
+        warn "  ./scripts/fetch-model.sh engram で slim 化すること (476GiB 探索に行くと詰まる)"
+    fi
+else
+    ng "${ENGRAM_PATH} (shard 47+48) がありません — ./scripts/fetch-model.sh engram"
 fi
 
 echo
 echo "== メモリ =="
 AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-# 重み 167GB / TP2 = 約 84GB + KV 10GiB + ランタイム
-if [ "${AVAIL_GB}" -ge 105 ]; then
+# V4.1 EXL3: 重み ~99.5GiB/rank + KV 2.5GiB + CUDA ctx/NCCL/graphs 5〜7GiB +
+# プロセス/OS ~9GiB で常時 ~118GiB commit。121.7GiB に対して残 3〜4GiB が正常系。
+# 上流の boot margin (12GiB) 相当を見るなら、起動前は MemAvailable 118GiB が理想。
+if [ "${AVAIL_GB}" -ge 112 ]; then
     ok "MemAvailable ${AVAIL_GB} GB"
-elif [ "${AVAIL_GB}" -ge 95 ]; then
-    warn "MemAvailable ${AVAIL_GB} GB — ギリギリ。他のコンテナを止めて sync && drop_caches 推奨"
+elif [ "${AVAIL_GB}" -ge 100 ]; then
+    warn "MemAvailable ${AVAIL_GB} GB — 重み予算 ~118GiB に対して厳しい。他のコンテナを止めて sync && drop_caches 推奨"
 else
     ng "MemAvailable ${AVAIL_GB} GB — 足りません。他のコンテナを止めるか再起動してください"
 fi

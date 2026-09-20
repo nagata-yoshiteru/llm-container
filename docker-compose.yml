@@ -1,11 +1,14 @@
 # =============================================================================
-# DeepSeek-V4-Flash-0731 on 2x NVIDIA DGX Spark (GB10 / SM121)
+# DeepSeek-V4.1-Flash (EXL3 2.9bpw) on 2x NVIDIA DGX Spark (GB10 / SM121)
+#   出典レシピ: MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks
+#               (IMAGE / serve 引数 / メモリ予算をこの repo の書式に読み替え)
 #
 #   TP=2 (1 GPU/node) / distributed-executor-backend = mp (Ray なし)
 #   NCCL は 200GbE QSFP の RoCEv2 (RDMA) 経由、bootstrap も同じ IF の TCP
-#   native DSpark speculative decoding (k=7)
+#   native DSpark speculative decoding (k=3 / 天井 5 だが実測で速い方が 3)
+#   重み = EXL3 ツリー (39 shard) + ネイティブ shard 47+48 の Engram テーブル
 #
-# API は ${HOST_PORT} (既定 8910) に OpenAI 互換で生える。
+# API は ${HOST_PORT} (既定 8910) に OpenAI 互換で生える。レシピ既定は 8888。
 #
 # rootful Docker が必須 (--device /dev/infiniband, memlock unlimited,
 # host network + RDMA)。必ず `sudo docker compose ...` で起動すること。
@@ -17,15 +20,22 @@
 x-vllm-env: &vllm-env
   # ---- モデル / サービング ----
   MODEL_CONTAINER_PATH: ${MODEL_CONTAINER_PATH}
+  ENGRAM_CONTAINER_PATH: ${ENGRAM_CONTAINER_PATH}
   SERVED_MODEL_NAME: ${SERVED_MODEL_NAME}
   HOST_PORT: ${HOST_PORT:-8910}
-  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
-  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-1}
-  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
-  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.87}
+  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-600000}
+  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-2}
+  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-1536}
+  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.88}
   VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
   VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
   VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
+
+  # ---- entrypoint がフラグに変換するスイッチ ----
+  LANGUAGE_MODEL_ONLY: ${LANGUAGE_MODEL_ONLY:-0}
+  ENFORCE_EAGER: ${ENFORCE_EAGER:-0}
+  SKIP_MM_PROFILING: ${SKIP_MM_PROFILING:-}
+  LIMIT_MM: ${LIMIT_MM:-}
 
   # ---- トポロジ ----
   TP_SIZE: ${TP_SIZE:-2}
@@ -50,9 +60,15 @@ x-vllm-env: &vllm-env
   NCCL_IGNORE_CPU_AFFINITY: ${NCCL_IGNORE_CPU_AFFINITY:-1}
   NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
   NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
-  # `:-` ではなく `-` なのは、presets/ 側で「空にして無効化する」ためにわざと。
+  # UMA 向け NCCL バッファ調整 (ネイティブ DS4.1 3-Spark recipe 由来 / 空なら unset)
+  NCCL_BUFFSIZE: ${NCCL_BUFFSIZE:-}
+  NCCL_LL128_BUFFSIZE: ${NCCL_LL128_BUFFSIZE:-}
+  NCCL_PROTO: ${NCCL_PROTO:-}
+  NCCL_MAX_NCHANNELS: ${NCCL_MAX_NCHANNELS:-}
+  # `:-` ではなく `-` なのは、「空にして無効化する」ためにわざと。
   # (`:-` だと空文字も未設定扱いになって既定値に戻ってしまう)
-  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-/usr/lib/aarch64-linux-gnu/libnccl.so.2}
+  # V4.1 は USE_HOST_NCCL=0 相当。空 = イメージ内 torch 同梱 NCCL に任せる。
+  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-}
   NCCL_NET: ${NCCL_NET:-}
   NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-}
   NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-}
@@ -67,59 +83,48 @@ x-vllm-env: &vllm-env
   VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
   # 初回の Triton/DeepGEMM JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
-  # HPC-X の NCCL RDMA plugin を pip 版 NCCL から見えるようにする。
   # イメージ側の LD_LIBRARY_PATH を潰さないよう、entrypoint が「前に足す」。
-  # 別イメージ (anemll 等) に差し替えるときは presets/ で上書きする。
-  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/opt/hpcx/nccl_rdma_sharp_plugin/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64}
+  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/usr/local/cuda/lib64:/usr/local/nvidia/lib64}
 
-  # ---- SM121 数値契約 (チューニングではなく必須) ----
-  # 既定イメージ (bjk110 / DeepGEMM FP8 経路) 用。anemll イメージは b12x MoE を
-  # 使うので presets/anemll-1m.env が空にする (空文字は entrypoint が unset する)。
-  VLLM_USE_DEEP_GEMM_E8M0: ${VLLM_USE_DEEP_GEMM_E8M0-1}
-  VLLM_MOE_USE_DEEP_GEMM: ${VLLM_MOE_USE_DEEP_GEMM-0}
+  # ---- EXL3 / DSV41 overlay ノブ (イメージが読む) ----
+  # SERIAL_STREAMS + DISABLE_SHARED_EXPERTS_STREAM は必須系 (exllamav3 の
+  # lock buffer が 1 device 1 個なので、クロスストリーム EXL3 GEMM でデッドロック)。
+  DSV41_EXL3_SERIAL_STREAMS: ${DSV41_EXL3_SERIAL_STREAMS:-}
+  DSV41_IO_THREADS: ${DSV41_IO_THREADS:-}
+  DSV41_INDEXER_PREFILL_FACTOR: ${DSV41_INDEXER_PREFILL_FACTOR:-}
+  DSV41_PREFILL_EMPTY_CACHE_TOKENS: ${DSV41_PREFILL_EMPTY_CACHE_TOKENS:-}
+  DSV41_PREFILL_EMPTY_CACHE_MEMAVAIL_GIB: ${DSV41_PREFILL_EMPTY_CACHE_MEMAVAIL_GIB:-}
+  DSV41_PREFILL_END_EMPTY_CACHE: ${DSV41_PREFILL_END_EMPTY_CACHE:-}
+  DSV41_DROP_PAGE_CACHE: ${DSV41_DROP_PAGE_CACHE:-}
+  DSV41_SKIP_MIXED_WARMUP: ${DSV41_SKIP_MIXED_WARMUP:-}
+  DSV41_BOOT_SHAPE_WARMUP: ${DSV41_BOOT_SHAPE_WARMUP:-}
+  # Engram 行キャッシュ (既定 off。rows の再利用はほぼ 0% という実測)
+  DSV41_CACHE_GIB: ${DSV41_CACHE_GIB:-}
+  DSV41_RESIDENT_SCALES: ${DSV41_RESIDENT_SCALES:-}
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: ${VLLM_DISABLE_SHARED_EXPERTS_STREAM:-}
+  EXL3_FUSED_MOE: ${EXL3_FUSED_MOE:-}
+  EXL3_FAT_KERNEL: ${EXL3_FAT_KERNEL:-}
+  EXL3_FAT_GROUPED: ${EXL3_FAT_GROUPED:-}
+  EXL3_TEMP_ROWS_FUSED: ${EXL3_TEMP_ROWS_FUSED:-}
+  GLM53_SUPPRESS_STOPS_IN_REASONING: ${GLM53_SUPPRESS_STOPS_IN_REASONING:-}
+  GLM53_MIXED_PREFILL_CHUNK: ${GLM53_MIXED_PREFILL_CHUNK:-}
+  GLM53_SPINWAIT_MS: ${GLM53_SPINWAIT_MS:-}
+
+  # ---- 数値 / アーキ ----
   FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST:-12.1}
   TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-12.1a}
-
-  # ---- b12x / NVFP4 DS-MLA (anemll イメージのときだけ値が入る) ----
-  # 既定イメージでは未登録の変数なので、空のまま渡すと vLLM が
-  # "Unknown vLLM environment variable" を出す。空文字は entrypoint が unset する。
-  VLLM_USE_B12X_MOE: ${VLLM_USE_B12X_MOE:-}
-  VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: ${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-}
-  VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: ${VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M:-}
-  VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-}
-  FLASHINFER_DISABLE_VERSION_CHECK: ${FLASHINFER_DISABLE_VERSION_CHECK:-}
-  FLASHINFER_WORKSPACE_BASE: ${FLASHINFER_WORKSPACE_BASE:-}
-  TILELANG_CLEANUP_TEMP_FILES: ${TILELANG_CLEANUP_TEMP_FILES:-}
-  DG_JIT_USE_NVRTC: ${DG_JIT_USE_NVRTC:-}
-  DG_JIT_NVCC_COMPILER: ${DG_JIT_NVCC_COMPILER:-}
-  # CuTeDSL の kernel コンパイル対象。VLLM_* ではないので warning は出ない。
-  # 未指定だと b12x が GB10 native ではない遅い W4A16 経路を JIT することがある。
-  CUTE_DSL_ARCH: ${CUTE_DSL_ARCH:-}
-  # 0731 同梱の encoding_dsv4.py をランタイムに入れる (=1 のときだけ)
-  DSPARK_ENCODING_INSTALL: ${DSPARK_ENCODING_INSTALL:-0}
-  DSPARK_ENCODING_FILE: ${DSPARK_ENCODING_FILE:-}
-
-  # ---- MiaAI-Lab 移植版の hotfix 適用 (Vision-Exp を動かすのに必須) ----
-  # =1 で entrypoint が patches/ の hotfix をコンテナ起動時に当てる。vision の
-  # 有効化 (hotfix-dsv4-vision-exp.py) もこの中。既定イメージでは 0 のまま。
-  # 詳細は presets/anemll-vision-1m.env と README の「⛔ 現状ブロック中」。
-  DSPARK_APPLY_HOTFIXES: ${DSPARK_APPLY_HOTFIXES:-0}
-  # 個別に外したいときだけ 1 にする (既定は全部当てる)。
-  DSPARK_SKIP_HOTFIX: ${DSPARK_SKIP_HOTFIX:-0}
-  VLLM_USE_B12X_WO_PROJECTION: ${VLLM_USE_B12X_WO_PROJECTION:-}
-  # b12x / TileLang / DeepGEMM の JIT キャッシュ。イメージ既定はコンテナ内の
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: ${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-256}
+  # Triton / TileLang / DeepGEMM の JIT キャッシュ。イメージ既定はコンテナ内の
   # ホームなので再作成で消える。既存の vllm-cache/ マウントの下に逃がす。
   TILELANG_CACHE_DIR: ${TILELANG_CACHE_DIR:-/root/.cache/vllm/tilelang}
   TRITON_CACHE_DIR: ${TRITON_CACHE_DIR:-/root/.triton/cache}
   DG_JIT_CACHE_DIR: ${DG_JIT_CACHE_DIR:-/root/.cache/vllm/deepgemm}
-  B12X_CUTE_COMPILE_CACHE_DIR: ${B12X_CUTE_COMPILE_CACHE_DIR:-/root/.cache/vllm/b12x-cute}
 
   # ---- ランタイム ----
   NVIDIA_VISIBLE_DEVICES: all
   PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
   VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: ${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}
   VLLM_USE_BREAKABLE_CUDAGRAPH: ${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}
-  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: ${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-256}
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-}
   VLLM_ATTENTION_BACKEND: ${VLLM_ATTENTION_BACKEND:-}
   VLLM_CACHE_ROOT: /root/.cache/vllm
@@ -137,9 +142,10 @@ x-vllm-service: &vllm-service
   entrypoint: ["bash", "/entrypoint.sh"]
   volumes:
     - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
+    # Engram テーブル (ネイティブ shard 47+48 の slim ツリー)。
+    # --hf-overrides {"engram_table_dir":...} の先がここ。
+    - ${ENGRAM_PATH}:${ENGRAM_CONTAINER_PATH}:ro
     - ./scripts/entrypoint.sh:/entrypoint.sh:ro
-    # MiaAI-Lab 移植版の hotfix 群。DSPARK_APPLY_HOTFIXES=1 のときだけ使われる。
-    - ./patches:/opt/dspark-patches:ro
     - ./vllm-cache/vllm:/root/.cache/vllm
     - ./vllm-cache/triton:/root/.triton
     - ./vllm-cache/torchinductor:/var/cache/torchinductor
@@ -168,6 +174,10 @@ x-vllm-service: &vllm-service
   # "Failed to infer device type" で即死する。
   #   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
   gpus: all
+  # kernel OOM のとき、デスクトップや関連デーモンではなく vLLM を選んで殺させる。
+  # 2026-09-11 に GB10 で「GPU ドライバの割り込みがどのプロセス RSS にも見えず」
+  # デスクトップ側を巻き込んで両ノードが wedge される事故の実測あり。これで最後は vLLM が落ちる。
+  oom_score_adj: 1000
   # 意図的に restart させない。EngineCore の初期化失敗で無限再起動すると
   # GB10 の unified memory を食い潰してホストごと巻き込む。
   restart: "no"
@@ -175,7 +185,7 @@ x-vllm-service: &vllm-service
 services:
   head:
     <<: *vllm-service
-    container_name: dsv4-head
+    container_name: dsv41-head
     profiles: ["head"]
     environment:
       <<: *vllm-env
@@ -185,7 +195,7 @@ services:
 
   worker:
     <<: *vllm-service
-    container_name: dsv4-worker
+    container_name: dsv41-worker
     profiles: ["worker"]
     environment:
       <<: *vllm-env
@@ -195,6 +205,7 @@ services:
       # QSFP を直結ではなくリング配線している場合、head と worker で「相手を向いて
       # いるポート」の名前が違う (例: head=enp1s0f0np0 / worker=enp1s0f1np1)。
       # .env に WORKER_* を書けばここだけ差し替わる。未設定なら head と同じ値。
+      # 出典レシピの機体も spark1 f1 ↔ spark2 f0 のペアだった。
       ROCE_IF_NAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       IB_HCA_NAME: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
       NCCL_IB_HCA: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
