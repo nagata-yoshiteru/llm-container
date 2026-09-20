@@ -84,12 +84,15 @@ fetch_engram() {
     if [ ! -f "${src}/model-00047-of-00048.safetensors" ]; then
         echo "==> Engram 元: ${src} にネイティブ shard 47+48 + index + config.json を取得 (約 190GiB)"
         check_disk "${src}" 200
-        # --include で 4 ファイルだけ。476GiB の全体は落かない。
-        hf download "${NATIVE_REPO}" --local-dir "${src}" --max-workers 4 \
-            --include "model-00047-of-00048.safetensors" \
-                      "model-00048-of-00048.safetensors" \
-                      "model.safetensors.index.json" \
-                      "config.json"
+        # ファイル名を positional で渡す (新旧 huggingface CLI 共通の形)。
+        # --include だと新版 hf が「filenames が明示指定なので無視」と言って
+        # 1 枚目が消える実害あり。476GiB の全体は落かない。
+        hf download "${NATIVE_REPO}" \
+            "model-00047-of-00048.safetensors" \
+            "model-00048-of-00048.safetensors" \
+            "model.safetensors.index.json" \
+            "config.json" \
+            --local-dir "${src}" --max-workers 4
     else
         echo "==> Engram 元: ${src} を再利用 (shard 47/48 既存)"
     fi
