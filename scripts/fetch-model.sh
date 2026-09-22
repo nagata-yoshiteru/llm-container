@@ -6,9 +6,10 @@
 # worker 側でも同じコマンドを実行すること (rsync でコピーしてもよい)。
 #
 #   ./scripts/fetch-model.sh            # メインモデル -> .env の MODEL_PATH
-#   ./scripts/fetch-model.sh draft      # DFlash2 drafter (2.2GB, 任意)
+#   ./scripts/fetch-model.sh draft      # DFlash2 drafter (2.2GB)
 #
-# DFlash2 drafter は presets/dflash2.env (高速化) で使う場合だけ必要。
+# DFlash2 drafter は **既定レシピで必須** (decode 約 46.9 t/s / MTP-4 比 2.15x)。
+# 使わない構成にするなら presets/mtp4.env を重ねて起動する。
 # ライセンス: CC-BY-NC-ND-4.0 (非商用・改変禁止) — 商用利用は確認すること。
 #
 # rootless / rootful どちらの docker とも無関係。sudo は不要。

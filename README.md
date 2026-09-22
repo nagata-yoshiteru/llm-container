@@ -7,8 +7,16 @@
 - 分散バックエンドは **Ray ではなく `mp`** (torch.distributed SPMD)。head/worker が
   それぞれ `vllm serve` を `--nnodes/--node-rank/--master-addr` 付きで起動する。
 - ノード間の NCCL は 200GbE QSFP 直結リンクの **RoCEv2 (RDMA)**。
-- **MTP-4 speculative decoding** (checkpoint 同梱の MTP head / decode 約 21.8 t/s)。
-  高速化 preset で **DFlash2** (約 46.9 t/s / 2.15x) に切り替え可能。
+- **DFlash2 speculative decoding** (k=7 / decode 約 46.9 t/s / MTP-4 比 2.15x)。
+  MTP-4 に戻すなら `presets/mtp4.env`。
+- **KV プールは 8 GiB 固定** (fp8 KV / 262K ctx で約 71 万トークン)。
+  旧版の「固定するな」から**方針が逆転している** →
+  下記「[KV は 8 GiB に固定する](#kv-は-8-gib-に固定する-2026-09-18-に方針が逆転した)」。
+- **prefix cache 修正 (#18)** 込み。公開イメージは未適用なので
+  `scripts/build-prefix-fix.sh` で生成が要る。無いとエージェントのセッションが
+  毎ターン会話全体を再 prefill する (13K トークン反復の TTFT 21.1s -> 6.3s)。
+- **boot hardening** 込み (JIT storm 抑止 / 永続カーネルキャッシュ / cgroup
+  メモリ上限 / page-cache flusher)。KV 固定が成立する前提条件。
 - vision (画像・動画) 対応。チェックポイント同梱の chat template が
   マルチモーダルなので追加設定なし。
 
@@ -42,8 +50,12 @@ GLM-5.3 は **NoPE MLA** (`qk_rope_head_dim=0`)。vLLM の素の SM12x sparse-ML
 
 | イメージ | 内容 |
 |---|---|
-| `ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8` (既定) | day-0 公式 (`vllm/vllm-openai:glm53-flash`) + パッチ 8 段: SM90 NoPE-MLA バックエンドを SM121 で有効化 (FA2) / FlashInfer 0.6.18 (0.6.17 は 64〜256 行バッチで NaN) / NCCL 2.30.7 固定 (nightly が 2.29.7 に落とすと fabric で死ぬ) / cutlass-dsl 4.6.2 / PDL を SM12x で無効 / indexer 強化 / fp8 KV |
-| `:sm121-v11-dflash2` (preset) | v8 + DFlash2 drafter 対応 overlay |
+| `ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8` | day-0 公式 (`vllm/vllm-openai:glm53-flash`) + パッチ 8 段: SM90 NoPE-MLA バックエンドを SM121 で有効化 (FA2) / FlashInfer 0.6.18 (0.6.17 は 64〜256 行バッチで NaN) / NCCL 2.30.7 固定 (nightly が 2.29.7 に落とすと fabric で死ぬ) / cutlass-dsl 4.6.2 / PDL を SM12x で無効 / indexer 強化 / fp8 KV。`presets/mtp4.env` で使う |
+| `:sm121-v11-dflash2` (**既定**) | v8 + DFlash2 drafter 対応 overlay |
+
+`:sm121-v11-dflash2` は 2026-08-28 ビルドで、**#18 prefix-cache 修正を持っていない**。
+`scripts/build-prefix-fix.sh` がイメージからパッチ済みファイルを作り、entrypoint が
+起動時に site-packages へ差し込む (下記「[prefix cache](#prefix-cache-18-の修正)」)。
 
 さらに **bind-mount で入れる top-k 修正が必須**
 ([patches/sparse_attn_indexer_kpool_sm121.py](patches/sparse_attn_indexer_kpool_sm121.py))。
@@ -149,10 +161,10 @@ ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh'
 保存先は `.env` の `MODEL_PATH`。`hf` が無ければ
 `pip install -U 'huggingface_hub[cli,hf_transfer]'`。
 
-`model_mtp.safetensors` (7.6GB) も同じリポジトリに含まれていて、MTP speculative
-decoding の draft head として使う。別途のダウンロードは不要。
+`model_mtp.safetensors` (7.6GB) も同じリポジトリに含まれている。これは
+`presets/mtp4.env` (MTP-4 構成) の draft head で、既定の DFlash2 では使わない。
 
-**DFlash2 preset を使う場合だけ**追加で drafter を取る (2.2GB /
+**既定構成では DFlash2 drafter が必須**なので続けて取る (2.2GB /
 ライセンス **CC-BY-NC-ND-4.0 = 非商用・改変禁止**):
 
 ```bash
@@ -173,18 +185,22 @@ ssh -t "$WORKER" "cd ~/repos/llm-container && sudo docker pull \$(sed -n 's/^VLL
 > **必ず起動前に pull しておくこと。** 片方が pull 中に rendezvous が始まると
 > ハンドシェイクごと固まる。
 
-DFlash2 preset を使うならそのイメージも両台で pull:
+`presets/mtp4.env` (MTP-4 に戻す構成) を使うなら v8 も両台で pull:
 
 ```bash
-sudo docker pull ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6
+sudo docker pull ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:d77d375c742fc54f436dec5108b440f58f021bc6600052bf0e8fe5840357e78f
 ```
 
 ### 3. メモリを空ける (2 台とも)
 
-重みが 1 台あたり約 99GB + MTP head 約 4GB + KV + ランタイム。121GB の
+重みが 1 台あたり約 99GB + KV 8GiB + DFlash2 drafter + ランタイム。121GB の
 unified memory に対して余裕がほとんどないので、**起動前に他のワークロードを
 止める**。GB10 の UVM は一度確保されると完全には返らないので、迷ったら再起動が
 一番確実。
+
+(`presets/mtp4.env` の MTP-4 構成では drafter の代わりに MTP head が
+約 4GB/rank を食う。DFlash2 の drafter は MLA テンソルに slot-share するので
+KV の追加コストはほぼ 0。)
 
 ```bash
 docker ps                                    # rootless 側で動いているものを確認
@@ -271,7 +287,33 @@ worker 側も同じ編集をして、(b) の確認をもう一度。
 **再起動後は必ず確認すること。** netplan の適用が外れると 1500 に戻る。
 `scripts/preflight.sh` が MTU を WARN で出すので、そこで気付ける。
 
-### 5. preflight
+### 5. prefix-cache 修正を生成 (2 台とも / 一度やれば済む)
+
+公開イメージ `sm121-v11-dflash2` は #18 の修正を持っていない。パッチは
+site-packages に置かれた状態で self-check するのでホストでは当てられず、
+使い捨てコンテナの中で当ててパッチ済みファイルを書き出す。
+
+```bash
+./scripts/build-prefix-fix.sh
+ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/build-prefix-fix.sh'
+```
+
+`patches/kv_cache_coordinator_prefix_fix.py` (git 管理外 / イメージ依存の派生物)
+が出来る。entrypoint が `PREFIX_FIX=1` のときに site-packages へコピーする。
+**生成しなくても起動はする** (起動ログに OFF の理由が出る) が、prefix cache が
+0 hit のままになる。
+
+### 6. GPU がクランプしていないか確認 (ベンチを取るなら必須)
+
+```bash
+./scripts/gputest.sh
+ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/gputest.sh'
+```
+
+健全なら 65〜82 TFLOPS。**50 未満はクロッククランプ**で、測定値が全部 2.5 倍
+遅くなる。詳細は下記「[クロッククランプ](#クロッククランプ-ベンチの前に必ず見る)」。
+
+### 7. preflight
 
 ```bash
 ./scripts/preflight.sh                                         # head
@@ -279,7 +321,8 @@ ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/preflight.sh'
 ```
 
 NG が出ている状態で起動しても、5〜10 分待たされてから NCCL エラーか OOM-kill
-で死ぬだけ。kpool パッチの存在もここで確認される。
+で死ぬだけ。kpool パッチ / ModelOpt ビルドの誤用 / KV 固定と
+`MAX_NUM_BATCHED_TOKENS` の危険な組み合わせもここで弾かれる。
 
 ---
 
@@ -289,22 +332,39 @@ NG が出ている状態で起動しても、5〜10 分待たされてから NCC
 先に待ち受けている状態にしてから head を上げる。
 
 ```bash
+# --- 毎 boot のメモリ儀式 (2 台とも / 省略しないこと) ---
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+sudo sysctl -w vm.swappiness=0
+ssh -t "$WORKER_MGMT" "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' && sudo sysctl -w vm.swappiness=0"
+
 # --- worker ---
 ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose --profile worker up -d'
 
 # --- head ---
 sudo docker compose --profile head up -d
+
+# --- page-cache flusher (2 台とも / 起動中ずっと回しておく) ---
+./scripts/flusher.sh &
+ssh "$WORKER_MGMT" 'cd ~/repos/llm-container && nohup ./scripts/flusher.sh >/dev/null 2>&1 &'
+
 sudo docker logs -f glm53-head
 ```
 
-初回は CuTeDSL / Triton の JIT が走るので **15〜20 分**かかる。2 回目以降は
-`vllm-cache/` が効いて短くなる。`Application startup complete` が出れば完了。
+初回は CuTeDSL / Triton / FlashInfer の JIT が走るので **15〜20 分**かかる
+(fp4 CUTLASS GEMM の variant が 1 個あたり数分)。2 回目以降は `vllm-cache/` が
+効いて短くなる。`Application startup complete` が出れば完了。
 
-**イメージを跨いだら `vllm-cache/{vllm,triton,torchinductor}/*` を消すこと**
-(DeepSeek 構成から切り替える場合を含む)。JIT キャッシュが混ざると起動不能になる。
+**flusher は「回しておく」ものではなく、回していないと落ちる。** GB10 の NVRM は
+MemFree で割当を判定し page cache を強制回収しないので、回収可能なキャッシュが
+数 GB 残っているだけで KV slab が `NV_ERR_NO_MEMORY` で落ちる。上流は閾値式の
+フラッシャが起動 25 分後に期限切れし、その 1 分後にノードを失っている。
+**無条件に 20 秒ごと**が正解 (`scripts/flusher.sh` がそれをやる)。
+
+**イメージを跨いだら JIT キャッシュを消すこと** (DeepSeek 構成や
+`presets/mtp4.env` から切り替える場合を含む)。混ざると起動不能になる。
 
 ```bash
-sudo rm -rf vllm-cache/{vllm,triton,torchinductor}/*    # 2 台とも
+sudo rm -rf vllm-cache/{vllm,triton,torchinductor,flashinfer,tilelang}/*    # 2 台とも
 ```
 
 ### 確認
@@ -409,8 +469,18 @@ r = client.chat.completions.create(
 )
 ```
 
-DFlash2 preset では drafter がテキスト専用なので、vision リクエストは
-speculation されない (速度だけ落ちる、機能はする)。
+`--chat-template` は**渡していない**。checkpoint 同梱の
+`chat_template.jinja` が image/video/audio の placeholder マクロと tool_call ID の
+重複判定を持つ最新版で、上流 repo が同梱している `chat_template_mm.jinja` より
+新しい。上流版を渡すと機能後退になるので入れていない。
+
+枚数上限は `.env` の `VLLM_MM_ARGS` (既定 `--limit-mm-per-prompt
+{"image":2,"video":1}`)。上流は起動時の最大サイズ video encoder profile が
+メモリスパイクを起こした事故 (2026-09-18) を受けて `"video":0` にしているが、
+この repo では動画入力を残している。boot 時に落ちるようなら 0 にする。
+
+DFlash2 の drafter はテキスト専用なので、vision リクエストは speculation
+されない (速度だけ落ちる、機能はする)。
 
 ### Anthropic 互換 (`/v1/messages`) — Claude Code から使う
 
@@ -478,28 +548,96 @@ accepted ÷ draft が MTP で 0.4〜0.5 前後、DFlash2 で 0.6〜0.8 が健全
 **TP2 では 262K が実用上の上限**。1M 単一リクエストは 4 ノード TP4 が必要
 (上流の姉妹リポジトリで検証済み)。
 
-### KV サイズは固定しない (GB10 の MemFree 壁)
+### KV は 8 GiB に固定する (2026-09-18 に方針が逆転した)
 
-**`--kv-cache-memory` を大きな値に固定すると warmup で NVRM OOM する。**
-上流が 6 回の boot で実証したラダー (fp8 KV + MTP-4 / TP2):
+**このレシピは `--kv-cache-memory 8589934592` (8 GiB) を固定する。**
+旧版の README にあった「固定するな」は撤回された。上流も根拠にしていた
+`docs/GB10-KV-MEMORY-LADDER.md` / `docs/KV-HUNT-672K-TP2-RECORD.md` ごと
+superseded 扱いにしている。
 
-| 固定値 | KV トークン | 結果 |
-|---:|---:|---|
-| 4.14 GiB (vLLM が起動ログで出す建議値) | 507,041 | **安定 (3/3)** |
-| 5.5 GiB | 672,606 | worker 死亡 (NVRM OOM) |
-| 6.5 GiB | 796,779 | head 死亡 |
-| 7.5 GiB | 920,953 | 5 回全滅 |
+| | KV トークン (262K ctx / fp8 KV) |
+|---|---:|
+| プロファイラ任せ | 581,040 |
+| 6 GiB 固定 | 678,661 |
+| **8 GiB 固定 (既定)** | **714,240** |
 
-機構: GB10 には VRAM が無く、GPU の割当はすべて NVRM ドライバー経由の
-system RAM。その割当は **MemAvailable ではなく MemFree** を見て、page cache の
-回収は強制しない (bounded reclaim)。198GB の重みロードで page cache が
-MemFree を取り潰しているので、大きな slab は「予約は成功して touch で死ぬ」
-(phantom backing) になる。vLLM 0.1x は integrated GPU の free を
-`psutil.available` (= page cache 込み) と誤認するため、提案値自体が
-実態より大きい場合がある。**起動ログの建議値より大きくしないこと。**
+#### 何が変わって逆転したのか
 
-既定構成は固定値を一切渡さず、プロファイラの自動サイズに任せている
-(fp8 KV で約 50 万トークン / 262K ctx で `max_concurrency ≈ 1.9x`)。
+機構そのものは変わっていない。GB10 には VRAM が無く、GPU の割当はすべて NVRM
+ドライバー経由の system RAM。その割当は **MemAvailable ではなく MemFree** を見て、
+page cache の回収は強制しない (bounded reclaim)。198GB の重みロードで page cache
+が MemFree を取り潰すと、大きな slab は「予約は成功して touch で死ぬ」
+(phantom backing) になる。
+
+**変わったのは MemFree を空け続ける仕組みが入ったこと。** 旧ラダーは以下が全部
+無い状態で測られている:
+
+- `MAX_JOBS=2` / `FLASHINFER_NVCC_THREADS=1` — 既定値だと FlashInfer が CPU 数ぶんの
+  nvcc を撒き、重みが常駐した状態で `cicc` が OOM killer を呼ぶ
+- 永続 JIT キャッシュ (`flashinfer` / `tilelang` / `triton`) — 再コンパイルの
+  メモリスパイクが boot ごとに来ない
+- `MEM_LIMIT=112g` (cgroup) — 超過が「ホストごと巻き込む page-allocator livelock」
+  ではなく「コンテナの clean な OOM」になる
+- `scripts/flusher.sh` — 20 秒ごとに無条件で clean cache を落とす
+
+さらに旧ラダーは **MTP-4** での測定で、MTP head が約 4GB/rank を別に食っていた。
+DFlash2 の drafter は MLA テンソルに slot-share するので **KV 追加コストがほぼ 0**。
+
+hardening 抜きで固定すると旧ラダー通りに落ちる。**セットで入れること。**
+OOM が出るなら `KV_CACHE_MEMORY=6442450944` (6 GiB) に落とす。
+`0` か空でプロファイラ任せに戻る。
+
+#### 固定したときの制約: `MAX_NUM_BATCHED_TOKENS` を上げられない
+
+`--kv-cache-memory` を渡すと **vLLM はメモリプロファイリングを丸ごとスキップする**。
+つまり `--max-num-batched-tokens` の活性化ピークを誰も検証しない。上流の実測で
+**mnbt 16384 は両ノードが `NVRM: NV_ERR_NO_MEMORY` で死んだ** (KV 8 GiB 固定時)。
+
+検証済みの上限は **8192**。entrypoint と preflight が、KV 固定時に 8192 を超える
+組み合わせを起動前に弾く。
+
+`MAX_NUM_SEQS` も 6 から上げないこと。上流が 32 を試して C12 で aggregate +10%
+だけ、C8〜C16 で TTFT p90 が 60〜179 秒に悪化した。
+
+### boot hardening (KV 固定の前提条件)
+
+| 対策 | どこ | 効果 |
+|---|---|---|
+| `MAX_JOBS=2` / `FLASHINFER_NVCC_THREADS=1` | `.env` | JIT storm で `cicc` が OOM killer を呼ぶのを止める |
+| 永続 `flashinfer` / `tilelang` / `triton` キャッシュ | compose の volumes | 初回 boot 41 分 -> 以降 16〜19 分 |
+| `MEM_LIMIT=112g` (`mem_limit` / `memswap_limit`) | compose | 超過をコンテナ OOM に閉じ込める。UMA の GPU 割当は cgroup に課金されないのでホスト側だけを縛る |
+| `scripts/flusher.sh` (20 秒ごと無条件) | ホスト | MemFree を空け続ける |
+| `drop_caches` + `swappiness=0` | 毎 boot | 下記「起動前にやるメモリ儀式」 |
+
+上流はこれを入れる前、2026-09-18 の 1 回の boot で **4 ノード全部を落として
+3 台が watchdog リブート**している。しかもリブート後に GPU の電力が約 14W に
+張り付き (クロッククランプ)、その夜のベンチが全部無効になった。
+
+### prefix cache (#18 の修正)
+
+`scripts/build-prefix-fix.sh` を 2 台で実行していない場合、**prefix cache は
+1 hit もしない**。DFlash2 の draft group が target group の hit 長を潰すバグで、
+ブロック境界に揃ったプロンプトを再送しても `prefix_cache_hits_total` が 0 のまま。
+エージェントのセッションが毎ターン会話全体を再 prefill する。
+
+実測: 13K トークン反復の TTFT **21.1s -> 6.3s** (-70%)、
+262K トークン反復で hit 率 **0.986** / warm TTFT p95 **2.98s**。
+
+検証のしかた (`--enable-prompt-tokens-details` は既定で入っている):
+
+```bash
+# 同じ長いプロンプトを 3 回投げる (temperature 0)
+curl -s http://127.0.0.1:8910/metrics | grep prefix_cache
+```
+
+読み違えやすい点が 2 つある:
+
+- **2,304 トークン (1 ブロック) 未満のプロンプトは原理的に hit しない。**
+  `--block-size 2304` の倍数に切り下げた分だけがキャッシュされる。
+- **commit は 2 回目、hit が数字に出るのは 3 回目。** 2 回目で増えないから
+  壊れていると判断しないこと。
+
+レスポンス側では `prompt_tokens_details.cached_tokens` が同じ数を返す。
 
 ### 起動前にやるメモリ儀式 (毎 boot)
 
@@ -517,8 +655,10 @@ KV slab の割当競争に勝つ確率が上がる (上流も毎 boot 実行)。
 ### OOM 系の症状
 
 - **`NV_ERR_NO_MEMORY` / `_memdescAllocInternal` (dmesg)**: KV slab の割当失敗。
-  上の儀式 + 他のワークロード停止。KV が要らないなら `--speculative-config` を
-  外す (MTP head の約 4GB/rank が解放される)。
+  まず `scripts/flusher.sh` が両ノードで回っているか確認する (回っていないのが
+  一番多い原因)。次に儀式 + 他のワークロード停止。それでも出るなら
+  `KV_CACHE_MEMORY` を 6442450944 (6 GiB) に落とす。
+  `MAX_NUM_BATCHED_TOKENS` が 8192 を超えていないかも見る。
 - **shard ロードが同じ場所で凍る / UVM kthread が 100% になる**: swap livelock。
   `vm.swappiness=0` が効いているか確認 (swap 無効化でも既定 swappiness でも起きる)。
 - **worker が exit 137**: UMA の OOM-kill。両ノード再起動してからやり直す。
@@ -527,39 +667,88 @@ KV slab の割当競争に勝つ確率が上がる (上流も毎 boot 実行)。
 
 ## 速度
 
-上流の実測 (同一の 2x Spark / TP2 / 262K / fp8 KV / C1):
+上流の実測 (同一の 2x Spark / TP2 / 262K / fp8 KV / C1 / temperature 0):
 
 | 構成 | decode | 備考 |
 |---|---:|---|
 | bf16 KV / 非 speculative | 14.3 t/s | 参考値 |
-| **fp8 KV + MTP-4 (既定)** | **21.8 t/s** | acceptance 約 0.5 |
-| **fp8 KV + DFlash2 (preset)** | **46.9 t/s** | acceptance 74.1% / 2.15x |
+| fp8 KV + MTP-4 (`presets/mtp4.env`) | 21.8 t/s | acceptance 約 0.5 |
+| **fp8 KV + DFlash2 (既定)** | **46.9 t/s** | acceptance 74.1% / 2.15x |
 
-DFlash2 の並行性 (400 トークン生成 / 2 ウェーブ):
+2026-09-18 の healthy-fleet 実測。RoCE all-reduce + prefix 修正 + KV 8 GiB 固定を
+入れる前後 (aggregate t/s / median of 3):
 
 | | C1 | C2 | C3 | C4 | C5 | C6 |
 |---|---:|---:|---:|---:|---:|---:|
-| 合計 t/s | 35.1 | 41.6 | 40.6 | 47.5 | **56.2** | 47.7 |
-| 1 ストリーム当り | 35.1 | 23.2 | 17.3 | 15.3 | 17.5 | 13.3 |
+| before | 43.4 | 29.0 | 30.2 | 50.3 | 44.4 | 47.8 |
+| after | 42.7 | 33.8 | 35.9 | 59.0 | 40.9 | 51.6 |
 
-DFlash2 に切り替える:
+cold prefill (salted prompt / TTFT -> tok/s):
+
+| プロンプト長 | before | after | Δ |
+|---:|---|---|---:|
+| 5,942 tok | 4.98s -> 1,192 | 3.95s -> 1,506 | +26% |
+| 29,868 tok | 31.4s -> 952 | 24.1s -> 1,242 | +30% |
+| 113,910 tok | 115.8s -> 984 | 85.3s -> 1,336 | +36% |
+
+**要約: prefill +26〜36% / aggregate +8〜19% (C2-C4, C6) / 単発 decode は横ばい
+(flat 〜 +8%)。** この夜に触ったのは step の外側なので、単発 decode が伸びないのは
+想定どおり。
+
+実プロンプトでの単発 decode (40 プロンプト / 8 カテゴリ / 3 回):
+
+| | tok/s |
+|---|---:|
+| 散文 | 18.8 |
+| コード | 52.2 |
+| 4 並列の実プロンプト混在 | 合計 31.4 (first token 1.97s) |
+
+数え上げプロンプト (count-to-100 系) は **draft acceptance の上限を測る指標**で、
+decode 性能として引用してはいけない。drafter にとって最も予測しやすいテキスト。
+
+### さらに速くする
+
+| やること | 効果 | 手順 |
+|---|---|---|
+| RoCE all-reduce | aggregate +5〜18% | `presets/roce.env` + `patches/roce/README.md` |
+| 並行度重視の k schedule | C4 +29.9% / C6 +18.3% (単発は -15〜-24%) | `presets/deep-concurrency.env` |
+| thinking off | acceptance +8% | `presets/thinking-off.env` (**reasoning が content に混ざる**) |
+| `temperature: 0` | +13〜21% | リクエスト側 |
+
+### MTP-4 に戻す
 
 ```bash
-# 1. drafter を 2 台に取得 (2.2GB / CC-BY-NC-ND-4.0 非商用ライセンス)
-./scripts/fetch-model.sh draft
-ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh draft'
+# 1. v8 イメージを 2 台で pull (README「2. イメージを取得」参照)
 
-# 2. イメージを 2 台で pull (README「2. イメージを取得」の末尾の digest)
+# 2. JIT キャッシュを 2 台で消す (イメージが変わるので必須)
+sudo rm -rf vllm-cache/{vllm,triton,torchinductor,flashinfer,tilelang}/*
+ssh "$WORKER" 'cd ~/repos/llm-container && sudo rm -rf vllm-cache/{vllm,triton,torchinductor,flashinfer,tilelang}/*'
 
-# 3. JIT キャッシュを 2 台で消す
-sudo rm -rf vllm-cache/{vllm,triton,torchinductor}/*
-ssh "$WORKER" 'cd ~/repos/llm-container && sudo rm -rf vllm-cache/{vllm,triton,torchinductor}/*'
-
-# 4. 2 台とも --env-file を重ねて起動 (worker -> head)
+# 3. 2 台とも --env-file を重ねて起動 (worker -> head)
 ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose \
-  --env-file .env --env-file presets/dflash2.env --profile worker up -d'
-sudo docker compose --env-file .env --env-file presets/dflash2.env --profile head up -d
+  --env-file .env --env-file presets/mtp4.env --profile worker up -d'
+sudo docker compose --env-file .env --env-file presets/mtp4.env --profile head up -d
 ```
+
+`mtp4.env` は KV の固定も外す (`KV_CACHE_MEMORY=0`)。8 GiB 固定は DFlash2 構成でしか
+測られておらず、MTP head の約 4GB/rank を足した組み合わせの実測が無いため。
+
+### クロッククランプ (ベンチの前に必ず見る)
+
+```bash
+./scripts/gputest.sh      # 2 台とも
+```
+
+GB10 は不正なリセット (watchdog リブート / `nvidia-smi -r` 後の CUDA 実行) のあと、
+**プラットフォームの電力バジェットが約 14W のフォールバック値に張り付く**ことがある。
+負荷時 611〜890MHz / bf16 で 26〜33 TFLOPS しか出ず、測定値が全部 2.5 倍遅くなる。
+上流はこれで一晩のベンチを丸ごと捨てている。
+
+- 健全: **65〜82 TFLOPS**。**50 未満はクランプ。**
+- 復帰方法は **AC 電源を抜く**だけ。`nvidia-smi -r` / `-lgc` / `-ac` / `-pl` と
+  通常の再起動では戻らない。
+- **`nvidia-smi -r` の後に再起動せず CUDA を回すと SMMU timeout で GPU が fault する。**
+  やらないこと。
 
 ### 速度を見ていないときに最初に見るもの
 
@@ -590,6 +779,17 @@ rsync -av --exclude .git --exclude models --exclude vllm-cache ./ "$WORKER_MGMT:
 grep '^VLLM_IMAGE' .env "$WORKER_MGMT 経由の同等ファイル"
 ```
 
+**git に入らない生成物も 2 台で揃える必要がある** (`.gitignore` 済み):
+
+| パス | 作り方 |
+|---|---|
+| `patches/kv_cache_coordinator_prefix_fix.py` | `./scripts/build-prefix-fix.sh` (イメージ依存。上の rsync でコピーしてもよい) |
+| `patches/roce/{b12x,b12x-1.3.0.dist-info,b12x-roce}/` | `./scripts/build-roce-bundle.sh` (`ROCE=1` を使う場合だけ) |
+
+片方だけに prefix 修正が入っている状態でも起動はするが、rank 間で KV の扱いが
+変わるので**必ず両方揃えること**。起動ログの `prefix-cache 修正 (#18) ON` を
+両 rank で確認する。
+
 ### ハマりどころ
 
 | 症状 | 原因と対処 |
@@ -599,11 +799,16 @@ grep '^VLLM_IMAGE' .env "$WORKER_MGMT 経由の同等ファイル"
 | `ncclCommInitRank: internal error` で rendezvous 死亡 | イメージの NCCL バージョン問題 (2.29.x は fabric で死ぬ) か、NIC/HCA 名違い。`sm121-v8` 以上なら前者は回避済み。`show_gids` で GID index を確認し直す |
 | ~24K トークン超の context で decode 開始直後に engine 死亡 (dmesg クリーン / `EngineDeadError`) | kpool top-k バグ。`patches/sparse_attn_indexer_kpool_sm121.py` の bind-mount が効いていない (entrypoint が起動時にチェックする) |
 | 出力が `locklock` 系の無意味な反復 / logprobs が NaN | FlashInfer 0.6.17 の FA2 MLA NaN。`sm121-v8` 以上を使う |
-| KV 割当は成功するのに warmup や 1 リクエスト目で NVRM OOM | `--kv-cache-memory` を大きく固定している、または MemFree 不足。固定値を外して (既定構成は無し) メモリ儀式をやる |
+| KV 割当は成功するのに warmup や 1 リクエスト目で NVRM OOM | ① `scripts/flusher.sh` が両ノードで回っていない (最も多い) ② `MAX_NUM_BATCHED_TOKENS` が 8192 超 ③ MemFree 不足 → メモリ儀式。それでも出るなら `KV_CACHE_MEMORY=6442450944` |
+| ベンチが上流の半分以下 / 全プロンプトが一様に遅い | GPU のクロッククランプ。`./scripts/gputest.sh` が 50 TFLOPS 未満なら AC 電源を抜いて入れ直す (`nvidia-smi -r` では戻らない) |
+| 同じプロンプトを再送しても `prefix_cache_hits_total` が 0 | ① `scripts/build-prefix-fix.sh` を実行していない (起動ログの `prefix-cache 修正 (#18) OFF` を確認) ② プロンプトが 2,304 トークン未満なので原理的に hit しない ③ まだ 2 回目 (hit は 3 回目に出る) |
+| `RoCEnante all-reduce is live` がログに出ない | `patches/roce/b12x` が無いので NCCL にフォールバックしている。`scripts/build-roce-bundle.sh` (`patches/roce/README.md`) |
+| 起動が「RoCE パッチの対象ツリーと一致しません」で止まる | イメージの vLLM が `patches/roce/` の想定と違う。`ROCE=0` に戻すか、アダプタを新ツリー向けに作り直す |
+| preflight が ModelOpt ビルドで NG | ModelOpt NVFP4 は token を壊す (vLLM #54150)。RedHatAI (compressed-tensors) を使う |
 | `reasoning` が `null` で思考が content に混ざる | `--reasoning-parser glm45` が無い / 壊れている |
 | ツール呼び出しが JSON 文字列で返る | `--tool-call-parser glm47 --enable-auto-tool-choice` が無い |
 | 2 台で起動したが API が永遠に出ない | 片方の `VLLM_IMAGE` / 引数が違う (2 台で `grep '^VLLM_IMAGE' .env` / compose の環境を diff)。`docker logs` を**両方**見る (worker 側の死因が log に出ることが多い) |
-| 文字化け・意味不明な出力 (イメージ変更直後) | 旧 JIT キャッシュ残骸。`sudo rm -rf vllm-cache/{vllm,triton,torchinductor}/*` で再起動 |
+| 文字化け・意味不明な出力 (イメージ変更直後) | 旧 JIT キャッシュ残骸。`sudo rm -rf vllm-cache/{vllm,triton,torchinductor,flashinfer,tilelang}/*` で再起動 |
 | `/v1/models` は 200 なのに生成が死んでいる | engine dead。`/health` で見る (503 なら死亡) |
 
 ---
@@ -612,10 +817,18 @@ grep '^VLLM_IMAGE' .env "$WORKER_MGMT 経由の同等ファイル"
 
 この構成は以下の実機レポートを組み合わせたもの。
 
-- [tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark) — 2x Spark TP2 の world-first。
+- **[tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark)**
+  — 現在参照している後継リポジトリ。この repo の既定はここの `CURRENT.md` に
+  合わせてある。KV 8 GiB 固定 / mnbt 8192 / gmu 0.85 / DFlash2 k=7 /
+  boot hardening (`docs/SPEED-NIGHT-2026-09-18.md`) / #18 prefix-cache 修正
+  (`docs/PREFIX-CACHE-DFLASH2-SM121.md`) / speculative depth の実測
+  (`docs/TP2-SPEC-DEPTH-AND-KV-2026-09-02.md`) / b12x RoCE all-reduce
+  (`speed-night-2026-09-18/roce/`)
+- [tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark) — 2x Spark TP2 の world-first (上記の前身)。
   7 つの day-0 バグの root cause と修復、使っているパッチ入りイメージ
-  (`sm121-v8` / `sm121-v11-dflash2`)、kpool top-k 修正、GB10 の KV/MemFree ラダー、
-  DFlash2 の KV slot-share 機構とベンチ
+  (`sm121-v8` / `sm121-v11-dflash2`)、kpool top-k 修正、
+  DFlash2 の KV slot-share 機構とベンチ。**KV/MemFree ラダーの「固定するな」は
+  後継リポジトリで撤回されている** (boot hardening 導入後に 8 GiB 固定が既定)
 - [barrydeen/glm53-flash-dgx-spark](https://github.com/barrydeen/glm53-flash-dgx-spark) —
   同一パッチスタックを別の fleet で検証・再構築したレシピ。`gmu 0.85` と
   `--block-size 2304` / `--enforce-eager` の根拠

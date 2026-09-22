@@ -3,3 +3,12 @@
 models
 venv
 .cache/
+
+# ./scripts/build-prefix-fix.sh がイメージから生成する (イメージ依存の派生物)
+patches/kv_cache_coordinator_prefix_fix.py
+
+# ./scripts/build-roce-bundle.sh が別イメージから抜き出す b12x ランタイム本体
+# (Apache-2.0 / PyPI に無い。patches/roce/README.md 参照)
+patches/roce/b12x/
+patches/roce/b12x-1.3.0.dist-info/
+patches/roce/b12x-roce/

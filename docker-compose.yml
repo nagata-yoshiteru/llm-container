@@ -1,12 +1,13 @@
 # =============================================================================
-# RedHatAI/GLM-5.3-Flash-NVFP4 on 2x NVIDIA DGX Spark (GB10 / SM121)
+# RedHatAI/GLM-5.3-Flash-NVFP4 + DFlash2 on 2x NVIDIA DGX Spark (GB10 / SM121)
 #
 #   TP=2 (1 GPU/node) / distributed-executor-backend = mp (Ray なし)
 #   NCCL は 200GbE QSFP の RoCEv2 (RDMA) 経由、bootstrap も同じ IF の TCP
-#   MTP-4 speculative decoding (checkpoint 同梱の MTP head) / fp8 KV
+#   DFlash2 speculative decoding (k=7) / fp8 KV / KV プール 8 GiB 固定
 #
 #   素の vLLM では GB10 で glm5_next が起動しない (NoPE MLA)。既定の
-#   VLLM_IMAGE (tonyd2wild sm121-v8) は day-0 公式イメージ + SM121 パッチ。
+#   VLLM_IMAGE (tonyd2wild sm121-v11-dflash2) は day-0 公式イメージ +
+#   SM121 パッチ 8 段 + DFlash2 overlay。
 #   さらに patches/sparse_attn_indexer_kpool_sm121.py を bind-mount しないと
 #   ~24K トークン超の decode で persistent_topk カーネルが engine を殺す
 #   (48 SM / 99KB smem で CTA が超過 → RuntimeError)。
@@ -27,12 +28,19 @@ x-vllm-env: &vllm-env
   HOST_PORT: ${HOST_PORT:-8910}
   MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
   MAX_NUM_SEQS: ${MAX_NUM_SEQS:-6}
-  # 空 = フラグを渡さない (検証済みレシピは明示指定しない / vLLM のハイブリッド既定を使う)
-  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS-}
-  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.88}
+  # KV を固定すると vLLM はメモリプロファイリングをスキップするので、これを
+  # 8192 より上げると活性化ピークを誰も検証しない (16384 は両ノードで NVRM OOM)。
+  # entrypoint が KV 固定時に 8192 超を弾く。
+  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
+  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.85}
+  # 8589934592 = 8 GiB (上流 2026-09-18 の既定 / プール +33%)。
+  # 0 か空でプロファイラ任せに戻る。
+  KV_CACHE_MEMORY: ${KV_CACHE_MEMORY-}
   VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS-}
   VLLM_KV_ARGS: ${VLLM_KV_ARGS-}
   VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS-}
+  VLLM_MM_ARGS: ${VLLM_MM_ARGS-}
+  VLLM_CHAT_TEMPLATE_ARGS: ${VLLM_CHAT_TEMPLATE_ARGS-}
 
   # ---- トポロジ ----
   TP_SIZE: ${TP_SIZE:-2}
@@ -78,6 +86,24 @@ x-vllm-env: &vllm-env
   # backend を手動指定する場合 (既定は空 = vLLM が FLASHINFER_MLA_SPARSE_SM90 を選ぶ)
   VLLM_ATTENTION_BACKEND: ${VLLM_ATTENTION_BACKEND-}
 
+  # ---- 任意パッチ (entrypoint が /patches から site-packages にコピー) ----
+  # PREFIX_FIX: #18 prefix-cache 修正 (公開イメージは未適用 / TTFT 21.1s -> 6.3s)
+  #   ./scripts/build-prefix-fix.sh で生成した
+  #   patches/kv_cache_coordinator_prefix_fix.py がある場合だけ効く。
+  # ROCE: b12x RoCEnante one-shot all-reduce (aggregate +5〜18%)。既定 OFF。
+  #   patches/roce/ に b12x ランタイムを揃えてから presets/roce.env を重ねる。
+  PREFIX_FIX: ${PREFIX_FIX:-1}
+  ROCE: ${ROCE:-0}
+  ROCE_EXPECT_VLLM: ${ROCE_EXPECT_VLLM-}
+  # b12x のチューニング値 (上流 2026-09-18 の実測設定)
+  B12X_ROCE_HCA: ${IB_HCA_NAME}
+  B12X_ROCE_GID_INDEX: ${NCCL_IB_GID_INDEX:-3}
+  B12X_ROCE_SPIN_LIMIT: ${B12X_ROCE_SPIN_LIMIT:-300000000}
+  B12X_ROCE_CACHE_DIR: /opt/b12x-roce/cache
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: ${VLLM_ROCE_ALLREDUCE_MAX_SIZE:-2MB}
+  VLLM_ROCE_ALLGATHER_MAX_SIZE: ${VLLM_ROCE_ALLGATHER_MAX_SIZE:-16MB}
+  VLLM_ROCE_ALLGATHER_ENABLE: ${VLLM_ROCE_ALLGATHER_ENABLE:-1}
+
   # ---- ランタイム ----
   NVIDIA_VISIBLE_DEVICES: all
   PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -85,8 +111,14 @@ x-vllm-env: &vllm-env
   HF_HOME: /cache/huggingface
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
-  # ランタイム JIT が nproc 分の nvcc を撒いて UMA を食い潰すのを防ぐ
-  MAX_JOBS: ${MAX_JOBS:-4}
+  # JIT storm 対策 (上流 2026-09-18 §3)。既定の MAX_JOBS だと FlashInfer が
+  # CPU 数ぶんの nvcc を撒き、重みが常駐した状態で cicc が OOM killer を呼ぶ。
+  MAX_JOBS: ${MAX_JOBS:-2}
+  FLASHINFER_NVCC_THREADS: ${FLASHINFER_NVCC_THREADS:-1}
+  # 永続 JIT キャッシュ。fp4 CUTLASS GEMM の variant を 1 回しかコンパイルしない
+  # (初回 boot 41 分 -> 以降 16〜19 分)。パスは下の volumes と対応。
+  TILELANG_CACHE_DIR: /root/.cache/tilelang
+  TRITON_CACHE_DIR: /root/.triton/cache
 
 x-vllm-service: &vllm-service
   image: ${VLLM_IMAGE}
@@ -101,9 +133,16 @@ x-vllm-service: &vllm-service
     # SM121 top-k 修正 (必須)。persistent_topk が GB10 (48 SM / 99KB smem) で
     # ~24K ctx 超の decode を殺すので、修正版モジュールを上書き bind-mount。
     - ./patches/sparse_attn_indexer_kpool_sm121.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
+    # 任意パッチ置き場。compose では「ファイルがあればマウント」が書けないので、
+    # ディレクトリごと渡して entrypoint が PREFIX_FIX / ROCE を見てコピーする。
+    - ./patches:/patches:ro
     - ./vllm-cache/vllm:/root/.cache/vllm
     - ./vllm-cache/triton:/root/.triton
     - ./vllm-cache/torchinductor:/var/cache/torchinductor
+    # FlashInfer の JIT 出力 (fp4 CUTLASS GEMM の variant / 1 個あたり数分) は
+    # /root/.cache/flashinfer にあり、永続化しないとコンテナと一緒に消える。
+    - ./vllm-cache/flashinfer:/root/.cache/flashinfer
+    - ./vllm-cache/tilelang:/root/.cache/tilelang
     - ./vllm-cache/huggingface:/cache/huggingface
     - /sys/class/infiniband:/sys/class/infiniband:ro
   devices:
@@ -124,6 +163,15 @@ x-vllm-service: &vllm-service
     stack:
       soft: 67108864
       hard: 67108864
+  # RDMA の memlock に必要 (memlock unlimited と対で効く)。
+  cap_add:
+    - IPC_LOCK
+  # cgroup メモリ上限。超過を「ホストごと巻き込む page-allocator livelock +
+  # watchdog リブート」(上流 2026-09-18 に 3 ノード落ちた) ではなく
+  # 「コンテナの clean な OOM」にする。
+  # UMA の GPU 割当は cgroup に課金されないので、これはホスト側だけを縛る。
+  mem_limit: ${MEM_LIMIT:-112g}
+  memswap_limit: ${MEM_LIMIT:-112g}
   # rootful docker 側に nvidia ランタイムが登録されている必要がある。
   # 未登録だとコンテナ内で NVML が初期化できず、vLLM が
   # "Failed to infer device type" で即死する。
@@ -164,3 +212,6 @@ services:
       TP_SOCKET_IFNAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       MN_IF_NAME: ${WORKER_ROCE_IF_NAME:-${ROCE_IF_NAME}}
       NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-${NCCL_IB_GID_INDEX:-3}}
+      # b12x も worker 側はケーブルが刺さっている HCA / GID を向く
+      B12X_ROCE_HCA: ${WORKER_IB_HCA_NAME:-${IB_HCA_NAME}}
+      B12X_ROCE_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-${NCCL_IB_GID_INDEX:-3}}
