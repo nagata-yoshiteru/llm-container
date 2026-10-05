@@ -110,6 +110,22 @@ for i in "${!ROCE_IFS[@]}"; do
         warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 9000 に上げると path MTU が 4096 になる"
         warn "  手順は README の「セットアップ 4. MTU を 9000 に上げる」。両ノードで揃えること"
     fi
+    # 自 IF の MTU だけでは足りない。スイッチ経由だとスイッチがジャンボを落として
+    # いても小さい ping は通り、NCCL の TCP bootstrap が Send-Q 詰まりで無言ハングする
+    # (2026-10-05 実例)。各レールの peer に DF 付き・IF MTU ぴったりの ping を打つ。
+    # peer = 自 IP の第 4 オクテットを相手の役割 (.env の HEAD/WORKER_ROCE_IP) の値に
+    # 置き換えたもの (全レール head .1 / worker .2 の規約)。
+    LIP=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1)
+    if [ -n "${LIP}" ] && [ -n "${MTU}" ]; then
+        if [ "${LIP##*.}" = "${HEAD_ROCE_IP##*.}" ]; then PEER_OCT="${WORKER_ROCE_IP##*.}"; else PEER_OCT="${HEAD_ROCE_IP##*.}"; fi
+        PEER_IP="${LIP%.*}.${PEER_OCT}"
+        if ping -M do -c 2 -W 2 -s $((MTU - 28)) -I "${IFN}" "${PEER_IP}" >/dev/null 2>&1; then
+            ok "${IFN} -> ${PEER_IP} に MTU ${MTU} のパケットが通る"
+        else
+            ng "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通りません (経路 = スイッチがジャンボを落としている?)"
+            echo "       両ノードの MTU を経路に合わせて下げるか、スイッチのポートでジャンボを有効にすること"
+        fi
+    fi
 done
 
 echo
