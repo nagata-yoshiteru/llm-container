@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 起動前チェック。head / worker 両方で実行する。
+# 起動前チェック。head / worker1 / worker2 の 3 台すべてで実行する。
 #
 #   ./scripts/preflight.sh
 #
 # ここで赤が出た状態で起動すると、だいたい 5〜10 分待たされた挙句
 # NCCL の "unhandled system error" か OOM-kill で死ぬ。
+# 特にこの構成 (FP8 328GB / 3 台) はメモリが限界なので、== メモリ == は必ず見ること。
 # =============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -25,7 +26,9 @@ fi
 env_get() {
     sed -n "s/^$1=//p" .env | tail -1
 }
-for k in VLLM_IMAGE MODEL_PATH ENGRAM_PATH HEAD_ROCE_IP WORKER_ROCE_IP ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX; do
+for k in VLLM_IMAGE MODEL_PATH MODEL_CONTAINER_PATH TP_SIZE DP_SIZE \
+         HEAD_ROCE_IP WORKER1_ROCE_IP WORKER2_ROCE_IP \
+         ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX GPU_MEMORY_UTILIZATION; do
     printf -v "$k" '%s' "$(env_get "$k")"
 done
 # ROCE_IF_NAME / IB_HCA_NAME は dual-HCA だとカンマ区切りになる
@@ -36,6 +39,19 @@ IFS=',' read -ra IB_HCAS  <<< "${IB_HCA_NAME}"
 # NCCL_IB_GID_INDEX は dual-HCA では「意図的に未設定」が正解なので、
 # 空を既定値で埋めない (埋めると固定してあるかのように見えてしまう)。
 
+# 3 ノード分の peer (自分以外) を作っておく。
+ALL_PEERS=("${HEAD_ROCE_IP}" "${WORKER1_ROCE_IP}" "${WORKER2_ROCE_IP}")
+PEER_OCTS=("${HEAD_ROCE_IP##*.}" "${WORKER1_ROCE_IP##*.}" "${WORKER2_ROCE_IP##*.}")
+
+echo "== トポロジ =="
+echo "  TP=${TP_SIZE} DP=${DP_SIZE} (EP=${DP_SIZE}) — TP>1 は glm5_next の形状で不可"
+if [ "${TP_SIZE}" != "1" ] || [ "${DP_SIZE}" != "3" ]; then
+    ng "TP_SIZE=${TP_SIZE} / DP_SIZE=${DP_SIZE}。この構成は TP=1 / DP=3 固定 (entrypoint が落とす)"
+else
+    ok "TP=1 / DP=3 / EP=3 (--enable-expert-parallel)"
+fi
+
+echo
 echo "== ホスト =="
 echo "  hostname: $(hostname)  arch: $(uname -m)"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sed 's/^/  GPU: /'
@@ -47,19 +63,19 @@ LOCAL_IPS=""
 for IFN in "${ROCE_IFS[@]}"; do
     IPS=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
     if [ -z "${IPS}" ]; then
-        ng "${IFN} に IPv4 が付いていません (netplan / ケーブルを確認)"
+        ng "${IFN} に IPv4 が付いていません (netplan / スイッチのポートを確認)"
     else
         ok "${IFN} = ${IPS}"
         LOCAL_IPS="${LOCAL_IPS}${LOCAL_IPS:+$'\n'}${IPS}"
     fi
 done
-if [ -n "${LOCAL_IPS}" ] && ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER_ROCE_IP}"; then
-    ng "どの IF の IP も .env の HEAD_ROCE_IP(${HEAD_ROCE_IP}) / WORKER_ROCE_IP(${WORKER_ROCE_IP}) と一致しません"
+if [ -n "${LOCAL_IPS}" ] && \
+   ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER1_ROCE_IP}" -e "${WORKER2_ROCE_IP}"; then
+    warn "どの IF の IP も .env の HEAD/WORKER1/WORKER2_ROCE_IP と一致しません。"
+    warn "  この機体が .env のどの役割か確認すること (compose の profile と IP が対応する)。"
 fi
-# dual-HCA の 2 本目は rendezvous には使わない (NCCL が勝手に束ねる) ので、
-# .env の HEAD/WORKER_ROCE_IP と一致しなくてよい。IP が付いてさえいればよい。
 
-for PEER in "${HEAD_ROCE_IP}" "${WORKER_ROCE_IP}"; do
+for PEER in "${ALL_PEERS[@]}"; do
     if echo "${LOCAL_IPS}" | grep -qx "${PEER}"; then continue; fi
     if ping -c 2 -W 2 "${PEER}" >/dev/null 2>&1; then
         ok "peer ${PEER} に疎通"
@@ -87,7 +103,7 @@ if [ -z "${NCCL_IB_GID_INDEX}" ]; then
     done
 else
     warn "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} を固定している。リンクイベントで index が"
-    warn "  ずれると片方の HCA だけ無言でハングする (README「QSFP を 2 枚使う」)"
+    warn "  ずれると片方の HCA だけ無言でハングする。dual-HCA なら空にするのが正解。"
     for HCA in "${IB_HCAS[@]}"; do
         GID_LINE=$(show_gids 2>/dev/null | awk -v d="${HCA}" -v i="${NCCL_IB_GID_INDEX}" '$1==d && $3==i')
         if [ -n "${GID_LINE}" ] && echo "${GID_LINE}" | grep -q 'v2'; then
@@ -99,6 +115,9 @@ else
 fi
 [ -e /dev/infiniband/uverbs0 ] && ok "/dev/infiniband あり" || ng "/dev/infiniband がありません"
 
+# 光スイッチはジャンボを通さない。自 IF の MTU が 1500 か、経路で DF ping が
+# 通るかを 3 peer 分すべて見る (小さい ping は通っても NCCL の TCP bootstrap が
+# Send-Q 詰まりで無言ハングする事故が 2026-10-05 に実測されている)。
 for i in "${!ROCE_IFS[@]}"; do
     IFN="${ROCE_IFS[$i]}"
     HCA="${IB_HCAS[$i]:-${IB_HCAS[0]}}"
@@ -107,24 +126,22 @@ for i in "${!ROCE_IFS[@]}"; do
     if [ "${MTU:-0}" -ge 9000 ]; then
         ok "${IFN} MTU ${MTU} (RoCE path MTU ${ACTIVE_MTU:-?})"
     else
-        warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 9000 に上げると path MTU が 4096 になる"
-        warn "  手順は README の「セットアップ 4. MTU を 9000 に上げる」。両ノードで揃えること"
+        warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 光スイッチはジャンボを"
+        warn "  通さないので 1500 で正解。全ノードで揃えること (9000 のままだと bootstrap が詰まる)。"
     fi
-    # 自 IF の MTU だけでは足りない。スイッチ経由だとスイッチがジャンボを落として
-    # いても小さい ping は通り、NCCL の TCP bootstrap が Send-Q 詰まりで無言ハングする
-    # (2026-10-05 実例)。各レールの peer に DF 付き・IF MTU ぴったりの ping を打つ。
-    # peer = 自 IP の第 4 オクテットを相手の役割 (.env の HEAD/WORKER_ROCE_IP) の値に
-    # 置き換えたもの (全レール head .1 / worker .2 の規約)。
     LIP=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1)
     if [ -n "${LIP}" ] && [ -n "${MTU}" ]; then
-        if [ "${LIP##*.}" = "${HEAD_ROCE_IP##*.}" ]; then PEER_OCT="${WORKER_ROCE_IP##*.}"; else PEER_OCT="${HEAD_ROCE_IP##*.}"; fi
-        PEER_IP="${LIP%.*}.${PEER_OCT}"
-        if ping -M do -c 2 -W 2 -s $((MTU - 28)) -I "${IFN}" "${PEER_IP}" >/dev/null 2>&1; then
-            ok "${IFN} -> ${PEER_IP} に MTU ${MTU} のパケットが通る"
-        else
-            ng "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通りません (経路 = スイッチがジャンボを落としている?)"
-            echo "       両ノードの MTU を経路に合わせて下げるか、スイッチのポートでジャンボを有効にすること"
-        fi
+        for POCT in "${PEER_OCTS[@]}"; do
+            PEER_IP="${LIP%.*}.${POCT}"
+            [ "${PEER_IP}" = "${LIP}" ] && continue
+            if ping -M do -c 2 -W 2 -s $((MTU - 28)) -I "${IFN}" "${PEER_IP}" >/dev/null 2>&1; then
+                ok "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通る"
+            else
+                ng "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通りません"
+                echo "       スイッチがジャンボを落としている / 相手が down / arp が別 NIC に答えている"
+                echo "       (arp_ignore=1 / arp_announce=2 を 3 台とも確認)"
+            fi
+        done
     fi
 done
 
@@ -132,50 +149,45 @@ echo
 echo "== モデル =="
 if [ -d "${MODEL_PATH}" ]; then
     N=$(ls "${MODEL_PATH}"/model-*.safetensors 2>/dev/null | wc -l)
-    if [ "${N}" -eq 39 ]; then
-        ok "${MODEL_PATH} (EXL3 ${N} shard, $(du -sh "${MODEL_PATH}" | cut -f1))"
+    if [ "${N}" -eq 62 ]; then
+        ok "${MODEL_PATH} (${N} shard, $(du -sh "${MODEL_PATH}" 2>/dev/null | cut -f1))"
     else
-        ng "${MODEL_PATH} の shard 数が ${N} です (EXL3 は 39) — scripts/fetch-model.sh exl3 を再実行"
+        ng "${MODEL_PATH} の shard 数が ${N} です (GLM-5.3-Flash-UNCENSORED-FP8 は 62) — ./scripts/fetch-model.sh を再実行"
+    fi
+    if [ -f "${MODEL_PATH}/model.safetensors.index.json" ]; then
+        ok "${MODEL_PATH}/model.safetensors.index.json あり (MTP head はこの中)"
+    else
+        ng "${MODEL_PATH}/model.safetensors.index.json がありません"
     fi
 else
     ng "${MODEL_PATH} がありません — ./scripts/fetch-model.sh"
 fi
-# Engram: 量子化されないテーブル (ネイティブ shard 47+48 + embed-only slim index)
-if [ -d "${ENGRAM_PATH}" ] \
-    && [ -f "${ENGRAM_PATH}/model-00047-of-00048.safetensors" ] \
-    && [ -f "${ENGRAM_PATH}/model-00048-of-00048.safetensors" ]; then
-    if grep -qs dsv41_engram_src "${ENGRAM_PATH}/model.safetensors.index.json" 2>/dev/null; then
-        ok "${ENGRAM_PATH} (shard 47+48 / embed-only index)"
-    else
-        warn "${ENGRAM_PATH} に shard 47/48 はあるが index が embed-only ではない —"
-        warn "  ./scripts/fetch-model.sh engram で slim 化すること (476GiB 探索に行くと詰まる)"
-    fi
-else
-    ng "${ENGRAM_PATH} (shard 47+48) がありません — ./scripts/fetch-model.sh engram"
-fi
 
 echo
-echo "== メモリ =="
+echo "== メモリ (★ この構成の最大リスク) =="
 AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-# V4.1 EXL3: 重み ~99.5GiB/rank + KV 2.5GiB + CUDA ctx/NCCL/graphs 5〜7GiB +
-# プロセス/OS ~9GiB で常時 ~118GiB commit。121.7GiB に対して残 3〜4GiB が正常系。
-# 上流の boot margin (12GiB) 相当を見るなら、起動前は MemAvailable 118GiB が理想。
-if [ "${AVAIL_GB}" -ge 112 ]; then
+# FP8 328GB を 3 台で割ると素の下限が ~102GiB/rank。DP の複製 (~9GiB) が乗って
+# 重み ~107GiB/rank、CUDA ctx/NCCL/プロセスで +7GiB 前後。
+# 121.7GiB の unified memory に対して残りは数 GiB しかない。
+# 起動前は MemAvailable 113GiB 以上が理想。105GiB を切ると GB10 では
+# NVRM OOM (ドライバが MemFree を見る) で warmup 中に落ちる可能性が高い。
+if [ "${AVAIL_GB}" -ge 113 ]; then
     ok "MemAvailable ${AVAIL_GB} GB"
-elif [ "${AVAIL_GB}" -ge 100 ]; then
-    warn "MemAvailable ${AVAIL_GB} GB — 重み予算 ~118GiB に対して厳しい。他のコンテナを止めて sync && drop_caches 推奨"
+elif [ "${AVAIL_GB}" -ge 105 ]; then
+    warn "MemAvailable ${AVAIL_GB} GB — 重み予算 ~115GiB に対して厳しい。"
+    warn "  他コンテナを止めて sync && echo 3 > /proc/sys/vm/drop_caches を推奨"
 else
-    ng "MemAvailable ${AVAIL_GB} GB — 足りません。他のコンテナを止めるか再起動してください"
+    ng "MemAvailable ${AVAIL_GB} GB — 足りません。他コンテナを止めるか再起動してください"
 fi
 RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
-[ -n "${RUNNING}" ] && warn "rootless docker で起動中: ${RUNNING}"
+[ -n "${RUNNING}" ] && warn "起動中のコンテナ: ${RUNNING}"
+warn "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION} (0.90〜0.95 で調整。低いと KV 不足で起動不可)"
 
 echo
 echo "== rootful docker =="
 [ -e /dev/nvidia0 ] && ok "/dev/nvidia0 あり" || ng "/dev/nvidia0 がありません (ドライバを確認)"
 
 # rootful daemon に nvidia ランタイムが登録されているか。
-# rootless 側 (~/.config/docker/daemon.json) に登録されていても rootful には効かない。
 # 未登録だとコンテナ内で NVML が初期化できず、vLLM が
 # "Failed to infer device type" で即死する。
 if grep -qs nvidia /etc/docker/daemon.json; then
