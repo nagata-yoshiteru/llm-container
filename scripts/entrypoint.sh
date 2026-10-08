@@ -1,45 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
 # dealignai/GLM-5.3-Flash-UNCENSORED-FP8 (native block-FP8 128x128) /
-# 3x NVIDIA DGX Spark (GB10 / SM121) / 光スイッチ (フルメッシュ・同一 L2)
+# 4x NVIDIA DGX Spark (GB10 / SM121) / 光スイッチ (フルメッシュ・同一 L2)
 #
 # -----------------------------------------------------------------------------
-# なぜ TP=1 + DP=3 + EP=3 なのか (ここが一番むずかしい)
+# 並列化 = TP=4 (モデルカードの推奨構成と同じ)
 # -----------------------------------------------------------------------------
-# TP=3 は素の vllm では起動しない。glm5_next の形状が 3 で割れないため:
-#   attention.py:452-453   assert num_heads % tp_size == 0      (num_heads=64)
-#   kda.py:219             assert self.num_heads % self.tp_size == 0 (64)
-#   vocab_parallel_embedding  vocab_size=154880 も 3 で割れない
-# TP=3 を通すには「head をゼロパディングしたチェックポイント + ロード時の
-# pad overlay + カーネル側の power-of-2 対応」が要る (kindling の tp3 一式)。
-# この repo は設定のみで完結させたいので、その路線は採らない。
+# glm5_next の形状は 4 ですべて割り切れる (3 台のときは割れずに詰んでいた):
+#   num_attention_heads 64 / 4 = 16    (attention.py:452 の assert を通る)
+#   KDA num_heads       64 / 4 = 16    (kda.py:219 の assert を通る)
+#   vocab_size      154880 / 4 = 38720
+#   moe_intermediate  2048 / 4 = 512   (FP8 block 128 の倍数)
+#   intermediate     12288 / 4 = 3072
+# PP は glm5_next では vllm 側でゲートされている (make_empty_intermediate_tensors
+# 未実装) ので使わない。DP/EP も不要 (TP なら複製が無く、重みが一番軽い)。
 #
-# PP=3 も塞がっている。glm5_next は make_empty_intermediate_tensors を
-# 実装していないため、vllm 側で PP が明示的にゲートされている:
-#   common/model.py:788    "PP is gated off for GLM-5.3-Flash"
-#   common/model.py:1169   "does not implement make_empty_intermediate_tensors"
-#
-# 残るのが DP=3 + EP=3。fused_moe/config.py:1189-1233 のとおり
-# --enable-expert-parallel を付けると ep_size = DP x TP (=3) になり、
-# MoE 側の tp_size は **1 に落ちる**。したがって
-#   - routed experts: 288 / 3 = 96 ずつ。EP 要件 (num_experts % ep_size == 0) を満たす
-#   - moe_intermediate_size=2048 は分割されない → パディング不要
-#   - attention / embedding は TP=1 なので割り切れなくても assert に当たらない
-# つまり形状の問題が全部消える。代償は「attention/dense/embed/vision が 3 ノードに
-# 複製される」こと (~+9GiB/rank)。
+# 重み = (306GiB - vision 1GiB) / 4 = 約 76GiB/rank。3 台 DP3/EP3 のときは
+# 111GiB/rank で、起動時の空き 109.3GiB に収まらず落ちた (2026-10-06)。
 #
 # -----------------------------------------------------------------------------
-# 起動のしかた (vllm 公式の multi-node internal DP。--nnodes は使わない)
+# 起動のしかた (分散バックエンドは Ray ではなく mp = torch.distributed SPMD)
 # -----------------------------------------------------------------------------
-#   各ノードが自分の vllm serve を持ち、DP coordinator (= head の rpc port) に
-#   ぶら下がる。HTTP は head の 1 本だけ。
-#   ROLE=head   -> DP rank 0。API サーバあり
-#   ROLE=worker -> DP rank 1 / 2。--headless
-#
-#   ★ EP の all-to-all は 3 ノードをまたぐので NCCL (RoCEv2) が効いている前提。
-#   ★ メモリは極端に厳しい。重み ~107GiB/rank + CUDA ctx/NCCL ~5GiB で
-#     121GiB の unified memory をほぼ食い切る。GMU は 0.92〜0.95 で調整し、
-#     起動前に preflight.sh で MemAvailable を確認すること。
+#   4 台が同じ `vllm serve` を --nnodes 4 --node-rank N --master-addr <head>
+#   付きで起動し、MASTER_ADDR:MASTER_PORT で rendezvous する。
+#   ROLE=head   -> rank 0。API サーバあり
+#   ROLE=worker -> rank 1..3。--headless
+#   TP の all-reduce は毎層 4 ノードをまたぐので NCCL (RoCEv2) が効いている前提。
 # =============================================================================
 set -euo pipefail
 
@@ -97,37 +83,37 @@ fi
 : "${ROLE:?ROLE must be 'head' or 'worker'}"
 : "${MODEL_CONTAINER_PATH:?MODEL_CONTAINER_PATH must be set}"
 : "${SERVED_MODEL_NAME:?SERVED_MODEL_NAME must be set}"
-: "${TP_SIZE:=1}"
-: "${DP_SIZE:=3}"
-: "${DP_START_RANK:?DP_START_RANK must be set (head=0 / worker=1 / worker2=2)}"
-: "${DP_RPC_PORT:=13345}"
-: "${HEAD_ROCE_IP:?HEAD_ROCE_IP must be set (DP coordinator address)}"
+: "${TP_SIZE:=4}"
+: "${NNODES:=${TP_SIZE}}"
+: "${MASTER_PORT:=29501}"
+: "${NODE_RANK:?NODE_RANK must be set (head=0 / worker1=1 / worker2=2 / worker3=3)}"
+: "${HEAD_ROCE_IP:?HEAD_ROCE_IP must be set (rendezvous address)}"
 
-for v in WORKER1_ROCE_IP WORKER2_ROCE_IP ROCE_IF_NAME IB_HCA_NAME; do
+for v in WORKER1_ROCE_IP WORKER2_ROCE_IP WORKER3_ROCE_IP ROCE_IF_NAME IB_HCA_NAME; do
     if [ -z "${!v:-}" ]; then
         echo "[entrypoint] ERROR: ${v} is required (see .env)" >&2
         exit 1
     fi
 done
 
-# DP の前提が崩れていたら起動前に落とす (10 分待たされた挙句 assert で死ぬのは辛い)。
-if [ "${TP_SIZE}" != "1" ]; then
-    echo "[entrypoint] ERROR: TP_SIZE=${TP_SIZE}。このリポジトリの GLM-5.3 構成は TP=1 前提。" >&2
-    echo "[entrypoint]   TP>1 は glm5_next の num_heads=64 / vocab=154880 が割り切れず assert で落ちる。" >&2
-    echo "[entrypoint]   (TP=3 を通すにはゼロパディング済みチェックポイントが必要。README 参照)" >&2
+# 前提が崩れていたら起動前に落とす (重みのロードに 10 分以上待たされた挙句
+# assert で死ぬのは辛い)。
+if [ "${TP_SIZE}" != "4" ] || [ "${NNODES}" != "4" ]; then
+    echo "[entrypoint] ERROR: TP_SIZE=${TP_SIZE} NNODES=${NNODES}。この構成は TP=4 / 4 ノード固定。" >&2
+    echo "[entrypoint]   glm5_next は heads=64 / vocab=154880 なので TP=3 は assert で落ち、" >&2
+    echo "[entrypoint]   FP8 の重み (306GiB) は 2〜3 台には載らない。" >&2
     exit 1
 fi
-if [ "${DP_SIZE}" != "3" ]; then
-    echo "[entrypoint] ERROR: DP_SIZE=${DP_SIZE}。3 ノード 1 rank ずつなので 3 固定。" >&2
-    exit 1
-fi
-case "${DP_START_RANK}" in
-    0|1|2) ;;
-    *) echo "[entrypoint] ERROR: DP_START_RANK=${DP_START_RANK} は 0..2 のはず" >&2; exit 1 ;;
+case "${NODE_RANK}" in
+    0|1|2|3) ;;
+    *) echo "[entrypoint] ERROR: NODE_RANK=${NODE_RANK} は 0..3 のはず" >&2; exit 1 ;;
 esac
 
-echo "[entrypoint] role=${ROLE} dp_rank=${DP_START_RANK}/${DP_SIZE} tp=${TP_SIZE}"
-echo "[entrypoint] dp_coordinator=${HEAD_ROCE_IP}:${DP_RPC_PORT} iface=${ROCE_IF_NAME} hca=${IB_HCA_NAME} gid=${NCCL_IB_GID_INDEX:-<unset>}"
+: "${MASTER_ADDR:=${HEAD_ROCE_IP}}"
+export MASTER_ADDR MASTER_PORT NNODES NODE_RANK
+
+echo "[entrypoint] role=${ROLE} rank=${NODE_RANK}/${NNODES} tp=${TP_SIZE}"
+echo "[entrypoint] rendezvous=${MASTER_ADDR}:${MASTER_PORT} iface=${ROCE_IF_NAME} hca=${IB_HCA_NAME} gid=${NCCL_IB_GID_INDEX:-<unset>}"
 echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
 
 # ---------------------------------------------------------------------------
@@ -150,7 +136,7 @@ if command -v ibv_devinfo >/dev/null 2>&1; then
     done
     if [ "${_hca_ok}" != "1" ]; then
         echo "[entrypoint]   --device /dev/infiniband と /sys/class/infiniband のマウントを確認。" >&2
-        echo "[entrypoint]   3 ノード構成では、このノードのケーブルが光スイッチのどのポートに" >&2
+        echo "[entrypoint]   4 ノード構成では、このノードのケーブルが光スイッチのどのポートに" >&2
         echo "[entrypoint]   刺さっているかも確認すること (2026-10 の flat L2 構成)。" >&2
         exit 1
     fi
@@ -171,17 +157,12 @@ VLLM_CMD=(
     --port "${HOST_PORT:-8910}"
     --max-model-len "${MAX_MODEL_LEN:-262144}"
     --max-num-seqs "${MAX_NUM_SEQS:-6}"
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.92}"
-    # --- attention: TP=1 (どのランクも attention を丸ごと持つ) ---
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.88}"
     --tensor-parallel-size "${TP_SIZE}"
-    # --- MoE: DP=3 + EP=3 (expert 96 ずつ、中間次元は分割されない) ---
-    --data-parallel-size "${DP_SIZE}"
-    --data-parallel-size-local 1
-    --data-parallel-start-rank "${DP_START_RANK}"
-    --data-parallel-address "${HEAD_ROCE_IP}"
-    --data-parallel-rpc-port "${DP_RPC_PORT}"
-    --data-parallel-backend mp
-    --enable-expert-parallel
+    --nnodes "${NNODES}"
+    --node-rank "${NODE_RANK}"
+    --master-addr "${MASTER_ADDR}"
+    --master-port "${MASTER_PORT}"
     --distributed-executor-backend mp
 )
 
@@ -221,9 +202,8 @@ set +f
 # 詰まったと感じたら手で:
 #   sudo docker exec <container> py-spy dump --native <EngineCore pid>
 #   sudo docker logs <container> | tail
-# DP coordinator は head にいるので、worker が rendezvous で止まっていたら
-# head の `--data-parallel-rpc-port` が開いているかから疑う:
-#   ss -ltnp | grep "${DP_RPC_PORT}"
+# worker が rendezvous で止まっていたら、head の MASTER_PORT が開いているかから疑う:
+#   ss -ltnp | grep "${MASTER_PORT}"
 
 echo "[entrypoint] exec: ${VLLM_CMD[*]}"
 exec "${VLLM_CMD[@]}"

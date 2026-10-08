@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 起動前チェック。head / worker1 / worker2 の 3 台すべてで実行する。
+# 起動前チェック。head / worker1 / worker2 / worker3 の 4 台すべてで実行する。
 #
 #   ./scripts/preflight.sh
 #
 # ここで赤が出た状態で起動すると、だいたい 5〜10 分待たされた挙句
 # NCCL の "unhandled system error" か OOM-kill で死ぬ。
-# 特にこの構成 (FP8 328GB / 3 台) はメモリが限界なので、== メモリ == は必ず見ること。
+# GPU_MEMORY_UTILIZATION は起動時の空きを超えると即落ちるので、== メモリ == は必ず見ること。
 # =============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -26,8 +26,8 @@ fi
 env_get() {
     sed -n "s/^$1=//p" .env | tail -1
 }
-for k in VLLM_IMAGE MODEL_PATH MODEL_CONTAINER_PATH TP_SIZE DP_SIZE \
-         HEAD_ROCE_IP WORKER1_ROCE_IP WORKER2_ROCE_IP \
+for k in VLLM_IMAGE MODEL_PATH MODEL_CONTAINER_PATH TP_SIZE NNODES \
+         HEAD_ROCE_IP WORKER1_ROCE_IP WORKER2_ROCE_IP WORKER3_ROCE_IP \
          ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX GPU_MEMORY_UTILIZATION; do
     printf -v "$k" '%s' "$(env_get "$k")"
 done
@@ -40,15 +40,16 @@ IFS=',' read -ra IB_HCAS  <<< "${IB_HCA_NAME}"
 # 空を既定値で埋めない (埋めると固定してあるかのように見えてしまう)。
 
 # 3 ノード分の peer (自分以外) を作っておく。
-ALL_PEERS=("${HEAD_ROCE_IP}" "${WORKER1_ROCE_IP}" "${WORKER2_ROCE_IP}")
-PEER_OCTS=("${HEAD_ROCE_IP##*.}" "${WORKER1_ROCE_IP##*.}" "${WORKER2_ROCE_IP##*.}")
+ALL_PEERS=("${HEAD_ROCE_IP}" "${WORKER1_ROCE_IP}" "${WORKER2_ROCE_IP}" "${WORKER3_ROCE_IP}")
+PEER_OCTS=()
+for _p in "${ALL_PEERS[@]}"; do PEER_OCTS+=("${_p##*.}"); done
 
 echo "== トポロジ =="
-echo "  TP=${TP_SIZE} DP=${DP_SIZE} (EP=${DP_SIZE}) — TP>1 は glm5_next の形状で不可"
-if [ "${TP_SIZE}" != "1" ] || [ "${DP_SIZE}" != "3" ]; then
-    ng "TP_SIZE=${TP_SIZE} / DP_SIZE=${DP_SIZE}。この構成は TP=1 / DP=3 固定 (entrypoint が落とす)"
+echo "  TP=${TP_SIZE} NNODES=${NNODES} — glm5_next は heads=64 / vocab=154880 なので TP は 2 か 4"
+if [ "${TP_SIZE}" != "4" ] || [ "${NNODES}" != "4" ]; then
+    ng "TP_SIZE=${TP_SIZE} / NNODES=${NNODES}。この構成は TP=4 / 4 ノード固定 (entrypoint が落とす)"
 else
-    ok "TP=1 / DP=3 / EP=3 (--enable-expert-parallel)"
+    ok "TP=4 / 4 ノード (--nnodes 4, mp backend)"
 fi
 
 echo
@@ -70,8 +71,8 @@ for IFN in "${ROCE_IFS[@]}"; do
     fi
 done
 if [ -n "${LOCAL_IPS}" ] && \
-   ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER1_ROCE_IP}" -e "${WORKER2_ROCE_IP}"; then
-    warn "どの IF の IP も .env の HEAD/WORKER1/WORKER2_ROCE_IP と一致しません。"
+   ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER1_ROCE_IP}" -e "${WORKER2_ROCE_IP}" -e "${WORKER3_ROCE_IP}"; then
+    warn "どの IF の IP も .env の HEAD/WORKER1..3_ROCE_IP と一致しません。"
     warn "  この機体が .env のどの役割か確認すること (compose の profile と IP が対応する)。"
 fi
 
@@ -139,7 +140,7 @@ for i in "${!ROCE_IFS[@]}"; do
             else
                 ng "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通りません"
                 echo "       スイッチがジャンボを落としている / 相手が down / arp が別 NIC に答えている"
-                echo "       (arp_ignore=1 / arp_announce=2 を 3 台とも確認)"
+                echo "       (arp_ignore=1 / arp_announce=2 を 4 台とも確認)"
             fi
         done
     fi
@@ -164,24 +165,25 @@ else
 fi
 
 echo
-echo "== メモリ (★ この構成の最大リスク) =="
-AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-# FP8 328GB を 3 台で割ると素の下限が ~102GiB/rank。DP の複製 (~9GiB) が乗って
-# 重み ~107GiB/rank、CUDA ctx/NCCL/プロセスで +7GiB 前後。
-# 121.7GiB の unified memory に対して残りは数 GiB しかない。
-# 起動前は MemAvailable 113GiB 以上が理想。105GiB を切ると GB10 では
-# NVRM OOM (ドライバが MemFree を見る) で warmup 中に落ちる可能性が高い。
-if [ "${AVAIL_GB}" -ge 113 ]; then
-    ok "MemAvailable ${AVAIL_GB} GB"
-elif [ "${AVAIL_GB}" -ge 105 ]; then
-    warn "MemAvailable ${AVAIL_GB} GB — 重み予算 ~115GiB に対して厳しい。"
-    warn "  他コンテナを止めて sync && echo 3 > /proc/sys/vm/drop_caches を推奨"
+echo "== メモリ =="
+AVAIL_GIB=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
+# vLLM は起動時に「空き >= GPU_MEMORY_UTILIZATION x 119.63GiB」を要求し、満たさないと
+#   ValueError: Free memory on device cuda:0 (109.32/119.63 GiB) on startup is less
+#   than desired GPU memory utilization (0.92, 110.06 GiB)
+# で即落ちる (2026-10-06 head 実測)。GB10 の cuda 空き ~= MemAvailable なので、ここで先に見る。
+# 重みは FP8 / TP=4 で ~76.2GiB/rank なので、要求量を満たせば残りは KV に回る。
+NEED_GIB=$(awk -v g="${GPU_MEMORY_UTILIZATION:-0.88}" 'BEGIN {printf "%.1f", g*119.63}')
+if awk -v a="${AVAIL_GIB}" -v n="${NEED_GIB}" 'BEGIN {exit !(a >= n + 1.0)}'; then
+    ok "MemAvailable ${AVAIL_GIB} GiB >= GMU ${GPU_MEMORY_UTILIZATION} x 119.63 = ${NEED_GIB} GiB"
+elif awk -v a="${AVAIL_GIB}" -v n="${NEED_GIB}" 'BEGIN {exit !(a >= n)}'; then
+    warn "MemAvailable ${AVAIL_GIB} GiB は要求 ${NEED_GIB} GiB をかろうじて超える程度。"
+    warn "  他コンテナを止めて sync && echo 3 | sudo tee /proc/sys/vm/drop_caches を推奨"
 else
-    ng "MemAvailable ${AVAIL_GB} GB — 足りません。他コンテナを止めるか再起動してください"
+    ng "MemAvailable ${AVAIL_GIB} GiB < 要求 ${NEED_GIB} GiB (GMU ${GPU_MEMORY_UTILIZATION})。"
+    ng "  vLLM が起動直後に落ちる。GPU_MEMORY_UTILIZATION を下げるか、他プロセスを止める"
 fi
 RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
 [ -n "${RUNNING}" ] && warn "起動中のコンテナ: ${RUNNING}"
-warn "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION} (0.90〜0.95 で調整。低いと KV 不足で起動不可)"
 
 echo
 echo "== rootful docker =="
