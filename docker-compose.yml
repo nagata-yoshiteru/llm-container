@@ -100,6 +100,9 @@ x-vllm-env: &vllm-env
   TILELANG_CACHE_DIR: ${TILELANG_CACHE_DIR:-/root/.cache/vllm/tilelang}
   TRITON_CACHE_DIR: ${TRITON_CACHE_DIR:-/root/.triton/cache}
   DG_JIT_CACHE_DIR: ${DG_JIT_CACHE_DIR:-/root/.cache/vllm/deepgemm}
+  # GB10 向けの Triton fused_moe tile 設定 (patches/moe-configs/)。vLLM 同梱の
+  # configs/ より先に探される。空にすると同梱のみ (= GLM-5.3 は既定 tile)。
+  VLLM_TUNED_CONFIG_FOLDER: ${VLLM_TUNED_CONFIG_FOLDER-/opt/moe-configs}
 
   # ---- ランタイム ----
   NVIDIA_VISIBLE_DEVICES: all
@@ -120,6 +123,7 @@ x-vllm-service: &vllm-service
   volumes:
     - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
     - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+    - ./patches/moe-configs:/opt/moe-configs:ro
     - ./vllm-cache/vllm:/root/.cache/vllm
     - ./vllm-cache/triton:/root/.triton
     - ./vllm-cache/torchinductor:/var/cache/torchinductor
