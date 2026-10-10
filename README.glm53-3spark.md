@@ -68,6 +68,10 @@ config / index が異なるモデルや、手で変更された serving director
 を `c748079d45e6e070b2acb108a91edfe52f4a7747` に固定する。
 ビルドソースは `.cache/kindling-tp3/upstream`、vLLM nightly は
 `ddd6fbca148a867aad1fcab7ec72f582b9977db4`、mentat は0.17.1。
+Docker Hub の古い nightly タグは削除対象になるため、同じ公式ビルドが残る
+公開 ECR の ARM64 イメージを digest 固定で参照する:
+`public.ecr.aws/q9t5s3a7/vllm-release-repo@sha256:2352b4a6a8f290967eed33fad5946c94c668479f6fa5816c13d26ef7aa13f889`。
+イメージの commit label と CUDA 13.0.2 を確認済み。
 `Dockerfile.kindling` はこの固定版の Dockerfile を基に、必要な overlay をイメージへ含める。
 旧 v8 用のホスト側パッチはマウントしない。
 
@@ -117,6 +121,8 @@ MTP_SOURCE は上記 vLLM 固定コミットの `vllm/models/glm5next/common/mtp
 ```bash
 python3 scripts/test-glm53-tp3-padding.py .cache/kindling-tp3/upstream "$MTP_SOURCE"
 python3 scripts/test-glm53-compose.py
+# 公開レジストリの取得可否、ARM64、vLLM commit まで確認（Docker daemon 不要）
+python3 scripts/test-glm53-compose.py --check-images
 ```
 
 GPU 起動後、他のリクエストがない状態で同条件を測定する。

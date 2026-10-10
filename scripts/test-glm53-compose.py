@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Validate the three normal profiles and build inputs without a Docker daemon."""
+"""Validate profiles/build inputs; --check-images also checks public registries.
+
+Neither mode requires a Docker daemon. Network mode verifies ARM64 and the
+vLLM build commit, so an expired nightly tag cannot pass just a syntax check.
+"""
 import importlib.util
 import json
 import os
@@ -53,6 +57,11 @@ for role in ("head", "worker1", "worker2"):
 
 dockerfile = (ROOT / "Dockerfile.kindling").read_text()
 original = (SOURCE / "image/Dockerfile").read_text()
+original_base = "vllm/vllm-openai:nightly-ddd6fbca148a867aad1fcab7ec72f582b9977db4"
+base = "public.ecr.aws/q9t5s3a7/vllm-release-repo@sha256:2352b4a6a8f290967eed33fad5946c94c668479f6fa5816c13d26ef7aa13f889"
+# Same official build, retained in public ECR after Docker Hub nightly cleanup.
+assert original.count("ARG BASE=" + original_base) == 1
+original = original.replace("ARG BASE=" + original_base, "ARG BASE=" + base)
 assert dockerfile.split("# --- llm-container:")[0].split("\n", 1)[1] == original + "\n"
 for line in dockerfile.splitlines():
     if line.startswith("COPY ") and not line.startswith("COPY --from="):
@@ -91,3 +100,22 @@ with tempfile.TemporaryDirectory() as tmp:
     else:
         raise AssertionError("Unexpected source must be rejected")
 print("PASS: both existing model aliases reach vLLM as separate arguments; source guard")
+
+if "--check-images" in sys.argv:
+    def image_config(ref):
+        return json.loads(run("docker", "buildx", "imagetools", "inspect", ref,
+                              "--format", "{{json .Image}}"))
+
+    cfg = image_config(base)
+    assert (cfg["os"], cfg["architecture"]) == ("linux", "arm64")
+    assert cfg["config"]["Labels"]["ai.vllm.build.commit"] == "ddd6fbca148a867aad1fcab7ec72f582b9977db4"
+    print("PASS: public ECR base exists, linux/arm64, exact vLLM commit")
+    version = next(x.removeprefix("ARG MENTAT_VERSION=") for x in dockerfile.splitlines()
+                   if x.startswith("ARG MENTAT_VERSION="))
+    mentat = "mmastrac/mentat-artifacts:"
+    manifest = json.loads(run("docker", "buildx", "imagetools", "inspect", mentat + version, "--raw"))
+    arm = next(x for x in manifest["manifests"] if x["platform"].get("architecture") == "arm64"
+               and x["platform"].get("os") == "linux")
+    cfg = image_config("mmastrac/mentat-artifacts@" + arm["digest"])
+    assert (cfg["os"], cfg["architecture"]) == ("linux", "arm64")
+    print(f"PASS: mentat-artifacts:{version} exists, linux/arm64")

@@ -41,7 +41,7 @@
 #
 # GB10 is sm_121 and this torch reports up to sm_120. That is correct: sm_120
 # cubins run on sm_121. Do not widen TORCH_CUDA_ARCH_LIST.
-ARG BASE=vllm/vllm-openai:nightly-ddd6fbca148a867aad1fcab7ec72f582b9977db4
+ARG BASE=public.ecr.aws/q9t5s3a7/vllm-release-repo@sha256:2352b4a6a8f290967eed33fad5946c94c668479f6fa5816c13d26ef7aa13f889
 # vLLM source the FlashKDA registration shim comes from. Keep it at BASE's commit.
 ARG VLLM_REF=ddd6fbca148a867aad1fcab7ec72f582b9977db4
 # Pulled registry-qualified: a bare `mentat-artifacts:<ver>` tag resolves to a
