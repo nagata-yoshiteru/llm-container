@@ -37,6 +37,8 @@ x-vllm-env: &vllm-env
   VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
   VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
   VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
+  # MTP と decode graph を entrypoint で組み立てる。空なら旧 EXTRA_ARGS を使う。
+  MTP_NUM_SPECULATIVE_TOKENS: ${MTP_NUM_SPECULATIVE_TOKENS:-}
 
   # ---- entrypoint がフラグに変換するスイッチ ----
   LANGUAGE_MODEL_ONLY: ${LANGUAGE_MODEL_ONLY:-1}

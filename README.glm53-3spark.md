@@ -160,3 +160,57 @@ sudo docker compose --profile head down       # 各ノードで自分の profile
    `Using AgRsAll2AllManager` までは確認済み (メモリで落ちたのはその後)。
 3. **4 台にできるなら TP4 が本線。** num_heads=64/4=16、vocab=154880/4=38720、
    moe_i=2048/4=512 がすべて割り切れ、パディングも overlay も不要。
+
+---
+
+## 6. MTP k=2 の速度比較 (1〜2 リクエスト優先)
+
+現在の uncensored NVFP4、TP=1 / DP=3 / EP=3、1M の上限はそのまま、
+MTP の深さだけを比較する。`.env` / `.env.example` の初期比較値は **k=2**。
+速度・精度・KV 容量は、この構成で再起動してから検証する。
+
+```dotenv
+MTP_NUM_SPECULATIVE_TOKENS=2
+MAX_NUM_SEQS=2
+ENFORCE_EAGER=0
+VLLM_EXTRA_ARGS=--moe-backend marlin
+```
+
+`entrypoint.sh` が MTP と `FULL_DECODE_ONLY` の CUDA Graph 引数を生成する。
+`mode=0` (torch.compile 無効) は従来どおり。capture size は各 DP rank の
+`MAX_NUM_SEQS` と `k+1` (target 1 トークン + draft k トークン) から計算する。
+
+| `MTP_NUM_SPECULATIVE_TOKENS` | `MAX_NUM_SEQS=2` の capture sizes | 用途 |
+| --- | --- | --- |
+| `1` | `[2,4]` | 従来の基準へ戻す |
+| `2` | `[3,6]` | 最初の比較 |
+| `3` | `[4,8]` | k=2 の測定後に比較 |
+
+この変数を使う場合、`VLLM_*_ARGS` に `--speculative-config` や
+`--compilation-config` を入れると起動前にエラーにする。`ENFORCE_EAGER=1` では
+MTP だけを設定し、graph の引数は生成しない。変数を空にした場合は従来の
+`VLLM_EXTRA_ARGS` 手動設定を使える (MTP も手動指定が必要)。
+
+vLLM の一部の版では投機の深さが compile cache hash に含まれない
+([vLLM #53366](https://github.com/vllm-project/vllm/issues/53366)) ため、
+vLLM / TorchInductor キャッシュは自動で `glm53-mtp-k1` / `k2` / `k3` に分ける。
+従来のキャッシュは削除しない。各 k の初回は再ウォームアップが必要。
+
+### 反映と比較
+
+全ノードでコードを pull し、同じ `.env` を置いてから全コンテナを再作成する。
+稼働中のコンテナは `.env` を編集しただけでは変わらない。
+
+1. head → worker1 → worker2 の順で、それぞれ `sudo docker compose --profile <役割> down`。
+2. worker2 → worker1 → head の順で、それぞれ `sudo docker compose --profile <役割> up -d --force-recreate`。
+3. 起動ログの `MTP k=2 decode graph sizes=[3,6]` と `MTP cache=.../glm53-mtp-k2` を確認。
+4. KV 容量を確認する。k を増やすと MTP 用の状態等も増えるので、k=1 時の
+   「1M が rank ごとに2本載る」という結果をそのまま流用しない。
+5. ウォームアップ後、同じプロンプト・出力上限・sampling・reasoning effort で
+   **1並列 / 2並列**を各3回以上測る。固定長の生成速度と、元の数学・コード問題の
+   正答率／完了時間を別に比較する。MTP の採択率だけで採用を決めない。
+
+`reasoning_effort` は今回変更しない。現在のテンプレートは未指定で `max`、
+`enable_thinking=false` は反映されないので、thinking off の測定として記録しない。
+k=3 を試す／k=1 に戻す場合は **全3ノード**の `MTP_NUM_SPECULATIVE_TOKENS` を
+同じ値に変えて、上と同じ順で再作成する。

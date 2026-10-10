@@ -102,6 +102,7 @@ fi
 : "${DP_START_RANK:?DP_START_RANK must be set (head=0 / worker=1 / worker2=2)}"
 : "${DP_RPC_PORT:=13345}"
 : "${HEAD_ROCE_IP:?HEAD_ROCE_IP must be set (DP coordinator address)}"
+: "${MAX_NUM_SEQS:=6}"
 
 for v in WORKER1_ROCE_IP WORKER2_ROCE_IP ROCE_IF_NAME IB_HCA_NAME; do
     if [ -z "${!v:-}" ]; then
@@ -129,6 +130,44 @@ esac
 echo "[entrypoint] role=${ROLE} dp_rank=${DP_START_RANK}/${DP_SIZE} tp=${TP_SIZE}"
 echo "[entrypoint] dp_coordinator=${HEAD_ROCE_IP}:${DP_RPC_PORT} iface=${ROCE_IF_NAME} hca=${IB_HCA_NAME} gid=${NCCL_IB_GID_INDEX:-<unset>}"
 echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
+
+# MTP k を変えたとき、decode graph とキャッシュも一緒に切り替える。
+# 未指定なら従来どおり VLLM_EXTRA_ARGS の手動設定をそのまま使用する。
+MTP_ARGS=()
+if [ -n "${MTP_NUM_SPECULATIVE_TOKENS:-}" ]; then
+    case "${MTP_NUM_SPECULATIVE_TOKENS}" in
+        1|2|3) ;;
+        *) echo "[entrypoint] ERROR: MTP_NUM_SPECULATIVE_TOKENS は 1 / 2 / 3 を指定してください。" >&2; exit 1 ;;
+    esac
+    if ! [[ "${MAX_NUM_SEQS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[entrypoint] ERROR: MAX_NUM_SEQS は正の整数を指定してください。" >&2
+        exit 1
+    fi
+    # 同じフラグを後から上書きすると k と capture size が食い違う。
+    if [[ "${VLLM_PARSER_ARGS:-} ${VLLM_KV_ARGS:-} ${VLLM_EXTRA_ARGS:-}" =~ --(speculative-config|compilation-config)(=|[[:space:]]|$) ]]; then
+        echo "[entrypoint] ERROR: MTP_NUM_SPECULATIVE_TOKENS 使用時は VLLM_*_ARGS の --speculative-config / --compilation-config を削除してください。" >&2
+        exit 1
+    fi
+    _mtp_k=${MTP_NUM_SPECULATIVE_TOKENS}
+    MTP_ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${_mtp_k}}")
+    if [ "${ENFORCE_EAGER:-0}" != "1" ]; then
+        # 1 seq あたり target token 1 個 + draft k 個。seq 数は DP rank ごと。
+        _capture_sizes=""
+        for ((_seq=1; _seq<=MAX_NUM_SEQS; _seq++)); do
+            _capture_sizes+="${_capture_sizes:+,}$((_seq * (_mtp_k + 1)))"
+        done
+        _capture_max=$((MAX_NUM_SEQS * (_mtp_k + 1)))
+        MTP_ARGS+=(--compilation-config "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[${_capture_sizes}],\"max_cudagraph_capture_size\":${_capture_max}}")
+        echo "[entrypoint] MTP k=${_mtp_k} decode graph sizes=[${_capture_sizes}]"
+    else
+        echo "[entrypoint] MTP k=${_mtp_k} eager mode"
+    fi
+    # vLLM #53366: k が compile cache hash に含まれない版がある。
+    # 元の k=1 キャッシュは残し、各 k に専用ディレクトリを使う。
+    export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/root/.cache/vllm}/glm53-mtp-k${_mtp_k}"
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/var/cache/torchinductor}/glm53-mtp-k${_mtp_k}"
+    echo "[entrypoint] MTP cache=${VLLM_CACHE_ROOT} inductor=${TORCHINDUCTOR_CACHE_DIR}"
+fi
 
 # ---------------------------------------------------------------------------
 # RDMA プリフライト: HCA が見えていない状態で起動すると NCCL が
@@ -185,8 +224,7 @@ VLLM_CMD=(
     --distributed-executor-backend mp
 )
 
-# --max-num-batched-tokens は GLM-5.3 (hybrid mamba/attention) では
-# 「渡さない」のが検証済みレシピ。.env で空にしておくとここで落ちる。
+# 空なら vLLM の既定値を使う。現在の .env は KDA に合わせて 4608 を指定。
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && VLLM_CMD+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 
 [ "${ROLE}" = "worker" ] && VLLM_CMD+=(--headless)
@@ -196,7 +234,7 @@ VLLM_CMD=(
 #                           SM12x の sparse-MLA prefill には画像幅のカーネルが
 #                           無く、メモリも ~1.2GiB/rank 余分に食うので既定 1。
 #   ENFORCE_EAGER=1       : CUDA graph capture を止める (切り分け用)。既定の .env は
-#                           0 で、--compilation-config で decode だけ graph にしている。
+#                           0 で、MTP_ARGS の設定で decode だけ graph にしている。
 #   SKIP_MM_PROFILING     : vision ON のとき mm profiling を走らせない。
 #   LIMIT_MM              : {"image":2,"video":1} 等。空白を入れないこと。
 [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]  && VLLM_CMD+=(--language-model-only)
@@ -217,6 +255,7 @@ for _args in "${VLLM_PARSER_ARGS:-}" "${VLLM_KV_ARGS:-}" "${VLLM_EXTRA_ARGS:-}";
     VLLM_CMD+=(${_args})
 done
 set +f
+VLLM_CMD+=("${MTP_ARGS[@]}")
 
 # 詰まったと感じたら手で:
 #   sudo docker exec <container> py-spy dump --native <EngineCore pid>
