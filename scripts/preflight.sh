@@ -26,7 +26,7 @@ fi
 env_get() {
     sed -n "s/^$1=//p" .env | tail -1
 }
-for k in VLLM_IMAGE MODEL_PATH MODEL_CONTAINER_PATH TP_SIZE DP_SIZE \
+for k in VLLM_IMAGE MODEL_PATH MODEL_CONTAINER_PATH TP_SIZE KV_CACHE_MEMORY \
          HEAD_ROCE_IP WORKER1_ROCE_IP WORKER2_ROCE_IP \
          ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX GPU_MEMORY_UTILIZATION; do
     printf -v "$k" '%s' "$(env_get "$k")"
@@ -44,11 +44,11 @@ ALL_PEERS=("${HEAD_ROCE_IP}" "${WORKER1_ROCE_IP}" "${WORKER2_ROCE_IP}")
 PEER_OCTS=("${HEAD_ROCE_IP##*.}" "${WORKER1_ROCE_IP##*.}" "${WORKER2_ROCE_IP##*.}")
 
 echo "== トポロジ =="
-echo "  TP=${TP_SIZE} DP=${DP_SIZE} (EP=${DP_SIZE}) — TP>1 は glm5_next の形状で不可"
-if [ "${TP_SIZE}" != "1" ] || [ "${DP_SIZE}" != "3" ]; then
-    ng "TP_SIZE=${TP_SIZE} / DP_SIZE=${DP_SIZE}。この構成は TP=1 / DP=3 固定 (entrypoint が落とす)"
+echo "  kindling TP=${TP_SIZE} / 3 hosts (runtime zero padding)"
+if [ "${TP_SIZE}" != "3" ]; then
+    ng "この構成は TP_SIZE=3。MODEL_PATH は prepare-glm53-tp3.py が生成する別ディレクトリ"
 else
-    ok "TP=1 / DP=3 / EP=3 (--enable-expert-parallel)"
+    ok "TP=3、各 profile がローカル mentat daemon とモデルを起動"
 fi
 
 echo
@@ -95,7 +95,7 @@ for HCA in "${IB_HCAS[@]}"; do
 done
 
 if [ -z "${NCCL_IB_GID_INDEX}" ]; then
-    ok "GID index は未固定 (NCCL に選ばせる) — dual-HCA ではこれが正解"
+    ok "GID index は未固定 (kindling が実際の fabric アドレスから導出)"
     # 参考情報として、各 HCA の RoCEv2/IPv4 の行だけ出しておく
     for HCA in "${IB_HCAS[@]}"; do
         show_gids 2>/dev/null | awk -v d="${HCA}" '$1==d && /v2/ && $5 ~ /^[0-9]+\./ {
@@ -148,29 +148,37 @@ done
 echo
 echo "== モデル =="
 if [ -d "${MODEL_PATH}" ]; then
-    N=$(ls "${MODEL_PATH}"/model-*.safetensors 2>/dev/null | wc -l)
-    if [ "${N}" -eq 121 ]; then
-        ok "${MODEL_PATH} (${N} shard, $(du -sh "${MODEL_PATH}" 2>/dev/null | cut -f1))"
+    if python3 - "${MODEL_PATH}" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+t = json.loads((p / 'config.json').read_text())['text_config']
+m = json.loads((p / 'tp3-preparation.json').read_text())
+w = json.loads((p / 'model.safetensors.index.json').read_text())['weight_map']
+assert t['num_attention_heads'] == t['linear_attn_config']['num_heads'] == 66
+assert t['moe_intermediate_size'] == 2304 and t['vocab_size'] == 154880
+assert m['kindling_commit'] == 'c748079d45e6e070b2acb108a91edfe52f4a7747'
+assert all((p / s).is_file() for s in set(w.values()))
+print(f'  index が参照する {len(set(w.values()))} shards が存在')
+PY
+    then
+        ok "TP=3 の config / manifest / checkpoint index"
     else
-        ng "${MODEL_PATH} の shard 数が ${N} です (GLM-5.3-Flash-UNCENSORED-NVFP4 は 121) — ./scripts/fetch-model.sh を再実行"
-    fi
-    if [ -f "${MODEL_PATH}/model.safetensors.index.json" ]; then
-        ok "${MODEL_PATH}/model.safetensors.index.json あり (MTP head はこの中)"
-    else
-        ng "${MODEL_PATH}/model.safetensors.index.json がありません"
+        ng "モデル準備が未完了 — python3 scripts/prepare-glm53-tp3.py"
     fi
 else
-    ng "${MODEL_PATH} がありません — ./scripts/fetch-model.sh"
+    ng "${MODEL_PATH} がありません — python3 scripts/prepare-glm53-tp3.py"
 fi
 
 echo
 echo "== メモリ =="
 AVAIL_GIB=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
+echo "  KV pin: ${KV_CACHE_MEMORY} bytes。GMU とは別に予約するので、起動ログで余裕を確認。"
 # vLLM は起動時に「空き >= GPU_MEMORY_UTILIZATION x 119.63GiB」を要求し、満たさないと
 #   ValueError: Free memory on device cuda:0 (109.32/119.63 GiB) on startup is less
 #   than desired GPU memory utilization (0.92, 110.06 GiB)
 # で即落ちる (2026-10-06 head 実測)。GB10 の cuda 空き ~= MemAvailable なので、ここで先に見る。
-# 重みは NVFP4 / EP=3 で ~71.4GiB/rank なので、要求量を満たせば残りは KV に回る。
+# KV は kindling の TP=3 推奨値を固定予約。GMU による空きの検査だけで安全とは断定しない。
 NEED_GIB=$(awk -v g="${GPU_MEMORY_UTILIZATION:-0.88}" 'BEGIN {printf "%.1f", g*119.63}')
 if awk -v a="${AVAIL_GIB}" -v n="${NEED_GIB}" 'BEGIN {exit !(a >= n + 1.0)}'; then
     ok "MemAvailable ${AVAIL_GIB} GiB >= GMU ${GPU_MEMORY_UTILIZATION} x 119.63 = ${NEED_GIB} GiB"
@@ -214,7 +222,7 @@ if sudo -n docker info >/dev/null 2>&1; then
         || ng "docker info に nvidia ランタイムがありません"
     sudo -n docker image inspect "${VLLM_IMAGE}" >/dev/null 2>&1 \
         && ok "イメージ取得済み" \
-        || warn "イメージ未取得 — sudo docker pull ${VLLM_IMAGE}"
+        || warn "イメージ未ビルド — sudo docker compose --profile <役割> build"
 else
     warn "sudo docker が非対話で叩けません — 以下を手で確認すること:"
     echo "       sudo docker info | grep -i runtimes        # nvidia が出ること"

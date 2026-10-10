@@ -1,0 +1,245 @@
+# Derived from kindling c748079d45e6e070b2acb108a91edfe52f4a7747/image/Dockerfile
+# GLM-5.3-Flash NVFP4 on ASUS GX10 / GB10 (sm_121), TP=4 over RoCE.
+#
+# Built on a stock vLLM NIGHTLY. GLM-5.3-Flash (glm5_next) landed on main, so
+# the per-model pre-merge image this used to start from
+# (vllm/vllm-openai:glm53-flash-arm64-cu130) is no longer needed, and neither
+# are most of the patches that sat on top of it. Audited 2026-09-22 against
+# nightly 0961bbae, patch by patch, and again 2026-09-26 against ddd6fbca:
+#
+#   dropped, now upstream:
+#     thinking_budget_guard.py      the V2 sampler applies thinking_token_budget
+#     kpool-fix indexer.py          tail slot mapping written into a persistent
+#                                   buffer (out=slot_mapping_buffer)
+#     kpool-fix mamba_hybrid.py     positions= passed to build_attn_metadata
+#     dflash registry/qwen3_dflash2/speculator/spec_decode_init
+#     glm53_kpool_tail_ring.py      vllm#58454
+#   dropped, now a flag:
+#     gb10_topk_fallback.py         --sparse-indexer-topk-backend per_row
+#   dropped, no longer needed:
+#     flashinfer nightly pin        the nightly ships 0.6.18.post1
+#     NCCL 2.30.7 pin               the nightly ships 2.30.7
+#     cutlass-dsl 4.6.2 pin         the nightly ships 4.7.1; watch this one
+#     model_runner.py mount         PP-only; this runs PP=1
+#   added:
+#     glm53_mtp_bf16.py             MTP layer is BF16 but config.json says NVFP4
+#     sm90_fp8_kv_dtype.py          SM90 builder planned fp8 KV as uint8
+#     glm53_reasoning_always_parsed.py  thinking off = low effort, still <think>
+#     vllm-58720-routed-experts.patch  vllm#58720 (ad6817b), after this nightly
+#     FlashKDA 17a037d              vllm#58846, still open: fp32 recurrent state
+#   kept:
+#     glm53-flash_SM121.py (MiaAI)  5 of 7 edits apply unchanged; see below
+#     gb10_plugin_backend.py        MiaAI vs LibertAI sparse-MLA switch
+#     worker_memory_cap.py          ours: TORCH_MEM_FRACTION
+#     spin_wait.py                  was a whole-file shm_broadcast.py mount
+#     glm47_failclosed.py           tool parser plugin, import path ported
+#     glm53_eagle3_aux.py           upstream GLM5next exposes no aux hidden states;
+#                                   retargeted to models/glm5next/common/model.py
+#     glm53_dflash2_kv_groups.py    drafter KV groups on the GLM-5-Next layout
+#                                   (the old whole-file kv_cache_utils.py fork,
+#                                   reduced to what the nightly lacks)
+#
+# GB10 is sm_121 and this torch reports up to sm_120. That is correct: sm_120
+# cubins run on sm_121. Do not widen TORCH_CUDA_ARCH_LIST.
+ARG BASE=vllm/vllm-openai:nightly-ddd6fbca148a867aad1fcab7ec72f582b9977db4
+# vLLM source the FlashKDA registration shim comes from. Keep it at BASE's commit.
+ARG VLLM_REF=ddd6fbca148a867aad1fcab7ec72f582b9977db4
+# Pulled registry-qualified: a bare `mentat-artifacts:<ver>` tag resolves to a
+# local image, and those have been mislabelled before -- every image "pinned"
+# to 0.4.0 once silently ran 0.1.0. Verify with `mentatd --version`.
+# Must match the host daemons: the README asks for one mentat version on every box.
+ARG MENTAT_VERSION=0.17.1
+
+FROM mmastrac/mentat-artifacts:${MENTAT_VERSION} AS mentat
+
+# GLM's KDA layers run chunked prefill through vllm/_flashkda_C on SM12x. The
+# nightly builds FlashKDA b59532f, which rounds the recurrent state to bf16
+# after every 16-token tile, and long prefills corrupt tool-call output.
+# vllm#58846 bumps it to 17a037d, which keeps that state in fp32. Same
+# flash_kda.h and cutlass pin, so only the .so changes.
+FROM ${BASE} AS flashkda
+ARG VLLM_REF
+ARG FLASHKDA_REF=17a037d98da546deb4591e967cf961a43c034d8b
+ARG CUTLASS_REF=5c149f52a436782210263fb2f19b354443a61c6a
+COPY image/flashkda/ /build/
+RUN FLASHKDA_REF=${FLASHKDA_REF} CUTLASS_REF=${CUTLASS_REF} VLLM_REF=${VLLM_REF} /build/build.sh
+
+FROM ${BASE}
+
+# nvcc's include path is missing the headers whose libraries this base ships,
+# which breaks any FlashInfer JIT path (nvrtc.h, then -lnvrtc).
+COPY image/patches/link_cuda_headers.sh /tmp/link_cuda_headers.sh
+RUN bash /tmp/link_cuda_headers.sh && rm /tmp/link_cuda_headers.sh
+
+# --- sm_121 sparse MLA -------------------------------------------------------
+# This checkpoint is NoPE (qk_rope_head_dim 0). On capability 12 the nightly
+# still offers only TRITON_MLA and FLASHINFER_MLA_SPARSE_SM120, and SM120
+# mandates the packed fp8_ds_mla layout, which NoPE cannot use -- the engine
+# dies in concat_and_cache_mla after a ~10 minute weight load. The SM90 backend
+# already covers NoPE (kpe in {0, 64}) but is gated to Hopper; FA3 is, FA2 is
+# not. MiaAI's patcher lists SM90 on capability 12 and swaps FA2 in off Hopper,
+# plus FA2's fp8 gate and CTA tile for ~101 KB smem, PDL off (a KDA race on
+# this hardware), a kpool pid clamp, and initialising the indexer's top-k
+# buffer to -1 instead of torch.empty.
+#
+# Two of those edits target code that moved since MiaAI wrote them: the indexer
+# allocation and FlashInfer 0.7.0's fp8 gate. mia_retarget.py rewrites their
+# paths and anchors in a copy, so the vendored file stays verbatim (MIT,
+# licence beside it). The patcher still asserts every anchor matches once.
+COPY image/patches/glm53-flash_SM121.py image/patches/LICENSE.MiaAI-Lab image/patches/mia_retarget.py /tmp/mia/
+RUN python3 /tmp/mia/mia_retarget.py /tmp/mia/glm53-flash_SM121.py \
+ && python3 /tmp/mia/glm53-flash_SM121.py && rm -rf /tmp/mia
+
+# MiaAI's patcher and LibertAI's plugin both solve the sm_121 MLA problem, and
+# the first shuts the second out. Make the choice an env var -- see the script.
+COPY image/patches/gb10_plugin_backend.py /tmp/gb10_plugin_backend.py
+RUN python3 /tmp/gb10_plugin_backend.py && rm /tmp/gb10_plugin_backend.py
+
+# The SM90 backend's metadata builder plans FlashInfer's MLA wrapper with
+# kv_cache_spec.dtype, which for an fp8 cache is the uint8 STORAGE dtype, and
+# plan() rejects it at the first autotune run. The pre-merge image passed
+# float8_e4m3fn; this restores that. Not GB10-specific.
+COPY image/patches/sm90_fp8_kv_dtype.py /tmp/sm90_fp8_kv_dtype.py
+RUN python3 /tmp/sm90_fp8_kv_dtype.py && rm /tmp/sm90_fp8_kv_dtype.py
+
+# Nothing in vLLM bounds a worker's memory, and on unified memory an unbounded
+# worker takes the node down rather than its own request.
+COPY image/patches/spark_mem_trace.py /usr/local/lib/python3.12/dist-packages/spark_mem_trace.py
+COPY image/patches/worker_memory_cap.py /tmp/worker_memory_cap.py
+RUN python3 /tmp/worker_memory_cap.py && rm /tmp/worker_memory_cap.py
+
+COPY image/patches/spin_wait.py /tmp/spin_wait.py
+RUN python3 /tmp/spin_wait.py && rm /tmp/spin_wait.py
+
+# DFlash2 reads auxiliary hidden states from target layers 5, 14, 24, 33, 42.
+# Upstream serves the DFlash2 drafter but its GLM5next model exposes no aux
+# states, so without this `--speculative-config dflash` fails at load with
+# "Model does not support EAGLE3 interface". Inert unless a drafter asks for
+# aux layers. Only the target path changed from the vendor-base version.
+COPY image/patches/glm53_eagle3_aux.py /tmp/glm53_eagle3_aux.py
+RUN python3 /tmp/glm53_eagle3_aux.py && rm /tmp/glm53_eagle3_aux.py
+
+# nvidia/GLM-5.3-Flash-NVFP4 stores its MTP layer (45) in BF16, but its
+# config.json declares every Linear NVFP4 and does not list layer 45 in
+# `ignore`, so MTP dies at load: "size of tensor a (256) must match ... (512)"
+# in RoutedExperts._load_w2. This excludes the MTP layer from quantisation when
+# the checkpoint holds no scales for it -- driven by the weights, so a
+# checkpoint that does quantise its MTP layer is left alone.
+COPY image/patches/glm53_mtp_bf16.py /tmp/glm53_mtp_bf16.py
+RUN python3 /tmp/glm53_mtp_bf16.py && rm /tmp/glm53_mtp_bf16.py
+
+# Thinking off no longer closes an empty <think></think> (out of distribution for
+# this model; it breaks long structured output). The template maps it to
+# `Reasoning Effort: Low` and still opens <think>, so the reasoning parser must
+# track <think> even when the request says thinking is off.
+COPY image/patches/glm53_reasoning_always_parsed.py /tmp/glm53_reasoning_always_parsed.py
+RUN python3 /tmp/glm53_reasoning_always_parsed.py && rm /tmp/glm53_reasoning_always_parsed.py
+
+# The kpool indexer's top-k returns the right pools in a run-dependent order and
+# keeps a run-dependent subset of pools tied at the k-th score. The sparse MLA
+# kernel sums keys in list order, so identical requests past 2048 tokens rounded
+# differently and then selected different keys. The patch breaks ties by pool id
+# and sorts each row.
+COPY image/patches/glm53_deterministic_topk.py /tmp/glm53_deterministic_topk.py
+RUN python3 /tmp/glm53_deterministic_topk.py && rm /tmp/glm53_deterministic_topk.py
+
+# vllm#58720 (ad6817b) landed after this nightly: RoutedExperts indexes the
+# expert mapping by weight name once, instead of scanning it for every tensor.
+COPY image/patches/vllm-58720-routed-experts.patch /tmp/
+RUN cd /usr/local/lib/python3.12/dist-packages \
+ && patch -p1 --forward < /tmp/vllm-58720-routed-experts.patch \
+ && rm /tmp/vllm-58720-routed-experts.patch
+
+COPY --from=flashkda /out/_flashkda_C.abi3.so /out/FLASHKDA_REF /usr/local/lib/python3.12/dist-packages/vllm/
+
+# DFlash2's drafter adds five sliding-window attention layers, and the nightly's
+# GLM-5-Next KV grouper gives up on any spec that is not MLA, so the model falls
+# onto the generic path and dies in unify_kv_cache_spec_page_size ("page size is
+# not divisible by the maximum page size"). This keeps the target's groups and
+# gives the drafter layers a group of their own, laid out after the indexer
+# regions and opted out of prefix caching. Inert without a drafter.
+COPY image/patches/glm53_dflash2_kv_groups.py /tmp/glm53_dflash2_kv_groups.py
+RUN python3 /tmp/glm53_dflash2_kv_groups.py && rm /tmp/glm53_dflash2_kv_groups.py
+
+# The fail-closed GLM tool parser, loaded with --tool-parser-plugin. Baked and
+# selected by the entrypoint rather than passed through EXTRA_ARGS: a compose
+# override that restated EXTRA_ARGS dropped it, twice, and production ran the
+# stock parser without anyone noticing.
+COPY image/patches/glm47_failclosed.py /usr/local/share/glm47_failclosed.py
+
+#   iproute2  the entrypoint finds this node's ConnectX address by scanning
+#             `ip -o -4 addr` for CLUSTER_SUBNET, and derives GLOO_SOCKET_IFNAME
+#             from whichever interface owns it; the port differs per box.
+#   ibverbs   NCCL's RoCE data plane. Missing, NCCL silently falls back to TCP
+#             over the LAN and every TP step crawls.
+#   ripgrep/pciutils/usbutils are for the MCP inventory and search tools.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 libibverbs1 librdmacm1 ibverbs-providers \
+        ripgrep pciutils usbutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && command -v ip && command -v rg
+
+# mentat replaces Ray. Unlike the single-GPU tenants, TP=4 across four boxes
+# really does need placement, so this installs the daemon binary and the `ray`
+# symlink as well as the shim package. Real Ray on unified memory caused two
+# outages this exists to prevent: its memory monitor killed healthy ranks at 95%
+# node memory (the ~89 GiB of weights ARE host memory), and its object store
+# took up to ~36 GiB for a model that moves every tensor over NCCL. On a vLLM
+# bump, re-audit the shim with: grep -rn 'ray\.' <site-packages>/vllm/v1/executor/
+COPY --from=mentat /out/ /tmp/mentat-out/
+# mentatd-probe-machine is how the agent learns this box's GPUs from 0.9.0 on
+# ("Move the machine inventory into a probe script"). Without it `ray start`
+# registers ZERO GPUs, and vLLM's placement dies with "required GPUs exceeds
+# the total number of available GPUs". It must sit beside mentatd or on PATH.
+RUN install -m755 /tmp/mentat-out/mentatd /usr/local/bin/mentatd \
+    && install -m755 /tmp/mentat-out/mentatd-probe-machine /usr/local/bin/mentatd-probe-machine \
+    && ln -sf /usr/local/bin/mentatd /usr/local/bin/ray \
+    && pip install --no-cache-dir --no-deps /tmp/mentat-out/mentatd-*-py3-none-any.whl \
+    && rm -rf /tmp/mentat-out \
+    && ray --version
+
+COPY image/verify-base.py /tmp/verify-base.py
+RUN python3 /tmp/verify-base.py && rm /tmp/verify-base.py
+
+COPY image/chat-template.jinja /usr/local/share/glm53-chat-template.jinja
+COPY vllm/status-server.py image/self-test.py image/fabric-check.py /usr/local/bin/
+COPY image/entrypoint.sh image/discover.sh /
+# Per-rank NCCL and arx devices on a ring (TP=RING4), set before vLLM loads NCCL.
+COPY image/fabric_ring.py /usr/local/lib/python3.12/dist-packages/
+RUN echo "import fabric_ring" > /usr/local/lib/python3.12/dist-packages/fabric_ring.pth
+RUN chmod +x /usr/local/bin/status-server.py /usr/local/bin/self-test.py /usr/local/bin/fabric-check.py /entrypoint.sh
+
+# 8002 = OpenAI API, 8082 = startup status page, bound from container start
+EXPOSE 8002 8082
+ENTRYPOINT ["/entrypoint.sh"]
+
+# --- llm-container: TP=3 W4A16 overlays baked into the image ---
+COPY experimental/arx/arx.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/arx.py
+COPY experimental/arx/arx_vllm.cu /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/arx_vllm.cu
+COPY experimental/arx/arxbig.cu /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/arxbig.cu
+COPY experimental/arx/cuda_communicator.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/cuda_communicator.py
+COPY experimental/snapshot/weight_snapshot.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_snapshot.py
+COPY experimental/snapshot/base_loader.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/base_loader.py
+COPY experimental/snapshot/modelopt.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/modelopt.py
+COPY experimental/snapshot/flashinfer_cutlass_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
+COPY experimental/snapshot/dense_fp8.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/dense_fp8.py
+COPY experimental/fixes/_fa_common.py /usr/local/lib/python3.12/dist-packages/flashinfer/mla/_batch_mla/_backends/_fa_common.py
+COPY experimental/fixes/attention.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/attention.py
+COPY experimental/fixes/tilelang_kernels.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+COPY experimental/fixes/mhc_tilelang.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/mhc/tilelang.py
+COPY experimental/fixes/flashinfer_mla_sparse_sm90.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+COPY experimental/fixes/gb10_sparse_mla.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/gb10_sparse_mla.py
+COPY experimental/fixes/gdn_attn.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/gdn_attn.py
+COPY experimental/fixes/kda.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/kda.py
+COPY experimental/fixes/causal_conv1d.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+COPY experimental/fixes/kv_cache_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py
+COPY experimental/fixes/kv_cache_coordinator.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py
+COPY experimental/fixes/kv_cache_interface.py /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py
+COPY experimental/fixes/worker_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/utils.py
+COPY experimental/fixes/warmup.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/warmup.py
+COPY experimental/fixes/model.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/model.py
+COPY experimental/fixes/recoverssm.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/recoverssm.py
+COPY experimental/tp3/tp3pad.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/tp3pad.py
+COPY experimental/tp3/vocab_parallel_embedding.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/vocab_parallel_embedding.py
+COPY --from=local_patches patch-mtp.py patch-entrypoint.py /tmp/llm-patches/
+RUN python3 /tmp/llm-patches/patch-mtp.py && python3 /tmp/llm-patches/patch-entrypoint.py && rm -rf /tmp/llm-patches

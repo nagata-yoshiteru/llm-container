@@ -2,7 +2,7 @@
 # =============================================================================
 # dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 (modelopt NVFP4) の重みを取得する。
 #
-#   ./scripts/fetch-model.sh          # MODEL_PATH に 121 shard (約 181GiB)
+#   ./scripts/fetch-model.sh          # SOURCE_MODEL_PATH に元 checkpoint (約 181GiB)
 #   ./scripts/fetch-model.sh <path>   # 保存先を上書き
 #
 # DeepSeek-V4.1 と違い **追加テーブルは無い**。MTP の draft head
@@ -27,8 +27,12 @@ NEED_GIB=195
 
 env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -1 || true; }
 
-MODEL_PATH_DEST="${1:-$(env_get MODEL_PATH)}"
+MODEL_PATH_DEST="${1:-$(env_get SOURCE_MODEL_PATH)}"
 MODEL_PATH_DEST="${MODEL_PATH_DEST:-./models/GLM-5.3-Flash-UNCENSORED-NVFP4}"
+if [ -f "${MODEL_PATH_DEST}/tp3-preparation.json" ]; then
+    echo "TP=3 の serving ディレクトリには download できません。SOURCE_MODEL_PATH を使ってください。" >&2
+    exit 1
+fi
 
 if ! command -v hf >/dev/null 2>&1; then
     echo "huggingface_hub CLI (hf) が見つかりません。以下でインストールしてください:" >&2

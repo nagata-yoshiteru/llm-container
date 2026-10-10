@@ -1,4 +1,5 @@
 .env
+.env.kindling-tp3
 .env.*.bak
 models
 venv

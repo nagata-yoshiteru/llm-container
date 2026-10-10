@@ -1,206 +1,192 @@
-# =============================================================================
-# dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 on 3x NVIDIA DGX Spark (GB10 / SM121)
-#   光スイッチ経由 (フルメッシュ / 同一 L2)。RING ではない。
-#
-#   並列化 = TP=1 + DP=3 + EP=3 (--enable-expert-parallel)
-#     vllm 公式の multi-node internal DP。各ノードが自分の vllm serve を持ち、
-#     head の --data-parallel-rpc-port (= DP coordinator) にぶら下がる。
-#     HTTP (OpenAI 互換) は head の ${HOST_PORT} 1 本だけ。
-#
-#   なぜ TP=3 / PP=3 ではないか → scripts/entrypoint.sh の冒頭コメント参照。
-#   要点: glm5_next は num_heads=64 / vocab=154880 が 3 で割れず TP=3 は assert、
-#   PP は make_empty_intermediate_tensors 未実装で vllm 側がゲートしている。
-#
-#   重みは EP=3 で ~71.4GiB/rank。GPU_MEMORY_UTILIZATION は起動時の空きを
-#   超えると即落ちるので、起動前に ./scripts/preflight.sh を 3 台とも実行。
-#
-# rootful Docker が必須 (--device /dev/infiniband, memlock unlimited,
-# host network + RDMA)。必ず `sudo docker compose ...` で起動すること。
-#
-#   worker2 側 (先):  sudo docker compose --profile worker2 up -d
-#   worker1 側 (次):  sudo docker compose --profile worker1 up -d
-#   head 側   (最後): sudo docker compose --profile head    up -d
-#
-#   ★ DP coordinator は head。worker を先に上げても coordinator が居ないので
-#     worker はリトライしつつ待つ。head を最後に上げるのが素直。
-# =============================================================================
+# GLM-5.3-Flash UNCENSORED / kindling TP=3 on three DGX Spark hosts.
+# Same shared .env and profiles as before. Each profile starts one local mentatd.
+# First prepare sources/weights: python3 scripts/prepare-glm53-tp3.py
+# Then: sudo docker compose --profile head|worker1|worker2 up -d
+# Stop ALL three old model containers before starting this new TP cluster.
 
-x-vllm-env: &vllm-env
-  # ---- モデル / サービング ----
-  MODEL_CONTAINER_PATH: ${MODEL_CONTAINER_PATH}
-  SERVED_MODEL_NAME: ${SERVED_MODEL_NAME}
-  HOST_PORT: ${HOST_PORT:-8910}
-  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
-  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-6}
-  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-}
-  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.88}
-  VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
-  VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
-  VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
-  # MTP と decode graph を entrypoint で組み立てる。空なら旧 EXTRA_ARGS を使う。
-  MTP_NUM_SPECULATIVE_TOKENS: ${MTP_NUM_SPECULATIVE_TOKENS:-}
-  # BF16 dense をロード後に FP8 化する実験。0 なら元の重み精度。
-  GLM53_DENSE_FP8: ${GLM53_DENSE_FP8:-0}
+x-image: &image
+  image: ${VLLM_IMAGE:-llm-glm53-kindling:tp3-v2}
+  # Build on up, with Docker's layer cache; no separate image-build wrapper.
+  pull_policy: build
+  build:
+    context: ./.cache/kindling-tp3/upstream
+    dockerfile: ../../../Dockerfile.kindling
+    additional_contexts:
+      local_patches: ./patches/kindling
 
-  # ---- entrypoint がフラグに変換するスイッチ ----
-  LANGUAGE_MODEL_ONLY: ${LANGUAGE_MODEL_ONLY:-1}
-  ENFORCE_EAGER: ${ENFORCE_EAGER:-1}
-  SKIP_MM_PROFILING: ${SKIP_MM_PROFILING:-}
-  LIMIT_MM: ${LIMIT_MM:-}
-
-  # ---- トポロジ (TP=1 / DP=3 / EP=3) ----
-  TP_SIZE: ${TP_SIZE:-1}
-  DP_SIZE: ${DP_SIZE:-3}
-  NNODES: ${NNODES:-3}
-  DP_RPC_PORT: ${DP_RPC_PORT:-13345}
-  HEAD_ROCE_IP: ${HEAD_ROCE_IP}
-  WORKER1_ROCE_IP: ${WORKER1_ROCE_IP}
-  WORKER2_ROCE_IP: ${WORKER2_ROCE_IP}
-  ROCE_IF_NAME: ${ROCE_IF_NAME}
-  IB_HCA_NAME: ${IB_HCA_NAME}
-
-  # ---- NCCL / RoCE ----
-  # 光スイッチはジャンボを通さない (MTU 1500 / RoCE active_mtu 1024)。
-  # また 4 ポートとも同じ L2 に見えるので、GID index は固定しない
-  # (固定するとリンクイベントでずれて片側だけ無言ハングする)。
-  NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
-  NCCL_IB_HCA: ${IB_HCA_NAME}
-  NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX-}
-  NCCL_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  GLOO_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  TP_SOCKET_IFNAME: ${ROCE_IF_NAME}
-  UCX_NET_DEVICES: ${ROCE_IF_NAME}
-  NCCL_IGNORE_CPU_AFFINITY: ${NCCL_IGNORE_CPU_AFFINITY:-1}
-  NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
-  NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
-  # UMA 向け NCCL バッファ調整 (空なら unset)。
-  NCCL_BUFFSIZE: ${NCCL_BUFFSIZE:-}
-  NCCL_LL128_BUFFSIZE: ${NCCL_LL128_BUFFSIZE:-}
-  NCCL_PROTO: ${NCCL_PROTO:-}
-  NCCL_MAX_NCHANNELS: ${NCCL_MAX_NCHANNELS:-}
-  # `:-` ではなく `-` なのは、「空にして無効化する」ためにわざと。
-  VLLM_NCCL_SO_PATH: ${VLLM_NCCL_SO_PATH-}
-  NCCL_NET: ${NCCL_NET:-}
-  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-}
-  NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-}
-  # RoCE を使うレールを IPv4 で固定する (office LAN に流れるのを防ぐ)。
-  # 光スイッチの flat L2 では特に効く。空にすれば unset。
-  NCCL_IB_ADDR_FAMILY: ${NCCL_IB_ADDR_FAMILY:-}
-  NCCL_IB_ROCE_VERSION_NUM: ${NCCL_IB_ROCE_VERSION_NUM:-}
-  NCCL_IB_ADDR_RANGE: ${NCCL_IB_ADDR_RANGE:-}
-  # dual-HCA (QSFP は 2 枚の NIC に見える) で 2 本を 1 本に束ねる。
-  NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS-}
-  # 重み 181GiB のロード + JIT に時間がかかる。エンジン ready の既定を持ち上げる。
-  VLLM_ENGINE_READY_TIMEOUT_S: ${VLLM_ENGINE_READY_TIMEOUT_S:-3600}
-  # 初回の Triton / DeepGEMM JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
-  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
-  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: ${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
-  # イメージ側の LD_LIBRARY_PATH を潰さないよう、entrypoint が「前に足す」。
-  VLLM_LD_LIBRARY_PATH_EXTRA: ${VLLM_LD_LIBRARY_PATH_EXTRA:-/usr/local/cuda/lib64:/usr/local/nvidia/lib64}
-
-  # ---- GLM-5.3 overlay ノブ (イメージ側が読む) ----
-  GLM53_SUPPRESS_STOPS_IN_REASONING: ${GLM53_SUPPRESS_STOPS_IN_REASONING:-}
-  GLM53_MIXED_PREFILL_CHUNK: ${GLM53_MIXED_PREFILL_CHUNK:-}
-  GLM53_SPINWAIT_MS: ${GLM53_SPINWAIT_MS:-}
-
-  # ---- 数値 / アーキ ----
-  # 12.1a は sm_121a 限定指令を有効にする上流レシピの値。
-  FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST:-12.1a}
-  TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-12.1a}
-  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: ${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-256}
-  # Triton / TileLang / DeepGEMM の JIT キャッシュ。コンテナ再作成で消えないよう逃がす。
-  TILELANG_CACHE_DIR: ${TILELANG_CACHE_DIR:-/root/.cache/vllm/tilelang}
-  TRITON_CACHE_DIR: ${TRITON_CACHE_DIR:-/root/.triton/cache}
-  DG_JIT_CACHE_DIR: ${DG_JIT_CACHE_DIR:-/root/.cache/vllm/deepgemm}
-
-  # ---- ランタイム ----
-  NVIDIA_VISIBLE_DEVICES: all
-  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-  VLLM_CACHE_ROOT: /root/.cache/vllm
-  HF_HOME: /cache/huggingface
-  HF_HUB_OFFLINE: "1"
-  TRANSFORMERS_OFFLINE: "1"
-  # ランタイム JIT が nproc 分の nvcc を撒いて UMA を食い潰すのを防ぐ
-  MAX_JOBS: ${MAX_JOBS:-4}
-
-x-vllm-service: &vllm-service
-  image: ${VLLM_IMAGE}
+x-runtime: &runtime
+  <<: *image
   network_mode: host
   ipc: host
-  shm_size: "64gb"
-  entrypoint: ["bash", "/entrypoint.sh"]
-  volumes:
-    - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
-    - ./scripts/entrypoint.sh:/entrypoint.sh:ro
-    - ./patches/install-glm53-dense-fp8.py:/opt/glm53/install-dense-fp8.py:ro
-    - ./patches/glm53_dense_fp8.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/glm53_dense_fp8.py:ro
-    # SM121 (GB10) の top-k 修正 (必須)。素のままだと ~24K トークンを超える decode でエンジンが落ちる
-    # 出典: tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark。
-    - ./patches/sparse_attn_indexer_kpool_sm121.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
-    - ./vllm-cache/vllm:/root/.cache/vllm
-    - ./vllm-cache/triton:/root/.triton
-    - ./vllm-cache/torchinductor:/var/cache/torchinductor
-    - ./vllm-cache/huggingface:/cache/huggingface
-    - /sys/class/infiniband:/sys/class/infiniband:ro
+  init: true
+  gpus: all
   devices:
     - /dev/infiniband:/dev/infiniband
-    # /etc/nvidia-container-runtime/config.toml が no-cgroups=true (rootless docker で
-    # GPU を使うのに必須の設定) だと、nvidia-container-cli が device cgroup の許可
-    # リストを更新しない。コンテナ内にノードは現れるがアクセスが弾かれ、vLLM が
-    # "Failed to infer device type" で死ぬ。ここで明示的に渡して cgroup を通す。
-    # これでもダメなら privileged: true を足す (device cgroup ごとバイパスされる)。
+    # Explicit device rules also work with NVIDIA no-cgroups=true on these hosts.
     - /dev/nvidia0:/dev/nvidia0
     - /dev/nvidiactl:/dev/nvidiactl
     - /dev/nvidia-uvm:/dev/nvidia-uvm
     - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
   ulimits:
-    memlock:
-      soft: -1
-      hard: -1
-    stack:
-      soft: 67108864
-      hard: 67108864
-  # rootful docker 側に nvidia ランタイムが登録されている必要がある。
-  # 未登録だとコンテナ内で NVML が初期化できず、vLLM が
-  # "Failed to infer device type" で即死する。
-  #   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
-  gpus: all
-  # kernel OOM のとき、デスクトップや関連デーモンではなく vLLM を選んで殺させる。
-  oom_score_adj: 1000
-  # 意図的に restart させない。EngineCore の初期化失敗で無限再起動すると
-  # GB10 の unified memory を食い潰してホストごと巻き込む。
+    memlock: -1
+    stack: 67108864
+    core: 0
   restart: "no"
 
+x-env: &env
+  MODEL_DIR: ${MODEL_CONTAINER_PATH}
+  SERVED_NAME: ${SERVED_MODEL_NAME}
+  API_PORT: ${HOST_PORT:-8910}
+  STATUS_PORT: ${STATUS_PORT:-8082}
+  TP: ${TP_SIZE:-3}
+  HEAD_HOST: ${HEAD_ROCE_IP}
+  CLUSTER_SUBNET: ${CLUSTER_SUBNET:-192.168.0.}
+  FABRIC_SUBNETS: ${FABRIC_SUBNETS:-192.168.0. 192.168.1.}
+  RAY_ADDRESS: 127.0.0.1:6379
+  MENTAT_GROUP: glm53-uncensored-tp3
+  MENTAT_UNIVERSE: llm-uncensored-tp3
+  SERVICE_NAME: glm53-uncensored-tp3
+  # Keep the checkpoint's own MTP draft; adaptive-k and DFlash are not enabled.
+  SPEC_METHOD: mtp
+  SPEC_TOKENS: ${MTP_NUM_SPECULATIVE_TOKENS:-3}
+  SPEC_EXTRA: ""
+  MOE_BACKEND: marlin
+  MAX_MODEL_LEN: ${MAX_MODEL_LEN:-524288}
+  MAX_NUM_SEQS: ${MAX_NUM_SEQS:-8}
+  MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
+  LONG_PREFILL_TOKEN_THRESHOLD: ${LONG_PREFILL_TOKEN_THRESHOLD:-7168}
+  GPU_MEM_UTIL: ${GPU_MEMORY_UTILIZATION:-0.85}
+  KV_CACHE_MEMORY: ${KV_CACHE_MEMORY:-12884901888}
+  KV_CACHE_DTYPE: fp8_e4m3
+  BLOCK_SIZE: ${BLOCK_SIZE:-3456}
+  CUDAGRAPH_CAPTURE_SIZES: ${CUDAGRAPH_CAPTURE_SIZES:-4 8 16 32}
+  CUDAGRAPH_MODE: FULL_DECODE_ONLY
+  CUDA_GRAPHS: "1"
+  LIMIT_MM: '{"image":0,"video":0}'
+  SKIP_MM_PROFILING: "1"
+  EXTRA_ARGS: --language-model-only --mm-encoder-tp-mode data
+  TOOL_PARSER: glm47
+  # These W4A16 weights have no activation scales: do not enable W4A4 megamoe.
+  VLLM_DENSE_FP8: ${GLM53_DENSE_FP8:-1}
+  VLLM_DENSE_W4: ""
+  VLLM_DENSE_FP8_LM_HEAD: "0"
+  VLLM_WEIGHT_SNAPSHOT_DIR: /root/.cache/weight-snapshots
+  VLLM_WEIGHT_SNAPSHOT_TAG: uncensored-tp3-mtp${MTP_NUM_SPECULATIVE_TOKENS:-3}-fp8${GLM53_DENSE_FP8:-1}-main-v2-c748079
+  VLLM_ARX_ALLREDUCE: "1"
+  VLLM_ARXBIG: "1"
+  VLLM_ARXBIG_RS: "1"
+  VLLM_ARXBIG_AG: "0"
+  VLLM_ARX_TWO_SHOT_MAX_KB: "2048"
+  VLLM_MHC_FUSED_MAX_TOKENS: "32"
+  VLLM_TRITON_SPARSE_MLA: "1"
+  VLLM_GLM5NEXT_DRAFT_POOL: "1"
+  VLLM_GLM5NEXT_RECOVERSSM: "1"
+  VLLM_GLM_SP_TP: "1"
+  VLLM_GLM_SP_MIN_TOKENS: "1024"
+  VLLM_GLM_SP_FP8_GATHER: ${GLM53_DENSE_FP8:-1}
+  VLLM_GLM_ARX_PREFETCH: "1"
+  VLLM_GLM_SP_MOE_FUSED: "0"
+  VLLM_GLM_SP_MOE_QUANT_GATHER: "0"
+  # kindling derives exact NIC/HCA/GID from FABRIC_SUBNETS on each host.
+  NCCL_IB_DISABLE: "0"
+  NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-}
+  NCCL_IB_ADDR_FAMILY: AF_INET
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_IB_ADDR_RANGE: ${NCCL_IB_ADDR_RANGE:-192.168.0.0/24,192.168.1.0/24}
+  NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS:-1}
+  NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-1}
+  NCCL_NET: IB
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_BUFFSIZE: ${NCCL_BUFFSIZE:-1048576}
+  NCCL_LL128_BUFFSIZE: ${NCCL_LL128_BUFFSIZE:-262144}
+  NCCL_PROTO: ${NCCL_PROTO:-^LL128}
+  NCCL_MAX_NCHANNELS: ${NCCL_MAX_NCHANNELS:-8}
+  NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
+  MAX_JOBS: ${MAX_JOBS:-4}
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+x-model: &model
+  <<: *runtime
+  shm_size: 64gb
+  oom_score_adj: 1000
+  entrypoint: ["bash", "/usr/local/bin/llm-entrypoint.sh"]
+  volumes:
+    - type: bind
+      source: ${MODEL_PATH}
+      target: ${MODEL_CONTAINER_PATH}
+      read_only: true
+      bind:
+        create_host_path: false
+    - ./scripts/entrypoint.sh:/usr/local/bin/llm-entrypoint.sh:ro
+    - ./.cache/kindling-tp3/runtime/cache:/root/.cache
+    - ./.cache/kindling-tp3/runtime/logs:/logs
+    - /run/systemd/units:/host/systemd-units:ro
+    - /sys/class/infiniband:/sys/class/infiniband:ro
+
+x-mentat: &mentat
+  <<: *runtime
+  entrypoint: ["/usr/local/bin/mentatd"]
+  command: ["daemon"]
+
+x-mentat-env: &mentat-env
+  MENTAT_PEERS: ${HEAD_ROCE_IP}:6379,${WORKER1_ROCE_IP}:6379,${WORKER2_ROCE_IP}:6379
+  MENTAT_UNIVERSE: llm-uncensored-tp3
+  MENTAT_ANNOUNCE_PORT: "0"
+
 services:
-  # DP rank 0 / API サーバ / DP coordinator。最後に上げる。
   head:
-    <<: *vllm-service
+    <<: *model
     container_name: glm53-fp8-head
-    profiles: ["head"]
+    profiles: [head]
+    depends_on: [mentat-head]
     environment:
-      <<: *vllm-env
+      <<: *env
       ROLE: head
-      DP_START_RANK: "0"
       VLLM_HOST_IP: ${HEAD_ROCE_IP}
-
-  # DP rank 1
   worker1:
-    <<: *vllm-service
+    <<: *model
     container_name: glm53-fp8-worker1
-    profiles: ["worker1"]
+    profiles: [worker1]
+    depends_on: [mentat-worker1]
     environment:
-      <<: *vllm-env
+      <<: *env
       ROLE: worker
-      DP_START_RANK: "1"
       VLLM_HOST_IP: ${WORKER1_ROCE_IP}
-
-  # DP rank 2
   worker2:
-    <<: *vllm-service
+    <<: *model
     container_name: glm53-fp8-worker2
-    profiles: ["worker2"]
+    profiles: [worker2]
+    depends_on: [mentat-worker2]
     environment:
-      <<: *vllm-env
+      <<: *env
       ROLE: worker
-      DP_START_RANK: "2"
       VLLM_HOST_IP: ${WORKER2_ROCE_IP}
+  mentat-head:
+    <<: *mentat
+    container_name: glm53-mentat-head
+    profiles: [head]
+    environment:
+      <<: *mentat-env
+      MENTAT_NODE_IP: ${HEAD_ROCE_IP}
+      MENTAT_ANNOUNCE_ADDRS: ${HEAD_ROCE_IP}=lan+connectx+rdma,${HEAD_ROCE_IP_2}=connectx+rdma
+  mentat-worker1:
+    <<: *mentat
+    container_name: glm53-mentat-worker1
+    profiles: [worker1]
+    environment:
+      <<: *mentat-env
+      MENTAT_NODE_IP: ${WORKER1_ROCE_IP}
+      MENTAT_ANNOUNCE_ADDRS: ${WORKER1_ROCE_IP}=lan+connectx+rdma,${WORKER1_ROCE_IP_2}=connectx+rdma
+  mentat-worker2:
+    <<: *mentat
+    container_name: glm53-mentat-worker2
+    profiles: [worker2]
+    environment:
+      <<: *mentat-env
+      MENTAT_NODE_IP: ${WORKER2_ROCE_IP}
+      MENTAT_ANNOUNCE_ADDRS: ${WORKER2_ROCE_IP}=lan+connectx+rdma,${WORKER2_ROCE_IP_2}=connectx+rdma
