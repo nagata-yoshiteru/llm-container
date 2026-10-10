@@ -128,6 +128,9 @@ x-vllm-service: &vllm-service
   volumes:
     - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
     - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+    # SM121 (GB10) の top-k 修正 (必須)。素のままだと ~24K トークンを超える decode でエンジンが落ちる
+    # 出典: tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark。
+    - ./patches/sparse_attn_indexer_kpool_sm121.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
     - ./vllm-cache/vllm:/root/.cache/vllm
     - ./vllm-cache/triton:/root/.triton
     - ./vllm-cache/torchinductor:/var/cache/torchinductor
