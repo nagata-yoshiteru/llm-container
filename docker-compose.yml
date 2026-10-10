@@ -1,5 +1,5 @@
 # =============================================================================
-# dealignai/GLM-5.3-Flash-UNCENSORED-FP8 on 3x NVIDIA DGX Spark (GB10 / SM121)
+# dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 on 3x NVIDIA DGX Spark (GB10 / SM121)
 #   光スイッチ経由 (フルメッシュ / 同一 L2)。RING ではない。
 #
 #   並列化 = TP=1 + DP=3 + EP=3 (--enable-expert-parallel)
@@ -11,8 +11,8 @@
 #   要点: glm5_next は num_heads=64 / vocab=154880 が 3 で割れず TP=3 は assert、
 #   PP は make_empty_intermediate_tensors 未実装で vllm 側がゲートしている。
 #
-#   ★ メモリは極端に厳しい。重み ~107GiB/rank なので GPU_MEMORY_UTILIZATION は
-#     0.92〜0.95 で調整。起動前に ./scripts/preflight.sh を 3 台とも実行。
+#   重みは EP=3 で ~71.4GiB/rank。GPU_MEMORY_UTILIZATION は起動時の空きを
+#   超えると即落ちるので、起動前に ./scripts/preflight.sh を 3 台とも実行。
 #
 # rootful Docker が必須 (--device /dev/infiniband, memlock unlimited,
 # host network + RDMA)。必ず `sudo docker compose ...` で起動すること。
@@ -33,7 +33,7 @@ x-vllm-env: &vllm-env
   MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
   MAX_NUM_SEQS: ${MAX_NUM_SEQS:-6}
   MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-}
-  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.92}
+  GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.88}
   VLLM_PARSER_ARGS: ${VLLM_PARSER_ARGS:-}
   VLLM_KV_ARGS: ${VLLM_KV_ARGS:-}
   VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
@@ -86,7 +86,7 @@ x-vllm-env: &vllm-env
   NCCL_IB_ADDR_RANGE: ${NCCL_IB_ADDR_RANGE:-}
   # dual-HCA (QSFP は 2 枚の NIC に見える) で 2 本を 1 本に束ねる。
   NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS-}
-  # 重み 328GB のロード + JIT に時間がかかる。エンジン ready の既定を持ち上げる。
+  # 重み 181GiB のロード + JIT に時間がかかる。エンジン ready の既定を持ち上げる。
   VLLM_ENGINE_READY_TIMEOUT_S: ${VLLM_ENGINE_READY_TIMEOUT_S:-3600}
   # 初回の Triton / DeepGEMM JIT は数分 CPU を占有する。NCCL watchdog に殺されないよう延長。
   TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "7200"

@@ -6,7 +6,7 @@
 #
 # ここで赤が出た状態で起動すると、だいたい 5〜10 分待たされた挙句
 # NCCL の "unhandled system error" か OOM-kill で死ぬ。
-# 特にこの構成 (FP8 328GB / 3 台) はメモリが限界なので、== メモリ == は必ず見ること。
+# GPU_MEMORY_UTILIZATION は起動時の空きを超えると即落ちるので、== メモリ == は必ず見ること。
 # =============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -149,10 +149,10 @@ echo
 echo "== モデル =="
 if [ -d "${MODEL_PATH}" ]; then
     N=$(ls "${MODEL_PATH}"/model-*.safetensors 2>/dev/null | wc -l)
-    if [ "${N}" -eq 62 ]; then
+    if [ "${N}" -eq 121 ]; then
         ok "${MODEL_PATH} (${N} shard, $(du -sh "${MODEL_PATH}" 2>/dev/null | cut -f1))"
     else
-        ng "${MODEL_PATH} の shard 数が ${N} です (GLM-5.3-Flash-UNCENSORED-FP8 は 62) — ./scripts/fetch-model.sh を再実行"
+        ng "${MODEL_PATH} の shard 数が ${N} です (GLM-5.3-Flash-UNCENSORED-NVFP4 は 121) — ./scripts/fetch-model.sh を再実行"
     fi
     if [ -f "${MODEL_PATH}/model.safetensors.index.json" ]; then
         ok "${MODEL_PATH}/model.safetensors.index.json あり (MTP head はこの中)"
@@ -164,24 +164,25 @@ else
 fi
 
 echo
-echo "== メモリ (★ この構成の最大リスク) =="
-AVAIL_GB=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-# FP8 328GB を 3 台で割ると素の下限が ~102GiB/rank。DP の複製 (~9GiB) が乗って
-# 重み ~107GiB/rank、CUDA ctx/NCCL/プロセスで +7GiB 前後。
-# 121.7GiB の unified memory に対して残りは数 GiB しかない。
-# 起動前は MemAvailable 113GiB 以上が理想。105GiB を切ると GB10 では
-# NVRM OOM (ドライバが MemFree を見る) で warmup 中に落ちる可能性が高い。
-if [ "${AVAIL_GB}" -ge 113 ]; then
-    ok "MemAvailable ${AVAIL_GB} GB"
-elif [ "${AVAIL_GB}" -ge 105 ]; then
-    warn "MemAvailable ${AVAIL_GB} GB — 重み予算 ~115GiB に対して厳しい。"
-    warn "  他コンテナを止めて sync && echo 3 > /proc/sys/vm/drop_caches を推奨"
+echo "== メモリ =="
+AVAIL_GIB=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
+# vLLM は起動時に「空き >= GPU_MEMORY_UTILIZATION x 119.63GiB」を要求し、満たさないと
+#   ValueError: Free memory on device cuda:0 (109.32/119.63 GiB) on startup is less
+#   than desired GPU memory utilization (0.92, 110.06 GiB)
+# で即落ちる (2026-10-06 head 実測)。GB10 の cuda 空き ~= MemAvailable なので、ここで先に見る。
+# 重みは NVFP4 / EP=3 で ~71.4GiB/rank なので、要求量を満たせば残りは KV に回る。
+NEED_GIB=$(awk -v g="${GPU_MEMORY_UTILIZATION:-0.88}" 'BEGIN {printf "%.1f", g*119.63}')
+if awk -v a="${AVAIL_GIB}" -v n="${NEED_GIB}" 'BEGIN {exit !(a >= n + 1.0)}'; then
+    ok "MemAvailable ${AVAIL_GIB} GiB >= GMU ${GPU_MEMORY_UTILIZATION} x 119.63 = ${NEED_GIB} GiB"
+elif awk -v a="${AVAIL_GIB}" -v n="${NEED_GIB}" 'BEGIN {exit !(a >= n)}'; then
+    warn "MemAvailable ${AVAIL_GIB} GiB は要求 ${NEED_GIB} GiB をかろうじて超える程度。"
+    warn "  他コンテナを止めて sync && echo 3 | sudo tee /proc/sys/vm/drop_caches を推奨"
 else
-    ng "MemAvailable ${AVAIL_GB} GB — 足りません。他コンテナを止めるか再起動してください"
+    ng "MemAvailable ${AVAIL_GIB} GiB < 要求 ${NEED_GIB} GiB (GMU ${GPU_MEMORY_UTILIZATION})。"
+    ng "  vLLM が起動直後に落ちる。GPU_MEMORY_UTILIZATION を下げるか、他プロセスを止める"
 fi
 RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
 [ -n "${RUNNING}" ] && warn "起動中のコンテナ: ${RUNNING}"
-warn "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION} (0.90〜0.95 で調整。低いと KV 不足で起動不可)"
 
 echo
 echo "== rootful docker =="

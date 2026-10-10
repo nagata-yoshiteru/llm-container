@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dealignai/GLM-5.3-Flash-UNCENSORED-FP8 (native block-FP8 128x128) /
+# dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 (modelopt NVFP4) /
 # 3x NVIDIA DGX Spark (GB10 / SM121) / 光スイッチ (フルメッシュ・同一 L2)
 #
 # -----------------------------------------------------------------------------
@@ -37,8 +37,8 @@
 #   ROLE=worker -> DP rank 1 / 2。--headless
 #
 #   ★ EP の all-to-all は 3 ノードをまたぐので NCCL (RoCEv2) が効いている前提。
-#   ★ メモリは極端に厳しい。重み ~107GiB/rank + CUDA ctx/NCCL ~5GiB で
-#     121GiB の unified memory をほぼ食い切る。GMU は 0.92〜0.95 で調整し、
+#   ★ 重みは EP=3 で ~71.4GiB/rank (FP8 版は ~111GiB/rank で載らなかった)。
+#     GMU は「起動時の空き / 119.63GiB」を超えると即落ちるので 0.88 を既定にし、
 #     起動前に preflight.sh で MemAvailable を確認すること。
 # =============================================================================
 set -euo pipefail
@@ -171,7 +171,7 @@ VLLM_CMD=(
     --port "${HOST_PORT:-8910}"
     --max-model-len "${MAX_MODEL_LEN:-262144}"
     --max-num-seqs "${MAX_NUM_SEQS:-6}"
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.92}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.88}"
     # --- attention: TP=1 (どのランクも attention を丸ごと持つ) ---
     --tensor-parallel-size "${TP_SIZE}"
     # --- MoE: DP=3 + EP=3 (expert 96 ずつ、中間次元は分割されない) ---
@@ -195,8 +195,8 @@ VLLM_CMD=(
 #   LANGUAGE_MODEL_ONLY=1 : text-only サーバ (vision tower を積まない)。
 #                           SM12x の sparse-MLA prefill には画像幅のカーネルが
 #                           無く、メモリも ~1.2GiB/rank 余分に食うので既定 1。
-#   ENFORCE_EAGER=1       : CUDA graph capture を止める。GLM-5.3 のこのパスは
-#                           graph capture 不可 (上流実測)。VRAM 節約にもなる。
+#   ENFORCE_EAGER=1       : CUDA graph capture を止める (切り分け用)。既定の .env は
+#                           0 で、--compilation-config で decode だけ graph にしている。
 #   SKIP_MM_PROFILING     : vision ON のとき mm profiling を走らせない。
 #   LIMIT_MM              : {"image":2,"video":1} 等。空白を入れないこと。
 [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]  && VLLM_CMD+=(--language-model-only)

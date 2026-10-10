@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dealignai/GLM-5.3-Flash-UNCENSORED-FP8 (native block-FP8 128x128) の重みを取得する。
+# dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 (modelopt NVFP4) の重みを取得する。
 #
-#   ./scripts/fetch-model.sh          # MODEL_PATH に 62 shard (約 328GB / 306GiB)
+#   ./scripts/fetch-model.sh          # MODEL_PATH に 121 shard (約 181GiB)
 #   ./scripts/fetch-model.sh <path>   # 保存先を上書き
 #
 # DeepSeek-V4.1 と違い **追加テーブルは無い**。MTP の draft head
@@ -13,7 +13,7 @@
 # worker1 / worker2 でも同じコマンドを実行すること (rsync でコピーしてもよい)。
 # resumable: 失敗したら同じコマンドを再実行すれば続きから。
 #
-# 328GB は 1 台のディスクに置くので、事前に空きを確認すること
+# 181GiB は 1 台のディスクに置くので、事前に空きを確認すること
 # (この repo の生成物は置き場を問わないが、3 台すべてで同じパスにする)。
 #
 # rootless / rootful どちらの docker とも無関係。sudo は不要。
@@ -21,14 +21,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL_REPO="${MODEL_REPO:-dealignai/GLM-5.3-Flash-UNCENSORED-FP8}"
-EXPECTED_SHARDS=62
-NEED_GIB=340
+MODEL_REPO="${MODEL_REPO:-dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4}"
+EXPECTED_SHARDS=121
+NEED_GIB=195
 
 env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -1 || true; }
 
 MODEL_PATH_DEST="${1:-$(env_get MODEL_PATH)}"
-MODEL_PATH_DEST="${MODEL_PATH_DEST:-./models/GLM-5.3-Flash-UNCENSORED-FP8}"
+MODEL_PATH_DEST="${MODEL_PATH_DEST:-./models/GLM-5.3-Flash-UNCENSORED-NVFP4}"
 
 if ! command -v hf >/dev/null 2>&1; then
     echo "huggingface_hub CLI (hf) が見つかりません。以下でインストールしてください:" >&2
@@ -47,7 +47,7 @@ check_disk() {  # $1=宛先dir $2=必要GiB
     fi
 }
 
-echo "==> GLM-5.3-Flash-UNCENSORED-FP8: ${MODEL_REPO} -> ${MODEL_PATH_DEST} (約 328GB)"
+echo "==> GLM-5.3-Flash-UNCENSORED-NVFP4: ${MODEL_REPO} -> ${MODEL_PATH_DEST} (約 181GiB)"
 check_disk "${MODEL_PATH_DEST}" "${NEED_GIB}"
 
 # ★ shard を positional で並べない。素の引数なしでリポジトリ全体を落とす
