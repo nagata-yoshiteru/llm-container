@@ -39,6 +39,8 @@ x-vllm-env: &vllm-env
   VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
   # MTP と decode graph を entrypoint で組み立てる。空なら旧 EXTRA_ARGS を使う。
   MTP_NUM_SPECULATIVE_TOKENS: ${MTP_NUM_SPECULATIVE_TOKENS:-}
+  # BF16 dense をロード後に FP8 化する実験。0 なら元の重み精度。
+  GLM53_DENSE_FP8: ${GLM53_DENSE_FP8:-0}
 
   # ---- entrypoint がフラグに変換するスイッチ ----
   LANGUAGE_MODEL_ONLY: ${LANGUAGE_MODEL_ONLY:-1}
@@ -130,6 +132,8 @@ x-vllm-service: &vllm-service
   volumes:
     - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
     - ./scripts/entrypoint.sh:/entrypoint.sh:ro
+    - ./patches/install-glm53-dense-fp8.py:/opt/glm53/install-dense-fp8.py:ro
+    - ./patches/glm53_dense_fp8.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/glm53_dense_fp8.py:ro
     # SM121 (GB10) の top-k 修正 (必須)。素のままだと ~24K トークンを超える decode でエンジンが落ちる
     # 出典: tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark。
     - ./patches/sparse_attn_indexer_kpool_sm121.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro

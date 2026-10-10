@@ -131,6 +131,20 @@ echo "[entrypoint] role=${ROLE} dp_rank=${DP_START_RANK}/${DP_SIZE} tp=${TP_SIZE
 echo "[entrypoint] dp_coordinator=${HEAD_ROCE_IP}:${DP_RPC_PORT} iface=${ROCE_IF_NAME} hca=${IB_HCA_NAME} gid=${NCCL_IB_GID_INDEX:-<unset>}"
 echo "[entrypoint] model=${MODEL_CONTAINER_PATH}"
 
+# FP8 はモデルの通常ロード／後処理の後に適用する。再作成前のコンテナにも
+# hook が残りうるため、runtime 側でも GLM53_DENSE_FP8 を判定する。
+case "${GLM53_DENSE_FP8:-0}" in
+    0) ;;
+    1)
+        python3 /opt/glm53/install-dense-fp8.py
+        # BF16 の graph/cache と混ぜない。下の MTP 用 suffix と併用する。
+        export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/root/.cache/vllm}/glm53-dense-fp8-v1"
+        export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/var/cache/torchinductor}/glm53-dense-fp8-v1"
+        echo "[entrypoint] dense FP8 enabled (target linears only, MTP unchanged)"
+        ;;
+    *) echo "[entrypoint] ERROR: GLM53_DENSE_FP8 は 0 / 1 を指定してください。" >&2; exit 1 ;;
+esac
+
 # MTP k を変えたとき、decode graph とキャッシュも一緒に切り替える。
 # 未指定なら従来どおり VLLM_EXTRA_ARGS の手動設定をそのまま使用する。
 MTP_ARGS=()

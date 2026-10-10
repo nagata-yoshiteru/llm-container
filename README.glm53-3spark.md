@@ -163,14 +163,14 @@ sudo docker compose --profile head down       # 各ノードで自分の profile
 
 ---
 
-## 6. MTP k=2 の速度比較 (1〜2 リクエスト優先)
+## 6. MTP の速度比較 (1〜2 リクエスト優先)
 
 現在の uncensored NVFP4、TP=1 / DP=3 / EP=3、1M の上限はそのまま、
-MTP の深さだけを比較する。`.env` / `.env.example` の初期比較値は **k=2**。
-速度・精度・KV 容量は、この構成で再起動してから検証する。
+MTP の深さを比較できる。`.env` / `.env.example` は次の試験用に **k=3**。
+FP8 化の効果を切り分けるときは MTP の k を同じ値に固定する。
 
 ```dotenv
-MTP_NUM_SPECULATIVE_TOKENS=2
+MTP_NUM_SPECULATIVE_TOKENS=3
 MAX_NUM_SEQS=2
 ENFORCE_EAGER=0
 VLLM_EXTRA_ARGS=--moe-backend marlin
@@ -183,7 +183,7 @@ VLLM_EXTRA_ARGS=--moe-backend marlin
 | `MTP_NUM_SPECULATIVE_TOKENS` | `MAX_NUM_SEQS=2` の capture sizes | 用途 |
 | --- | --- | --- |
 | `1` | `[2,4]` | 従来の基準へ戻す |
-| `2` | `[3,6]` | 最初の比較 |
+| `2` | `[3,6]` | 比較用 |
 | `3` | `[4,8]` | k=2 の測定後に比較 |
 
 この変数を使う場合、`VLLM_*_ARGS` に `--speculative-config` や
@@ -203,7 +203,7 @@ vLLM / TorchInductor キャッシュは自動で `glm53-mtp-k1` / `k2` / `k3` �
 
 1. head → worker1 → worker2 の順で、それぞれ `sudo docker compose --profile <役割> down`。
 2. worker2 → worker1 → head の順で、それぞれ `sudo docker compose --profile <役割> up -d --force-recreate`。
-3. 起動ログの `MTP k=2 decode graph sizes=[3,6]` と `MTP cache=.../glm53-mtp-k2` を確認。
+3. 起動ログの `MTP k=3 decode graph sizes=[4,8]` とキャッシュの末尾 `glm53-mtp-k3` を確認。
 4. KV 容量を確認する。k を増やすと MTP 用の状態等も増えるので、k=1 時の
    「1M が rank ごとに2本載る」という結果をそのまま流用しない。
 5. ウォームアップ後、同じプロンプト・出力上限・sampling・reasoning effort で
@@ -214,3 +214,65 @@ vLLM / TorchInductor キャッシュは自動で `glm53-mtp-k1` / `k2` / `k3` �
 `enable_thinking=false` は反映されないので、thinking off の測定として記録しない。
 k=3 を試す／k=1 に戻す場合は **全3ノード**の `MTP_NUM_SPECULATIVE_TOKENS` を
 同じ値に変えて、上と同じ順で再作成する。
+
+## 7. BF16 dense のロード後 FP8 化
+
+次の試験設定は `MTP_NUM_SPECULATIVE_TOKENS=3`、`GLM53_DENSE_FP8=1`。
+元の `dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4` を通常どおりロードし、
+vLLM の weight 後処理が終わった時点で対象層だけを FP8 にする。
+モデルファイル、モデル名、イメージの変更や checkpoint の再配布は不要。
+
+| 対象 | ロード後の精度 |
+| --- | --- |
+| KDA の fused input / output projection | FP8 |
+| MLA の fused qkv-a / q-b / output projection | FP8 |
+| 最初の3層の dense MLP、shared experts の gate/up/down | FP8 |
+| routed experts | 元の NVFP4 |
+| router、indexer、MLA kv-b、KDA f-b/g-b、norm、embedding、LM head、MTP | 元の精度 |
+
+現在の checkpoint では対象は **191 Linear、BF16 13.458 GiB/rank**。
+FP8 化すると重みの保存量と対象 GEMM の重み読み出し量が約 **6.7 GiB/rank** 減る。
+これは重みのバイト数による見積もりで、推論速度が2倍になるという意味ではない。
+余ったメモリは起動時に KV へ再配分されうるため、KV 容量は再起動後に確認する。
+
+方式は **W8A8**: weight は出力チャネル単位、activation はトークン単位の
+動的 scale を持つ FP8 E4M3 で、CUTLASS scaled GEMM を使う。
+静的 activation scale の校正データは不要。
+[kindling の dense_fp8.py](https://github.com/kindlingai/glm-5.3-flash-gx10/blob/c748079d45e6e070b2acb108a91edfe52f4a7747/experimental/snapshot/dense_fp8.py)
+の FP8 経路を参考に、現在の TP=1 とモデルの対象層に限定した。
+量子化誤差があるので、これは `lossless8` checkpoint の移植ではなく、
+元の7問の正答率、長文の検索結果、ツール呼び出しを再確認する必要がある。
+
+起動時に loader の SHA256 を確認し、現在の pinned `sm121-v8` 以外には適用しない。
+小さな実 GPU テストで FP8 GEMM の数値誤差、ゼロ入力、prefill、CUDA Graph replay を
+確認してから変換する。対象層の不足や非対応の shape / dtype も起動エラーにする。
+これらはカーネルの動作確認であり、モデル全体の品質確認とは別。
+起動ログでは次を確認する:
+
+```text
+[dense-fp8] verified v8 post-load hook installed
+GLM53 dense FP8 kernel/graph check passed
+GLM53 dense FP8: converted 191 target linears, saved ... GiB/rank
+GLM53 dense FP8: preserving the MTP draft in its original precision
+```
+
+コンテナ内の loader に小さな hook を追加する。元 checkpoint は読み取り専用のまま。
+キャッシュは `glm53-dense-fp8-v1/glm53-mtp-k3` 以下へ分離する。
+BF16 に戻す場合は **全3ノード**の `GLM53_DENSE_FP8=0` にし、6節の順序で
+コンテナを再作成する。再ロードで元の BF16 重みへ戻る。
+
+### 比較ベンチ
+
+`scripts/bench-glm53.py` は、同じ2種類のプロンプトを 256 tokens 固定で生成し、
+1並列・2並列を各3回測る。ウォームアップは集計から除く。
+`temperature=0`、`seed=42`、`reasoning_effort=max` を固定し、思考を含む
+サーバの `completion_tokens` を使う。SSE イベント数を token 数として数えない。
+EOS を無視して指定 token 数まで出力するため、これは速度テストであり品質テストではない。
+他のリクエストがない状態で実行する。`--label` は手入力なので実際の起動設定と合わせる。
+
+```bash
+# BF16 / k=3 で起動した後
+python3 scripts/bench-glm53.py --label bf16-mtp-k3 --output results/glm53-bf16-mtp-k3.json
+# FP8 / k=3 で起動した後 (今回の .env)
+python3 scripts/bench-glm53.py --label dense-fp8-mtp-k3 --output results/glm53-dense-fp8-mtp-k3.json
+```
