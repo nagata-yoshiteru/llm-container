@@ -46,6 +46,7 @@ def stream(name, body, route="/v1/chat/completions"):
     body = {"model": MODEL, "stream": True, "stream_options": {"include_usage": True}, **body}
     req = Request(API + route, json.dumps(body).encode(), {"Content-Type": "application/json"})
     start = time.perf_counter()
+    started_at_unix = time.time()
     progress_at = start
     first = last = None
     reasoning, content = [], []
@@ -88,6 +89,9 @@ def stream(name, body, route="/v1/chat/completions"):
     elapsed = time.perf_counter() - start
     tokens = (usage or {}).get("completion_tokens", 0)
     row = {"name": name, "usage": usage, "elapsed_s": elapsed,
+           "started_at_unix": started_at_unix,
+           "first_token_at_unix": started_at_unix + first - start if first is not None else None,
+           "finished_at_unix": started_at_unix + elapsed,
            "ttft_s": first - start if first is not None else None,
            "output_tok_s_e2e": tokens / elapsed,
            "output_tok_s_approx_decode": (tokens - 1) / (last - first)

@@ -30,14 +30,14 @@ def main():
                        (s["concurrency"], s["kind"]) == (row["concurrency"], row["kind"]))
             row["baseline_tok_s"] = old["median_per_request_tok_s"]
             row["improvement_percent"] = (row["median_per_request_tok_s"] / row["baseline_tok_s"] - 1) * 100
-    for concurrency in (1, 2, 6):
+    for concurrency in (1, 2, 6, 8):
         if concurrency < 6:
             samples = [s for s in fixed["samples"] if s["concurrency"] == concurrency]
             groups = [s["rows"] for s in samples]
             walls = [s["wall_s"] for s in samples]
             rate_key = "e2e_tok_s"
         else:
-            samples = [s for s in waves if s["label"].startswith("decode-c6-")]
+            samples = [s for s in waves if s["label"].startswith(f"decode-c{concurrency}-")]
             groups = [s["requests"] for s in samples]
             walls = [s["wall_s"] for s in samples]
             rate_key = "output_tok_s_e2e"
@@ -83,6 +83,12 @@ def main():
     retrieval = root / "retrieval-grade.json"
     if retrieval.exists():
         summary["retrieval_128k"] = json.loads(retrieval.read_text())
+    long_context = root / "long-context" / "long-context-grades.json"
+    if long_context.exists():
+        summary["long_context"] = json.loads(long_context.read_text())
+    interruption = root / "long-context" / "interruption.json"
+    if interruption.exists():
+        summary["long_context_interruption"] = json.loads(interruption.read_text())
     summary["all_wave_metric_counts_match"] = all(s["metrics_request_count_matches"] for s in waves)
     (root / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
