@@ -10,6 +10,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--comparison-note", action="append", default=[],
+                        help="Describe configuration differences from the baseline (repeatable).")
     args = parser.parse_args()
     root = args.directory
     fixed = json.loads((root / "fixed-output-c1-c2.json").read_text())
@@ -19,8 +21,8 @@ def main():
                "notes": ["Output rates count reasoning and final output tokens.",
                          "E2E rates include queue and prefill; streaming decode rates are approximate.",
                          "Prefill phase includes scheduling stalls and first token, not pure GPU kernel time.",
-                         "128K prefill is a throughput/stability test, not a long-context retrieval-quality test.",
-                         "Both dense precision and MTP k changed from the baseline."]}
+                         "128K prefill is a throughput/stability test, not a long-context retrieval-quality test."]
+                         + args.comparison_note}
     if args.baseline:
         baseline = json.loads(args.baseline.read_text())
         for row in summary["fixed_output"]:

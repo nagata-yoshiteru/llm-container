@@ -148,6 +148,9 @@ services:
       <<: *env
       ROLE: head
       VLLM_HOST_IP: ${HEAD_ROCE_IP}
+      # mentat's Ray shim uses this for the driver's cross-node control queue.
+      # RAY_ADDRESS is loopback, so its route cannot identify this node to peers.
+      MENTAT_NODE_IP: ${HEAD_ROCE_IP}
   worker1:
     <<: *model
     container_name: glm53-fp8-worker1
@@ -157,6 +160,7 @@ services:
       <<: *env
       ROLE: worker
       VLLM_HOST_IP: ${WORKER1_ROCE_IP}
+      MENTAT_NODE_IP: ${WORKER1_ROCE_IP}
   worker2:
     <<: *model
     container_name: glm53-fp8-worker2
@@ -166,6 +170,7 @@ services:
       <<: *env
       ROLE: worker
       VLLM_HOST_IP: ${WORKER2_ROCE_IP}
+      MENTAT_NODE_IP: ${WORKER2_ROCE_IP}
   mentat-head:
     <<: *mentat
     container_name: glm53-mentat-head

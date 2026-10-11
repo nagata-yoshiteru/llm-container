@@ -5,3 +5,4 @@ models
 venv
 .cache/
 vllm-cache/
+results/
