@@ -27,7 +27,7 @@ for role in ("head", "worker1", "worker2"):
     assert set(services) == {role, "mentat-" + role}, set(services)
     model, daemon = services[role], services["mentat-" + role]
     env, denv = model["environment"], daemon["environment"]
-    assert env["VLLM_HOST_IP"] == denv["MENTAT_NODE_IP"]
+    assert env["MENTAT_NODE_IP"] == env["VLLM_HOST_IP"] == denv["MENTAT_NODE_IP"]
     assert env["ROLE"] == ("head" if role == "head" else "worker")
     assert env["MENTAT_UNIVERSE"] == denv["MENTAT_UNIVERSE"]
     assert set(model["depends_on"]) == {"mentat-" + role}
@@ -93,13 +93,22 @@ with tempfile.TemporaryDirectory() as tmp:
     argv = json.loads(subprocess.check_output(["bash", "-c", shell], env=env, text=True))
     start = argv.index("--served-model-name") + 1
     assert argv[start:start + 3] == ["glm-5.3-flash-uncensored", "glm-5.3-flash", "--tensor-parallel-size"]
+    # Run the patched self-test command with an argv recorder, without a server.
+    (tmp / "python3").write_bytes(recorder.read_bytes())
+    (tmp / "python3").chmod(0o755)
+    probe = entry.read_text().split('if python3 /usr/local/bin/self-test.py', 1)[1].split('; then', 1)[0]
+    for names in ("glm-5.3-flash-uncensored glm-5.3-flash", "glm53"):
+        probe_env = dict(env, SERVED=names)
+        argv = json.loads(subprocess.check_output(
+            ["bash", "-c", "python3 /usr/local/bin/self-test.py" + probe], env=probe_env, text=True))
+        assert argv[argv.index("--model") + 1] == names.split()[0]
     try:
         module.patch(entry)
     except SystemExit:
         pass
     else:
         raise AssertionError("Unexpected source must be rejected")
-print("PASS: both existing model aliases reach vLLM as separate arguments; source guard")
+print("PASS: vLLM gets both aliases; self-test selects the first; source guard")
 
 if "--check-images" in sys.argv:
     def image_config(ref):

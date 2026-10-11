@@ -12,8 +12,11 @@ def patch(path):
         raise SystemExit("Unexpected kindling entrypoint; refusing alias patch")
     anchor = 'exec vllm serve "$MODEL"'
     flag = '--served-model-name "$SERVED"'
-    if text.count(anchor) != 1 or text.count(flag) != 1:
+    probe_model = '--model "$SERVED"'
+    if any(text.count(part) != 1 for part in (anchor, flag, probe_model)):
         raise SystemExit("Served model alias anchors are not unique")
+    # An API request selects one model; it cannot use the whole alias list.
+    text = text.replace(probe_model, '--model "${SERVED%% *}"')
     text = text.replace(anchor, 'read -r -a _served_names <<< "$SERVED"\n' + anchor)
     path.write_text(text.replace(flag, '--served-model-name "${_served_names[@]}"'))
 
