@@ -36,8 +36,8 @@ sudo docker compose --profile head up -d
 ```bash
 # head のログ。worker では head を worker1 / worker2 に読み替える。
 sudo docker compose --profile head logs -f head
-curl -fsS http://192.168.0.1:8910/health
-curl -fsS http://192.168.0.1:8910/v1/models
+curl -fsS http://<head の管理 IP>:8910/health
+curl -fsS http://<head の管理 IP>:8910/v1/models
 # 停止すると、そのホストの mentat daemon も停止する。
 sudo docker compose --profile head down --timeout 60
 ```
@@ -45,6 +45,54 @@ sudo docker compose --profile head down --timeout 60
 全ノードで TP=3 / MTP k=3、target と MTP の `tp3pad`、dense FP8、
 KV 容量と CUDA Graph のログを確認してからベンチを行う。
 rootful Docker を使用する。コミット・pull・ビルド・再起動はユーザー側で実施する。
+
+## RING ネットワーク (3台、スイッチなし)
+
+ケーブル3本で三角形を作る。各機の f0 / f1 が別々の隣に向く。
+物理ポート1つにつき PCIe root が2つ (`enp1s0f*` = root 0、`enP2p1s0f*` = root 1) なので、
+ケーブル1本に subnet を2つ割り当てる。ホスト部は機体番号 (head .1 / worker1 .2 / worker2 .3)。IP は例。
+
+| ケーブル | root 0 (enp1s0f*) | root 1 (enP2p1s0f*) |
+| --- | --- | --- |
+| head f1 ─ worker1 f0 | 192.168.0.0/24 | 192.168.1.0/24 |
+| worker1 f1 ─ worker2 f0 | 192.168.2.0/24 | 192.168.3.0/24 |
+| worker2 f1 ─ head f0 | 192.168.4.0/24 | 192.168.5.0/24 |
+
+| 機体 | enp1s0f0np0 | enP2p1s0f0np0 | enp1s0f1np1 | enP2p1s0f1np1 |
+| --- | --- | --- | --- | --- |
+| head | 192.168.4.1 | 192.168.5.1 | 192.168.0.1 | 192.168.1.1 |
+| worker1 | 192.168.0.2 | 192.168.1.2 | 192.168.2.2 | 192.168.3.2 |
+| worker2 | 192.168.2.3 | 192.168.3.3 | 192.168.4.3 | 192.168.5.3 |
+
+各機の `/etc/netplan/40-cx7.yaml` をこの表の4本で置き換える (MTU は4本とも9000)。
+他の netplan ファイルや NM 接続が同じ IF を掴んでいないこと
+(`nmcli -t -f NAME,DEVICE con show`)。1 IF に IPv4 は1つだけ。
+
+```yaml
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    enp1s0f0np0:   {addresses: [192.168.4.1/24], mtu: 9000}   # head の例
+    enP2p1s0f0np0: {addresses: [192.168.5.1/24], mtu: 9000}
+    enp1s0f1np1:   {addresses: [192.168.0.1/24], mtu: 9000}
+    enP2p1s0f1np1: {addresses: [192.168.1.1/24], mtu: 9000}
+```
+
+```bash
+sudo chmod 600 /etc/netplan/40-cx7.yaml && sudo netplan try   # 疎通が切れても120秒で戻る
+```
+
+制御面 (mentat / Gloo / NCCL bootstrap) は管理 LAN (`enP7s7`) を通す。RING ではどの RoCE
+アドレスも隣の1台にしか届かないため。`.env` の `HEAD_NODE_IP` / `WORKER1_NODE_IP` /
+`WORKER2_NODE_IP` は管理 IP で、DHCP なので変わったら直す。
+
+mentat の ring claim (`MENTAT_CLAIM_LAYOUT=ring`) が rank をケーブル順に置き、
+kindling の `fabric_ring.py` がそこから NCCL の Ring グラフと arx の ring デバイスを組む。
+arxbig の ring は3 rank に対応しないので `VLLM_ARXBIG=0`。起動前の fabric check は
+mesh 前提なので `FABRIC_CHECK=0`。上流は3台 ring を「手で設定する」としており、
+mentat の ring claim を3台で使うのはこの構成が初めて (未検証)。
+placement で止まったら head で `sudo docker exec glm53-mentat-head mentatd status` を見る。
 
 ## 新規ホストでの準備
 
@@ -87,7 +135,7 @@ Docker Hub の古い nightly タグは削除対象になるため、同じ公式
 | 最大同時実行数 | 8 |
 | prefill budget | 8192 tokens / step、長文1本の閾値7168 |
 | CUDA Graph | FULL_DECODE_ONLY、4/8/16/32 tokens |
-| 通信 | dual rail RoCE、光スイッチ、MTU 1500を維持 |
+| 通信 | 3台 RING (ケーブル直結の三角形)、ケーブルごとに PCIe root 別の2 subnet、MTU 9000 |
 
 元モデルは `SOURCE_MODEL_PATH`、serving directory は `MODEL_PATH`。
 後者の safetensors は元ファイルへの**ハードリンク**で、巨大な複製は行わない。

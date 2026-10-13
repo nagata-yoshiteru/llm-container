@@ -27,7 +27,7 @@ env_get() {
     sed -n "s/^$1=//p" .env | tail -1
 }
 for k in VLLM_IMAGE MODEL_PATH MODEL_CONTAINER_PATH TP_SIZE KV_CACHE_MEMORY \
-         HEAD_ROCE_IP WORKER1_ROCE_IP WORKER2_ROCE_IP \
+         HEAD_NODE_IP WORKER1_NODE_IP WORKER2_NODE_IP \
          ROCE_IF_NAME IB_HCA_NAME NCCL_IB_GID_INDEX GPU_MEMORY_UTILIZATION; do
     printf -v "$k" '%s' "$(env_get "$k")"
 done
@@ -39,9 +39,9 @@ IFS=',' read -ra IB_HCAS  <<< "${IB_HCA_NAME}"
 # NCCL_IB_GID_INDEX は dual-HCA では「意図的に未設定」が正解なので、
 # 空を既定値で埋めない (埋めると固定してあるかのように見えてしまう)。
 
-# 3 ノード分の peer (自分以外) を作っておく。
-ALL_PEERS=("${HEAD_ROCE_IP}" "${WORKER1_ROCE_IP}" "${WORKER2_ROCE_IP}")
-PEER_OCTS=("${HEAD_ROCE_IP##*.}" "${WORKER1_ROCE_IP##*.}" "${WORKER2_ROCE_IP##*.}")
+# 制御面は管理 LAN。RING の fabric 側はホスト部 = 機体番号 (head .1 / worker1 .2 / worker2 .3)。
+ALL_PEERS=("${HEAD_NODE_IP}" "${WORKER1_NODE_IP}" "${WORKER2_NODE_IP}")
+PEER_OCTS=(1 2 3)
 
 echo "== トポロジ =="
 echo "  kindling TP=${TP_SIZE} / 3 hosts (runtime zero padding)"
@@ -57,30 +57,34 @@ echo "  hostname: $(hostname)  arch: $(uname -m)"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sed 's/^/  GPU: /'
 
 echo
-echo "== RoCE リンク =="
+echo "== 管理 LAN (制御面) =="
+if ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+   | grep -qx -e "${HEAD_NODE_IP}" -e "${WORKER1_NODE_IP}" -e "${WORKER2_NODE_IP}"; then
+    ok "この機体は .env の HEAD/WORKER1/WORKER2_NODE_IP のどれかを持っている"
+else
+    ng "どの IF の IP も .env の HEAD/WORKER1/WORKER2_NODE_IP と一致しません"
+    echo "       管理 IP は DHCP。変わっていたら .env を直して 3 台に配る"
+fi
+for PEER in "${ALL_PEERS[@]}"; do
+    ip -4 -o addr show 2>/dev/null | grep -q " ${PEER}/" && continue
+    if ping -c 2 -W 2 "${PEER}" >/dev/null 2>&1; then
+        ok "peer ${PEER} に疎通"
+    else
+        ng "peer ${PEER} に ping が通りません"
+    fi
+done
+
+echo
+echo "== RoCE リンク (RING) =="
 [ "${#ROCE_IFS[@]}" -gt 1 ] && echo "  (dual-HCA: ${#ROCE_IFS[@]} 本構成)"
 LOCAL_IPS=""
 for IFN in "${ROCE_IFS[@]}"; do
     IPS=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
     if [ -z "${IPS}" ]; then
-        ng "${IFN} に IPv4 が付いていません (netplan / スイッチのポートを確認)"
+        ng "${IFN} に IPv4 が付いていません (netplan / ケーブルを確認)"
     else
         ok "${IFN} = ${IPS}"
         LOCAL_IPS="${LOCAL_IPS}${LOCAL_IPS:+$'\n'}${IPS}"
-    fi
-done
-if [ -n "${LOCAL_IPS}" ] && \
-   ! echo "${LOCAL_IPS}" | grep -qx -e "${HEAD_ROCE_IP}" -e "${WORKER1_ROCE_IP}" -e "${WORKER2_ROCE_IP}"; then
-    warn "どの IF の IP も .env の HEAD/WORKER1/WORKER2_ROCE_IP と一致しません。"
-    warn "  この機体が .env のどの役割か確認すること (compose の profile と IP が対応する)。"
-fi
-
-for PEER in "${ALL_PEERS[@]}"; do
-    if echo "${LOCAL_IPS}" | grep -qx "${PEER}"; then continue; fi
-    if ping -c 2 -W 2 "${PEER}" >/dev/null 2>&1; then
-        ok "peer ${PEER} に疎通"
-    else
-        ng "peer ${PEER} に ping が通りません"
     fi
 done
 
@@ -115,9 +119,8 @@ else
 fi
 [ -e /dev/infiniband/uverbs0 ] && ok "/dev/infiniband あり" || ng "/dev/infiniband がありません"
 
-# 光スイッチはジャンボを通さない。自 IF の MTU が 1500 か、経路で DF ping が
-# 通るかを 3 peer 分すべて見る (小さい ping は通っても NCCL の TCP bootstrap が
-# Send-Q 詰まりで無言ハングする事故が 2026-10-05 に実測されている)。
+# RING は直結なので MTU 9000 (RoCE path MTU 4096) を 4 本とも揃える。
+# 各ポートの /24 には隣の 1 台だけがいる。DF ping が通る相手がちょうど 1 台であること。
 for i in "${!ROCE_IFS[@]}"; do
     IFN="${ROCE_IFS[$i]}"
     HCA="${IB_HCAS[$i]:-${IB_HCAS[0]}}"
@@ -126,22 +129,23 @@ for i in "${!ROCE_IFS[@]}"; do
     if [ "${MTU:-0}" -ge 9000 ]; then
         ok "${IFN} MTU ${MTU} (RoCE path MTU ${ACTIVE_MTU:-?})"
     else
-        warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — 光スイッチはジャンボを"
-        warn "  通さないので 1500 で正解。全ノードで揃えること (9000 のままだと bootstrap が詰まる)。"
+        warn "${IFN} MTU ${MTU:-?} / RoCE path MTU ${ACTIVE_MTU:-?} — RING 直結は 9000 にする"
     fi
     LIP=$(ip -4 -o addr show dev "${IFN}" 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1)
     if [ -n "${LIP}" ] && [ -n "${MTU}" ]; then
+        FOUND=()
         for POCT in "${PEER_OCTS[@]}"; do
             PEER_IP="${LIP%.*}.${POCT}"
             [ "${PEER_IP}" = "${LIP}" ] && continue
-            if ping -M do -c 2 -W 2 -s $((MTU - 28)) -I "${IFN}" "${PEER_IP}" >/dev/null 2>&1; then
-                ok "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通る"
-            else
-                ng "${IFN} -> ${PEER_IP} に MTU ${MTU} の DF ping が通りません"
-                echo "       スイッチがジャンボを落としている / 相手が down / arp が別 NIC に答えている"
-                echo "       (arp_ignore=1 / arp_announce=2 を 3 台とも確認)"
-            fi
+            ping -M do -c 2 -W 2 -s $((MTU - 28)) -I "${IFN}" "${PEER_IP}" >/dev/null 2>&1 \
+                && FOUND+=("${PEER_IP}")
         done
+        if [ "${#FOUND[@]}" -eq 1 ]; then
+            ok "${IFN} -> ${FOUND[0]} に MTU ${MTU} の DF ping が通る"
+        else
+            ng "${IFN} (${LIP}) で MTU ${MTU} の DF ping が通る隣が ${#FOUND[@]} 台 (1 台のはず)"
+            echo "       配線・相手の IP/MTU を確認 (.env の配線表と ip -br addr を突き合わせる)"
+        fi
     fi
 done
 
