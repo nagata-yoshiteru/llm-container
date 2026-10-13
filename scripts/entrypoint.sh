@@ -17,4 +17,29 @@ groups = c['quantization_config']['config_groups']
 assert groups and all(g.get('input_activations') is None for g in groups.values()), 'Expected W4A16 checkpoint'
 print('GLM53 uncensored: TP=3 padded config / W4A16 validated', flush=True)
 PY
+# A ring claim made before mentatd has probed every cable fails at once with
+# "no such order of free nodes exists". A ring of TP boxes has TP cables, each
+# its own two-node island, so the head waits for that many before claiming.
+if [[ ${ROLE:-} == head && ${MENTAT_CLAIM_LAYOUT:-} == ring ]]; then
+  python3 - <<'PY'
+import json, os, time
+from urllib.request import urlopen
+want, deadline, seen = int(os.environ['TP']), time.monotonic() + 600, -1
+while True:
+    try:
+        n = len(json.load(urlopen('http://127.0.0.1:6380/status', timeout=5)).get('islands') or [])
+    except Exception:
+        n = -1
+    if n >= want:
+        print(f'ring: mentat sees {n} cable islands', flush=True)
+        break
+    if time.monotonic() > deadline:
+        print(f'ring: only {n} of {want} cable islands after 600 s; claiming anyway', flush=True)
+        break
+    if n != seen:
+        print(f'ring: waiting for {want} cable islands, have {max(n, 0)}', flush=True)
+        seen = n
+    time.sleep(5)
+PY
+fi
 exec /entrypoint.sh "$@"
