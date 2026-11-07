@@ -17,9 +17,14 @@ DGX Spark x3 RING 版 (`DGX-Spark-3-RING/dealignai/GLM-5.3-Flash-UNCENSORED-NVFP
 | 同時実行 | 8 | 実質 1 (vision レーンは直列、下記) |
 
 2026-11-07 に M5 Ultra 256GB / macOS 27.2 で、取得・準備・起動・応答まで確認した。
-単発の decode は約 38.5 tok/s。
 OpenAI 互換・Anthropic 互換・tool call・思考の分離が動くことも確認した。
-**品質 (uncensored の度合い、ベンチ) と長いコンテキストは未検証。**
+ベンチ (1 本ずつ) の結果は次のとおり (下記「速度と正答率」)。
+
+- decode 約 38.5 tok/s
+- prefill 545〜860 tok/s (128K〜1K)
+- 数学・コード 7/7 正解
+
+**uncensored の度合いと、2 本以上の並列は未検証。**
 
 **取得した重みは、そのままでは正しく動かない。**
 `./scripts/prepare-model.sh` で直した serving ディレクトリを使う (下記「そのままでは動かない 3 点」)。
@@ -217,21 +222,70 @@ Anthropic 互換のベース URL は `/v1` を付けない `http://localhost:891
 }
 ```
 
-## 速度
+## Rapid-MLX の hotfix (長い生成で落ちる問題)
 
-2026-11-07、M5 Ultra 256GB、`scripts/bench-glm53.py` (256 tokens、temperature=0、reasoning_effort=max、各 3 回) で測った。
-結果は `results/glm53-mac-oq4e.json` (git 管理外)。
+rapid-mlx 1.0.2 の MLLM (vision) lane では、約 11,200 トークンを生成したところで
+`[metal::malloc] Resource limit (499000) exceeded` で落ちる (API は `insufficient_memory` を返す)。
+GLM-5.3-Flash は vision 込みなので、このモデルは必ず MLLM lane で動く。
+
+- 原因: text lane は、hybrid (再帰) キャッシュの関数的な更新が遅延グラフを抱え続けるのを、
+  数ステップごとの `mx.eval([c.state for c in cache])` で抑えている (上流 #1834 / #2834)。
+  MLLM lane の decode にはこの barrier が無い。
+  そのため 45 層分の更新が、1 トークンあたり約 45 個の Metal handle として残り続ける。上流 #3270 と同じ系統。
+- 対処: `scripts/rapid_mlx_launch.py` が `MLLMBatchGenerator._step` に、text lane と同じ予算の barrier を足す
+  (同時実行数 × 間隔 = 64)。そのうえで、同じプロセスで rapid-mlx を起動する。
+  rapid-mlx のバージョンが 1.0.2 以外なら、起動を止める (fail-closed)。
+- 確認 (2026-11-07): 同じ 14,000 トークンの生成を両方で試した。
+  hotfix なしでは 11,234 トークンで落ち、hotfix ありでは完走した (37.6 tok/s、低下なし)。
+  素の mlx-vlm では、hotfix なしでも 12,500 トークンまで落ちない。
+
+## 速度と正答率 (1 本ずつ)
+
+2026-11-07、M5 Ultra 256GB、hotfix ありで測った。結果は `results/glm53-mac-oq4e-c1/` (git 管理外)。
+
+```bash
+python3 scripts/bench-glm53.py --label mac-oq4e --output results/glm53-mac-oq4e.json
+cd scripts && python3 bench-glm53-eval.py --phase quality --concurrency 1 --output-dir ../results/glm53-mac-oq4e-c1
+cd scripts && python3 bench-glm53-eval.py --phase profile --concurrency 1 --output-dir ../results/glm53-mac-oq4e-c1
+python3 scripts/summarize-glm53-eval.py results/glm53-mac-oq4e-c1
+```
+
+### decode
 
 | 条件 | decode |
 | --- | --- |
-| 1 本 (prose / code) | 37.4〜39.0 tok/s (平均 約 38.5) |
-| 2 本同時 | 1 本は 38.8、もう 1 本は 19.3 tok/s。合計は伸びない (直列に処理される) |
+| 固定 256 tokens、1 本 (prose / code 各 3 回) | 中央値 38.5 tok/s (37.4〜39.0)、TTFT 0.19 秒 |
+| quality 7 問 (1.4K〜17K tokens) | 37.7〜39.1 tok/s。17K tokens まで、生成長による低下はほぼ無い |
+| 2 本同時 | 1 本あたり 28.9 tok/s、合計 38.7 tok/s。直列に処理されるので合計は伸びない |
 
-- スモークテストでは、思考なしの短い応答が 1〜3 秒で返った。
-  tool call (`glm47`)、思考の分離 (`reasoning` / Anthropic の `thinking` ブロック)、`/v1/messages` も動いた。
-- prefill (TTFT) と長いコンテキストは未計測。
-  参考値として、Rapid-MLX 公式 alias は M3 Ultra で 8K の TTFT が 22.8 秒 (およそ 360 tok/s)。
-  長い入力を投げるときは、クライアントのタイムアウトを伸ばすこと。
+### cold prefill (1 本、prefix cache を外して計測)
+
+| 入力 | TTFT | prefill |
+| --- | --- | --- |
+| 1K | 1.2 秒 | 約 860 tok/s |
+| 8K | 10.1〜10.6 秒 | 約 810 tok/s |
+| 32K | 48.5 秒 | 約 680 tok/s |
+| 128K | 240 秒 | 約 545 tok/s |
+
+DGX Spark x3 よりかなり遅い。長い入力を投げるときは、クライアントのタイムアウトを伸ばすこと。
+
+### 正答率 (reasoning_effort=max、temperature 1.0、max_tokens 32768)
+
+`glm53_eval_tasks.py` の数学 4 問とコード 3 問で、**7/7 正解**。
+コードは、生成物を読んでから repo のテストで実行した (`code-grades.json`)。
+
+| 問題 | 結果 | 生成 tokens | 時間 |
+| --- | --- | --- | --- |
+| M4 2^2026 mod 1000 | 正解 (864) | 1,363 | 36 秒 |
+| M1 AIME 2006 (ゼロを含まない a+b=1000) | 正解 (738) | 17,254 | 458 秒 |
+| M2 AIME 1999 (n²−19n+99 が平方数) | 正解 (38) | 4,166 | 109 秒 |
+| M3 桁和 30 の個数 | 正解 (50877) | 2,666 | 69 秒 |
+| C1 転倒数 O(n log n) | PASS | 3,844 | 101 秒 |
+| C2 3×n ドミノ (n ≤ 10^18) | PASS | 5,288 | 139 秒 |
+| C3 最小窓部分文字列 | PASS | 12,069 | 320 秒 |
+
+各問 1 回ずつの結果なので、正答率の誤差は大きい。
+M1 は 17K tokens あり、hotfix なしでは途中で落ちる長さ。
 
 参考 (別の重み):
 
@@ -242,8 +296,15 @@ Anthropic 互換のベース URL は `/v1` を付けない `http://localhost:891
 
 ## 検証とベンチ
 
-DGX 版のベンチスクリプトは、`:8910` と `glm-5.3-flash-uncensored` を前提にしているので、そのまま使える。
-`bench-glm53.py` は実行を確認した。`bench-glm53-eval.py` と `bench-glm53-long-context.py` はまだ試していない。
+DGX 版のベンチスクリプトは、`:8910` と `glm-5.3-flash-uncensored` を前提にしている。
+`bench-glm53-eval.py` は Rapid-MLX にも対応させた。対応した内容は次のとおり。
+
+- `/metrics` の名前の違いを吸収する
+- `/tokenize` が無いので `/v1/messages/count_tokens` を使う
+- `cache_salt` が無いので、先頭に nonce を置いて prefix cache を外す
+
+1 本ずつ測るときは `--concurrency 1` を付ける。上の「速度と正答率」の手順で実行を確認した。
+`--phase retrieval` と `bench-glm53-long-context.py` は、まだ試していない。
 
 ```bash
 python3 scripts/bench-glm53.py --label mac-oq4e --output results/glm53-mac-oq4e.json

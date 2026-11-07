@@ -20,21 +20,41 @@ from glm53_eval_tasks import MATH, MATH_SUFFIX, CODE, CODE_SUFFIX
 MODEL = "glm-5.3-flash-uncensored"
 API = "http://127.0.0.1:8910"
 OUT = None
+# vLLM と Rapid-MLX (Mac) の両方に対応する。Rapid-MLX は /tokenize と cache_salt が無く、
+# /metrics の名前も違う (rapid_mlx_*)。初回の metrics() で判定する。
+BACKEND = None
 
 
 def metrics():
+    global BACKEND
     text = urlopen(API + "/metrics", timeout=15).read().decode()
     totals = {}
     for line in text.splitlines():
         if line.startswith("#") or not line:
             continue
         label, value = line.rsplit(" ", 1)
-        name = label.split("{", 1)[0].removeprefix("vllm:")
+        name = label.split("{", 1)[0]
+        if name.startswith("rapid_mlx_"):
+            BACKEND = "rapid-mlx"
+            name = "rapid:" + name.removeprefix("rapid_mlx_")
+        name = name.removeprefix("vllm:")
         if name.endswith(("_sum", "_count", "_total")) or name in (
             "num_requests_running", "num_requests_waiting",
+            "rapid:requests_running", "rapid:requests_waiting",
         ):
             totals[name] = totals.get(name, 0) + float(value)
+    BACKEND = BACKEND or "vllm"
+    if BACKEND == "rapid-mlx":
+        totals["num_requests_running"] = totals.get("rapid:requests_running", 0)
+        totals["num_requests_waiting"] = totals.get("rapid:requests_waiting", 0)
     return totals
+
+
+def count_tokens(body):
+    """Prompt token count. vLLM: /tokenize. Rapid-MLX: /v1/messages/count_tokens (messages only)."""
+    if BACKEND == "rapid-mlx":
+        return post("/v1/messages/count_tokens", {"model": MODEL, "messages": body["messages"]})["input_tokens"]
+    return post("/tokenize", {"model": MODEL, **body})["count"]
 
 
 def post(route, body):
@@ -123,24 +143,36 @@ def wave(label, jobs):
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         rows = list(pool.map(lambda job: stream(*job), jobs))
     wall = time.perf_counter() - start
+    count_key = ("rapid:model_ttft_seconds_count" if BACKEND == "rapid-mlx"
+                 else "request_prefill_time_seconds_count")
     for _ in range(30):
         after = metrics()
-        count = after.get("request_prefill_time_seconds_count", 0) - before.get("request_prefill_time_seconds_count", 0)
+        count = after.get(count_key, 0) - before.get(count_key, 0)
         if count >= len(jobs):
             break
         time.sleep(0.2)
     delta = {key: after.get(key, 0) - before.get(key, 0) for key in after}
     output = sum((row["usage"] or {}).get("completion_tokens", 0) for row in rows)
     prompt = sum((row["usage"] or {}).get("prompt_tokens", 0) for row in rows)
-    prefill_s = delta.get("request_prefill_time_seconds_sum", 0)
-    decode_s = delta.get("request_decode_time_seconds_sum", 0)
-    computed = delta.get("request_prefill_kv_computed_tokens_sum", 0)
-    result = {"label": label, "concurrency": len(jobs), "wall_s": wall,
+    if BACKEND == "rapid-mlx":
+        # Rapid-MLX: サーバ側 TTFT (キュー待ち込み) で prefill を、
+        # リクエストごとの decode tok/s ヒストグラムの平均で decode を見る。
+        prefill_s = delta.get("rapid:model_ttft_seconds_sum", 0)
+        computed = prompt - delta.get("rapid:prefix_cache_tokens_saved_total", 0)
+        decode_n = delta.get("rapid:model_decode_tokens_per_second_count", 0)
+        decode_rate = delta.get("rapid:model_decode_tokens_per_second_sum", 0) / decode_n if decode_n else None
+    else:
+        prefill_s = delta.get("request_prefill_time_seconds_sum", 0)
+        decode_s = delta.get("request_decode_time_seconds_sum", 0)
+        computed = delta.get("request_prefill_kv_computed_tokens_sum", 0)
+        decode_rate = (output - len(rows)) / decode_s if decode_s else None
+    result = {"label": label, "backend": BACKEND, "concurrency": len(jobs), "wall_s": wall,
               "prompt_tokens": prompt, "completion_tokens": output,
               "aggregate_output_tok_s_e2e": output / wall,
               "aggregate_prompt_tok_s_wall": prompt / wall,
+              "prefill_new_kv_tokens": computed,
               "prefill_new_kv_tok_s_per_request_weighted": computed / prefill_s if prefill_s else None,
-              "decode_tok_s_per_request_weighted": (output - len(rows)) / decode_s if decode_s else None,
+              "decode_tok_s_per_request_weighted": decode_rate,
               "metrics_delta": delta, "metrics_request_count_matches": count == len(jobs),
               "requests": [{k: v for k, v in row.items() if k not in ("content", "reasoning")} for row in rows]}
     (OUT / (label + "-wave.json")).write_text(json.dumps(result, indent=2) + "\n")
@@ -157,17 +189,52 @@ def main():
     parser.add_argument("--url", default=API)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--phase", choices=["profile", "quality", "retrieval"], required=True)
+    parser.add_argument("--concurrency", choices=["default", "1"], default="default",
+                        help="1: quality は 7 問を 1 本ずつ、profile は 1 本ずつの cold prefill だけ "
+                             "(decode の 1/2 本は bench-glm53.py で測る)")
     args = parser.parse_args()
     API, OUT = args.url.rstrip("/"), args.output_dir
+    metrics()  # BACKEND を判定
     OUT.mkdir(parents=True, exist_ok=True)
     marker = OUT / (args.phase + "-start.json")
     if marker.exists():
         parser.error("This phase already has results; use a new output directory")
     marker.write_text(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(),
                                  "phase": args.phase, "api": API, "model": MODEL,
+                                 "backend": BACKEND, "concurrency": args.concurrency,
                                  "note": "Decode streaming rate is approximate with speculative chunks. "
                                  "Prefill server interval includes scheduling stalls and first token, not pure GPU time."}, indent=2))
-    if args.phase == "profile":
+    if args.phase == "profile" and BACKEND == "rapid-mlx":
+        if args.concurrency != "1":
+            parser.error("Rapid-MLX は直列処理なので profile は --concurrency 1 だけ")
+        # /tokenize と cache_salt が無いので、テキストで長さを合わせ、先頭に毎回別の
+        # nonce を置いて prefix cache を外す (prefill_new_kv_tokens == prompt_tokens で確認)。
+        records = [f"Record {i:06d}: warehouse {(i * 17) % 997}, inventory {(i * 7919) % 100003}, "
+                   f"quantity {(i * 13) % 211}. Confirm delivery before updating the inventory ledger."
+                   for i in range(12000)]
+        per_record = count_tokens({"messages": [{"role": "user", "content": "\n".join(records[:400])}]}) / 400
+
+        def sized(length):
+            n = int(length / per_record)
+            for _ in range(6):
+                actual = count_tokens({"messages": [{"role": "user", "content": "\n".join(records[:n])}]})
+                if abs(actual - length) <= max(16, length // 200):
+                    break
+                n = max(1, int(n * length / actual))
+            return "\n".join(records[:n])
+
+        (OUT / "prefill-corpus.json").write_text(json.dumps({
+            "generator": "deterministic inventory records with a unique nonce prefix per request; "
+                         "see bench-glm53-eval.py", "backend": BACKEND,
+            "cache_policy": "unique leading nonce per request; verify prefill_new_kv_tokens == prompt_tokens",
+        }, indent=2))
+        for length, repeats in [(1024, 3), (8192, 3), (32768, 3), (131072, 1)]:
+            text = sized(length)
+            for rep in range(repeats):
+                label = f"prefill-n{length}-c1-r{rep}"
+                wave(label, [(label + "-0", {"prompt": f"Session {uuid.uuid4().hex}.\n" + text,
+                              "max_tokens": 1, "temperature": 0, "seed": 42}, "/v1/completions")])
+    elif args.phase == "profile":
         for rep in range(3):
             jobs = []
             for i in range(6):
@@ -209,9 +276,14 @@ def main():
             return name, {"messages": [{"role": "user", "content": prompt}],
                           "max_tokens": 32768, "temperature": 1.0, "top_p": 0.95,
                           "chat_template_kwargs": {"reasoning_effort": "max"}}
-        wave("quality-single-M4", [job("M4_powmod")])
-        wave("quality-concurrent-six", [job(name) for name in [
-            "M1_aime06", "M2_aime99", "M3_digitsum", "C1_inversions", "C2_domino", "C3_minwindow"]])
+        if args.concurrency == "1":
+            for name in ["M4_powmod", "M1_aime06", "M2_aime99", "M3_digitsum",
+                         "C1_inversions", "C2_domino", "C3_minwindow"]:
+                wave(f"quality-c1-{name}", [job(name)])
+        else:
+            wave("quality-single-M4", [job("M4_powmod")])
+            wave("quality-concurrent-six", [job(name) for name in [
+                "M1_aime06", "M2_aime99", "M3_digitsum", "C1_inversions", "C2_domino", "C3_minwindow"]])
     else:
         expected = {"RED": "Cobalt-73419-Orchid", "GREEN": "Quartz-58263-Finch", "BLUE": "Maple-91647-Lantern"}
 
@@ -228,10 +300,8 @@ def main():
         count = 4000
         for _ in range(4):
             prompt = make_prompt(count)
-            tokenized = post("/tokenize", {"model": MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "chat_template_kwargs": {"reasoning_effort": "max"}})
-            actual = tokenized["count"]
+            actual = count_tokens({"messages": [{"role": "user", "content": prompt}],
+                                   "chat_template_kwargs": {"reasoning_effort": "max"}})
             if 131072 <= actual <= 132096:
                 break
             count = max(1, int(count * 131584 / actual))

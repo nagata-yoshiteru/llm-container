@@ -67,4 +67,6 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export DO_NOT_TRACK=1 RAPID_MLX_DISABLE_VERSION_CHECK=1
 
 echo "+ rapid-mlx ${ARGS[*]}" | sed -E 's/(--api-key )[^ ]+/\1***/'
-exec "${RAPID_MLX}" "${ARGS[@]}"
+# rapid-mlx を直接 exec せず、hotfix を当ててから同じプロセスで起動する
+# (MLLM lane の decode で Metal handle が尽きる問題。scripts/rapid_mlx_launch.py 参照)
+exec "${VENV_DIR}/bin/python" -I "${REPO_ROOT}/scripts/rapid_mlx_launch.py" "${ARGS[@]}"

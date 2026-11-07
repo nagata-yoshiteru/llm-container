@@ -58,7 +58,9 @@ def main():
     keys = sorted({(s["prompt_tokens"] // s["concurrency"], s["concurrency"]) for s in prefill})
     for length, concurrency in keys:
         samples = [s for s in prefill if s["prompt_tokens"] == length * concurrency and s["concurrency"] == concurrency]
-        all_fresh = all(s["metrics_delta"]["request_prefill_kv_computed_tokens_sum"] == s["prompt_tokens"] for s in samples)
+        all_fresh = all(s.get("prefill_new_kv_tokens",
+                              s["metrics_delta"].get("request_prefill_kv_computed_tokens_sum")) == s["prompt_tokens"]
+                        for s in samples)
         summary["cold_prefill"].append({
             "input_tokens_per_request": length, "concurrency": concurrency,
             "repeats": len(samples), "all_tokens_newly_computed": all_fresh,
