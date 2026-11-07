@@ -4,9 +4,8 @@
 #
 #   ./scripts/preflight.sh
 #
-# ここで赤が出た状態で起動すると、186GB を数分かけて読んだ挙句に
-# Metal の OOM (kIOGPUCommandBufferCallbackErrorOutOfMemory) か swap 地獄になる。
-# 特に == メモリ == の wired 上限は必ず見ること。
+# ここで赤が出た状態で起動すると、197GiB を数分かけて読んだ挙句に
+# Metal の OOM か swap 地獄になる。特に == メモリ == の wired 上限は必ず見ること。
 # =============================================================================
 set -uo pipefail
 source "$(dirname "$0")/env.sh"
@@ -26,56 +25,68 @@ echo "  $(hostname -s) / ${CHIP} / ${MEM_GIB} GiB / macOS $(sw_vers -productVers
 if [ "${MEM_GIB}" -ge 256 ]; then
     ok "unified memory ${MEM_GIB} GiB"
 else
-    ng "unified memory ${MEM_GIB} GiB — 重み 186GB の oQ4e は 256GB 機が前提"
+    ng "unified memory ${MEM_GIB} GiB — JANG_2K (常駐 197GiB) は 256GB 機が前提"
 fi
 
 echo
 echo "== ランタイム =="
-if [ -x "${RAPID_MLX}" ]; then
-    V=$("${VENV_DIR}/bin/python" -c 'from importlib.metadata import version as v; print(v("rapid-mlx"))' 2>/dev/null)
-    if [ "${V}" = "${RAPID_MLX_VERSION}" ]; then
-        ok "rapid-mlx ${V}"
+if [ -x "${VMLX}" ]; then
+    V=$("${VENV_DIR}/bin/python" -c 'from importlib.metadata import version as v; print(v("vmlx"), v("jang"))' 2>/dev/null)
+    if [ "${V}" = "${VMLX_VERSION} ${JANG_VERSION}" ]; then
+        ok "vmlx ${VMLX_VERSION} / jang ${JANG_VERSION}"
     else
-        warn "rapid-mlx ${V:-?} (.env の RAPID_MLX_VERSION は ${RAPID_MLX_VERSION}) — ./scripts/setup.sh"
+        warn "vmlx/jang = ${V:-?} (.env は ${VMLX_VERSION} / ${JANG_VERSION}) — ./scripts/setup.sh"
     fi
-    "${VENV_DIR}/bin/python" -c 'import mlx.core as mx; assert mx.metal.is_available()' 2>/dev/null \
-        && ok "MLX から Metal が見える" || ng "MLX から Metal が見えません"
+    "${VENV_DIR}/bin/python" -I -c 'import mlx.core as mx, jang_tools.dsv4_1.mlx_model; assert mx.metal.is_available()' 2>/dev/null \
+        && ok "MLX から Metal が見え、jang_tools.dsv4_1 を import できる" \
+        || ng "MLX の Metal か jang_tools.dsv4_1 が使えません"
 else
-    ng "${RAPID_MLX} がありません — ./scripts/setup.sh"
+    ng "${VMLX} がありません — ./scripts/setup.sh"
 fi
 
 echo
 echo "== モデル =="
-if [ -d "${SERVE_MODEL_PATH}" ] && [ -x "${VENV_DIR}/bin/python" ]; then
-    if "${VENV_DIR}/bin/python" -I - "${SERVE_MODEL_PATH}" <<'PY'
+if [ -d "${MODEL_PATH}" ] && [ -x "${VENV_DIR}/bin/python" ]; then
+    if "${VENV_DIR}/bin/python" -I - "${MODEL_PATH}" <<'PY'
 import json, sys
 from pathlib import Path
 p = Path(sys.argv[1])
-m = json.loads((p / 'mlxvlm-preparation.json').read_text())
-print(f'  mlx-vlm 用に準備済み (再量子化 {len(m["requantized"])} 個 / mlx-vlm {m["mlx_vlm"]})')
 c = json.loads((p / 'config.json').read_text())
-assert c['model_type'] == 'glm5_next'
-assert (c['quantization']['bits'], c['quantization']['group_size']) == (4, 64)
+assert c['model_type'] == 'deepseek_v41'
+j = json.loads((p / 'jang_config.json').read_text())
+print(f'  JANG profile {j["profile"]} (routed experts 平均 {j["affine_bits"]["routed_expert_mean"]} bit)')
 w = json.loads((p / 'model.safetensors.index.json').read_text())['weight_map']
 shards = set(w.values())
 assert all((p / s).is_file() for s in shards)
-gb = sum((p / s).stat().st_size for s in shards) / 1e9
-print(f'  index が参照する {len(shards)} shards が存在 ({gb:.1f} GB)')
+gib = sum((p / s).stat().st_size for s in shards) / 2**30
+rt = c.get('runtime', {})
+engram = sorted((p / rt.get('engram_dir', 'engram')).glob('*.safetensors'))
+assert len(engram) == 2
+eg = sum(f.stat().st_size for f in engram) / 2**30
+ds = p / rt.get('dspark_dir', 'dspark') / 'dspark.safetensors'
+assert ds.is_file()
+print(f'  本体 {len(shards)} shards {gib:.1f} GiB (常駐) / Engram {eg:.1f} GiB (ディスク) / '
+      f'DSpark {ds.stat().st_size / 2**30:.1f} GiB')
 PY
     then
-        ok "glm5_next / MLX 4bit g64 / checkpoint index"
+        ok "deepseek_v41 / JANG_2K / 本体・Engram・DSpark"
     else
-        ng "モデルが不完全 — ./scripts/fetch-model.sh → ./scripts/prepare-model.sh"
+        ng "モデルが不完全 — ./scripts/fetch-model.sh を再実行"
     fi
+    # Engram は実行中に行単位で読む。外付け/ネットワークドライブだと prefill が遅くなる。
+    DEV=$(df "${MODEL_PATH}" | awk 'NR==2 {print $1}')
+    diskutil info "${DEV}" 2>/dev/null | grep -q -E 'Device Location: +Internal|Internal: +Yes' \
+        && ok "モデルは内蔵ストレージ上 (Engram をディスクから読む)" \
+        || warn "モデルが内蔵ストレージ上か確認できない (Engram はディスクから読む)"
 else
-    ng "${SERVE_MODEL_PATH} がありません — ./scripts/fetch-model.sh → ./scripts/prepare-model.sh"
+    ng "${MODEL_PATH} がありません — ./scripts/fetch-model.sh"
 fi
 
 echo
 echo "== メモリ =="
 # MLX が wired にできる上限 (max_recommended_working_set_size) は
 # iogpu.wired_limit_mb で決まる。0 は OS 既定 (256GB 機で約 75% = 192GiB 前後)。
-# 重み 173GiB + KV + 活性化 では足りないので引き上げる。再起動で 0 に戻る。
+# 本体 197GiB + DSpark 8.3GiB + KV では足りないので引き上げる。再起動で 0 に戻る。
 CUR_WIRED=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
 if [ "${CUR_WIRED}" -ge "${WIRED_LIMIT_MB}" ]; then
     ok "iogpu.wired_limit_mb=${CUR_WIRED} (>= ${WIRED_LIMIT_MB})"
@@ -91,13 +102,14 @@ FREE_GIB=$(vm_stat | awk -v ps="$(pagesize)" '
     /Pages free/ || /Pages inactive/ || /Pages speculative/ || /Pages purgeable/ {
         gsub(/\./, "", $NF); s += $NF }
     END { printf "%d", s * ps / 1024 / 1024 / 1024 }')
-if [ "${FREE_GIB}" -ge 200 ]; then
+if [ "${FREE_GIB}" -ge 215 ]; then
     ok "空きメモリ 約 ${FREE_GIB} GiB"
 else
-    ng "空きメモリ 約 ${FREE_GIB} GiB (< 200 GiB)。他のアプリ / モデルサーバを止める"
+    ng "空きメモリ 約 ${FREE_GIB} GiB (< 215 GiB)。他のアプリ / モデルサーバを止める"
 fi
-for P in ollama 'LM Studio' llama-server mlx_lm.server mlx_vlm.server; do
-    pgrep -fq "${P}" && warn "${P} が動いている (メモリを取り合う)"
+# GLM 用ブランチの Rapid-MLX サーバと同時には載らない (173 + 197 GiB)
+for P in rapid-mlx rapid_mlx_launch ollama 'LM Studio' llama-server mlx_lm.server mlx_vlm.server; do
+    pgrep -fq "${P}" && ng "${P} が動いている (同時には載らない。先に止める)"
 done
 SWAP=$(sysctl -n vm.swapusage | awk '{print $6}')
 echo "  swap used: ${SWAP}"
@@ -110,7 +122,7 @@ else
     ok ":${HOST_PORT} は空いている"
 fi
 if [ "${API_HOST}" != "127.0.0.1" ] && [ "${API_HOST}" != "localhost" ] && [ -z "${API_KEY}" ]; then
-    ng "API_HOST=${API_HOST} で API_KEY が空。rapid-mlx は無認証の公開バインドを拒否する"
+    ng "API_HOST=${API_HOST} で API_KEY が空。LAN に出すなら API_KEY を設定する"
 fi
 
 echo

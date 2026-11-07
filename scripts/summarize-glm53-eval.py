@@ -64,9 +64,13 @@ def main():
         summary["cold_prefill"].append({
             "input_tokens_per_request": length, "concurrency": concurrency,
             "repeats": len(samples), "all_tokens_newly_computed": all_fresh,
-            "median_server_prefill_tok_s_per_request": statistics.median(s["prefill_new_kv_tok_s_per_request_weighted"] for s in samples),
+            # サーバ側メトリクスが無い / TTFT が取れなかった wave は wall 時間で代用する
+            # (max_tokens=1 の prefill 計測なので wall ≒ TTFT)
+            "median_server_prefill_tok_s_per_request": statistics.median(
+                s["prefill_new_kv_tok_s_per_request_weighted"] or s["aggregate_prompt_tok_s_wall"] for s in samples),
             "median_aggregate_wall_tok_s": statistics.median(s["aggregate_prompt_tok_s_wall"] for s in samples),
-            "median_ttft_s": statistics.median(r["ttft_s"] for s in samples for r in s["requests"] if r["ttft_s"] is not None),
+            "median_ttft_s": statistics.median(r["ttft_s"] if r["ttft_s"] is not None else r["elapsed_s"]
+                                               for s in samples for r in s["requests"]),
             "median_wave_wall_s": statistics.median(s["wall_s"] for s in samples),
         })
     grades_path = root / "code-grades.json"

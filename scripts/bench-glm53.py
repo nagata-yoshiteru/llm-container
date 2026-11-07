@@ -28,7 +28,8 @@ def request(args, kind):
         "messages": [{"role": "user", "content": PROMPTS[kind]}],
         "temperature": 0, "seed": 42,
         "max_tokens": args.tokens, "min_tokens": args.tokens, "ignore_eos": True,
-        "chat_template_kwargs": {"reasoning_effort": "max"},
+        # DSV4.1 は enable_thinking を明示しないと思考しない。GLM のテンプレートは無視する。
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "max"},
         "stream": True, "stream_options": {"include_usage": True},
     }
     req = Request(args.url.rstrip("/") + "/v1/chat/completions",

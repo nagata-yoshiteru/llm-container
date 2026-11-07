@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# docker compose の代わり。rapid-mlx をバックグラウンドで起動・停止する。
+# docker compose の代わり。vmlx をバックグラウンドで起動・停止する。
 #
 #   ./scripts/serve.sh up       # 起動 (ready まで待つ)
 #   ./scripts/serve.sh logs     # ログを追う (Ctrl-C で抜けてもサーバは止まらない)
@@ -8,7 +8,7 @@
 #   ./scripts/serve.sh down     # 停止
 #   ./scripts/serve.sh fg       # フォアグラウンドで起動 (デバッグ用)
 #
-# ログは .cache/rapid-mlx/logs/serve.log、PID は .cache/rapid-mlx/serve.pid。
+# ログは .cache/vmlx/logs/serve.log、PID は .cache/vmlx/serve.pid。
 # =============================================================================
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
@@ -32,8 +32,9 @@ up)
     nohup "${REPO_ROOT}/scripts/entrypoint.sh" >> "${LOG_FILE}" 2>&1 &
     echo $! > "${PID_FILE}"
     echo "pid $(cat "${PID_FILE}") / log ${LOG_FILE}"
-    echo "ready を待つ (186GB のロードで数分かかる。Ctrl-C で待つのをやめても起動は続く)"
-    while ! curl -fsS -m 5 ${AUTH[@]+"${AUTH[@]}"} "${URL}/health" >/dev/null 2>&1; do
+    echo "ready を待つ (197GiB のロードで数分かかる。Ctrl-C で待つのをやめても起動は続く)"
+    # /health はロード中でも返ることがあるので、/v1/models にモデル名が出るまで待つ
+    while ! curl -fsS -m 5 ${AUTH[@]+"${AUTH[@]}"} "${URL}/v1/models" 2>/dev/null | grep -q "\"${SERVED_MODEL_NAME}\""; do
         if ! running_pid >/dev/null; then
             echo "起動に失敗。ログの末尾:" >&2; tail -n 40 "${LOG_FILE}" >&2; exit 1
         fi

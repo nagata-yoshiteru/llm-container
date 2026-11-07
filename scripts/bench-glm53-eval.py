@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import re
 import time
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import uuid
 
@@ -20,14 +21,24 @@ from glm53_eval_tasks import MATH, MATH_SUFFIX, CODE, CODE_SUFFIX
 MODEL = "glm-5.3-flash-uncensored"
 API = "http://127.0.0.1:8910"
 OUT = None
-# vLLM と Rapid-MLX (Mac) の両方に対応する。Rapid-MLX は /tokenize と cache_salt が無く、
-# /metrics の名前も違う (rapid_mlx_*)。初回の metrics() で判定する。
+# vLLM / Rapid-MLX / /metrics を持たないサーバ (vmlx など、"plain") に対応する。
+# Rapid-MLX は /tokenize と cache_salt が無く、/metrics の名前も違う (rapid_mlx_*)。
+# plain はサーバ側メトリクスが無いので、ストリームから測った TTFT / decode を使う。
+# 初回の metrics() で判定する。
 BACKEND = None
 
 
 def metrics():
     global BACKEND
-    text = urlopen(API + "/metrics", timeout=15).read().decode()
+    if BACKEND == "plain":
+        return {}
+    try:
+        text = urlopen(API + "/metrics", timeout=15).read().decode()
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise
+        BACKEND = "plain"
+        return {}
     totals = {}
     for line in text.splitlines():
         if line.startswith("#") or not line:
@@ -51,9 +62,13 @@ def metrics():
 
 
 def count_tokens(body):
-    """Prompt token count. vLLM: /tokenize. Rapid-MLX: /v1/messages/count_tokens (messages only)."""
+    """Prompt token count. vLLM: /tokenize. Rapid-MLX: /v1/messages/count_tokens (messages only).
+    plain: max_tokens=1 の completion を 1 回投げて usage から読む (prefill 分の時間がかかる)。"""
     if BACKEND == "rapid-mlx":
         return post("/v1/messages/count_tokens", {"model": MODEL, "messages": body["messages"]})["input_tokens"]
+    if BACKEND == "plain":
+        text = "\n".join(m["content"] for m in body["messages"])
+        return post("/v1/completions", {"model": MODEL, "prompt": text, "max_tokens": 1})["usage"]["prompt_tokens"]
     return post("/tokenize", {"model": MODEL, **body})["count"]
 
 
@@ -108,6 +123,9 @@ def stream(name, body, route="/v1/chat/completions"):
         error = repr(exc)
     elapsed = time.perf_counter() - start
     tokens = (usage or {}).get("completion_tokens", 0)
+    if first is None and error is None and tokens == 1:
+        # 1 トークンだけの応答でテキストが空 (vmlx の prefill 計測など) なら、完了時刻 = 最初のトークン
+        first = last = start + elapsed
     row = {"name": name, "usage": usage, "elapsed_s": elapsed,
            "started_at_unix": started_at_unix,
            "first_token_at_unix": started_at_unix + first - start if first is not None else None,
@@ -148,13 +166,21 @@ def wave(label, jobs):
     for _ in range(30):
         after = metrics()
         count = after.get(count_key, 0) - before.get(count_key, 0)
-        if count >= len(jobs):
+        if count >= len(jobs) or BACKEND == "plain":
             break
         time.sleep(0.2)
     delta = {key: after.get(key, 0) - before.get(key, 0) for key in after}
     output = sum((row["usage"] or {}).get("completion_tokens", 0) for row in rows)
     prompt = sum((row["usage"] or {}).get("prompt_tokens", 0) for row in rows)
-    if BACKEND == "rapid-mlx":
+    if BACKEND == "plain":
+        # サーバ側メトリクスが無い: クライアントで測った TTFT と streaming decode を使う。
+        # prefix cache を外せたかは検証できない (先頭 nonce で外している前提)。
+        count = len(jobs)
+        prefill_s = sum(row["ttft_s"] or 0 for row in rows)
+        computed = prompt
+        rates = [row["output_tok_s_approx_decode"] for row in rows if row["output_tok_s_approx_decode"]]
+        decode_rate = sum(rates) / len(rates) if rates else None
+    elif BACKEND == "rapid-mlx":
         # Rapid-MLX: サーバ側 TTFT (キュー待ち込み) で prefill を、
         # リクエストごとの decode tok/s ヒストグラムの平均で decode を見る。
         prefill_s = delta.get("rapid:model_ttft_seconds_sum", 0)
@@ -184,16 +210,17 @@ def wave(label, jobs):
 
 
 def main():
-    global API, OUT
+    global API, OUT, MODEL
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=API)
+    parser.add_argument("--model", default=MODEL)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--phase", choices=["profile", "quality", "retrieval"], required=True)
     parser.add_argument("--concurrency", choices=["default", "1"], default="default",
                         help="1: quality は 7 問を 1 本ずつ、profile は 1 本ずつの cold prefill だけ "
                              "(decode の 1/2 本は bench-glm53.py で測る)")
     args = parser.parse_args()
-    API, OUT = args.url.rstrip("/"), args.output_dir
+    API, OUT, MODEL = args.url.rstrip("/"), args.output_dir, args.model
     metrics()  # BACKEND を判定
     OUT.mkdir(parents=True, exist_ok=True)
     marker = OUT / (args.phase + "-start.json")
@@ -204,19 +231,22 @@ def main():
                                  "backend": BACKEND, "concurrency": args.concurrency,
                                  "note": "Decode streaming rate is approximate with speculative chunks. "
                                  "Prefill server interval includes scheduling stalls and first token, not pure GPU time."}, indent=2))
-    if args.phase == "profile" and BACKEND == "rapid-mlx":
+    if args.phase == "profile" and BACKEND in ("rapid-mlx", "plain"):
         if args.concurrency != "1":
-            parser.error("Rapid-MLX は直列処理なので profile は --concurrency 1 だけ")
+            parser.error(f"{BACKEND} は直列処理なので profile は --concurrency 1 だけ")
         # /tokenize と cache_salt が無いので、テキストで長さを合わせ、先頭に毎回別の
-        # nonce を置いて prefix cache を外す (prefill_new_kv_tokens == prompt_tokens で確認)。
+        # nonce を置いて prefix cache を外す (Rapid-MLX は prefill_new_kv_tokens == prompt_tokens で確認)。
         records = [f"Record {i:06d}: warehouse {(i * 17) % 997}, inventory {(i * 7919) % 100003}, "
                    f"quantity {(i * 13) % 211}. Confirm delivery before updating the inventory ledger."
                    for i in range(12000)]
-        per_record = count_tokens({"messages": [{"role": "user", "content": "\n".join(records[:400])}]}) / 400
+        calib = 100 if BACKEND == "plain" else 400  # plain は数えるたびに prefill が走る
+        per_record = count_tokens({"messages": [{"role": "user", "content": "\n".join(records[:calib])}]}) / calib
 
         def sized(length):
             n = int(length / per_record)
-            for _ in range(6):
+            # plain は 1 回数えるたびに length 分の prefill が走るので、比例計算だけにする
+            # (レコードは均質なので誤差は 1% 未満。実際の長さは usage.prompt_tokens に残る)。
+            for _ in range(6 if BACKEND == "rapid-mlx" else 0):
                 actual = count_tokens({"messages": [{"role": "user", "content": "\n".join(records[:n])}]})
                 if abs(actual - length) <= max(16, length // 200):
                     break
@@ -275,7 +305,8 @@ def main():
             prompt = MATH[name][0] + MATH_SUFFIX if name in MATH else CODE[name][0] + CODE_SUFFIX
             return name, {"messages": [{"role": "user", "content": prompt}],
                           "max_tokens": 32768, "temperature": 1.0, "top_p": 0.95,
-                          "chat_template_kwargs": {"reasoning_effort": "max"}}
+                          # DSV4.1 は enable_thinking を明示しないと思考しない。GLM のテンプレートは無視する。
+                          "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "max"}}
         if args.concurrency == "1":
             for name in ["M4_powmod", "M1_aime06", "M2_aime99", "M3_digitsum",
                          "C1_inversions", "C2_domino", "C3_minwindow"]:
