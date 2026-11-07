@@ -14,7 +14,9 @@ def main():
                         help="Describe configuration differences from the baseline (repeatable).")
     args = parser.parse_args()
     root = args.directory
-    fixed = json.loads((root / "fixed-output-c1-c2.json").read_text())
+    # 難問セットだけのディレクトリには bench-glm53.py の結果が無い
+    fixed_path = root / "fixed-output-c1-c2.json"
+    fixed = json.loads(fixed_path.read_text()) if fixed_path.exists() else {"summary": [], "samples": []}
     waves = [json.loads(p.read_text()) for p in sorted(root.glob("*-wave.json"))]
     summary = {"fixed_output": fixed["summary"], "output_by_concurrency": [],
                "cold_prefill": [], "quality": [],
@@ -84,8 +86,27 @@ def main():
         if name in grades:
             summary["quality"][-1]["grade"] = grades[name]
     for s in waves:
-        if s["label"].startswith("quality-"):
+        if s["label"].startswith("quality-") and not s["label"].startswith("quality-hard-"):
             summary[s["label"]] = {k: v for k, v in s.items() if k != "requests"}
+    # 難問セット (--suite hard --repeats N): 問題ごとに N 回分をまとめる
+    hard = {}
+    for path in sorted(root.glob("H[MC][0-9]*-r[0-9]*.json")):
+        row = json.loads(path.read_text())
+        grade = grades.get(row["name"], row.get("grade", {}))
+        tokens = (row.get("usage") or {}).get("completion_tokens", 0)
+        h = hard.setdefault(row.get("task", row["name"]), {"runs": 0, "pass": 0, "pending": 0, "tokens": [],
+                                                           "elapsed_s": [], "decode_tok_s": [], "finish": []})
+        h["runs"] += 1
+        if "pass" in grade:
+            h["pass"] += bool(grade["pass"])
+        else:
+            h["pending"] += 1
+        h["tokens"].append(tokens)
+        h["elapsed_s"].append(round(row["elapsed_s"], 1))
+        h["decode_tok_s"].append(round(row["output_tok_s_approx_decode"] or 0, 1))
+        h["finish"].append(row["finish_reason"] or row["error"])
+    if hard:
+        summary["hard"] = hard
     retrieval = root / "retrieval-grade.json"
     if retrieval.exists():
         summary["retrieval_128k"] = json.loads(retrieval.read_text())

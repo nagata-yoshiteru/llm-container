@@ -171,6 +171,43 @@ DSpark (先読み) の当たり方で、速度が 1 割ほどぶれる。
 
 各問 1 回ずつの結果なので、正答率の誤差は大きい。7 問とも簡単すぎて、2 つのモデルの差はまだ見えていない。
 
+### 難問セット (各問 3 回、2026-11-08)
+
+`glm53_eval_tasks.py` の `HARD_MATH` / `HARD_CODE` は、過去問の暗記が効かないように新しく作った 10 問。
+正解は `scripts/verify-hard-tasks.py` が、総当たりと別解の 2 通りで計算し直して照合する。
+条件は reasoning_effort=max、enable_thinking、temperature 1.0、max_tokens 65536。
+
+結果は **30/30** (数学 18/18、コード 12/12)。30 回とも打ち切りなしで `stop` した。計 2.2 時間。
+
+| 問題 | 内容 | 正解 | 生成 tokens (3 回) | 時間 (3 回) |
+| --- | --- | --- | --- | --- |
+| HM1 | 4×10 をドミノと 2×2 で敷き詰める数 | 3/3 | 24.7K / 26.3K / 24.5K | 7.1〜7.4 分 |
+| HM2 | {1..20} の連続しない部分集合で和が 7 の倍数 | 3/3 | 13.6K / 15.5K / 13.6K | 3.3〜3.6 分 |
+| HM3 | n ≤ 10^6 で 1625 \| n²+1 | 3/3 | 4.2K / 3.5K / 2.7K | 0.7〜1.1 分 |
+| HM4 | n ≤ 10^4 で n \| 2^n+1 の和 | 3/3 | 38.2K / 40.4K / 29.2K | 8.8〜12.7 分 |
+| HM5 | 3×5 グリッドの全域木の数 | 3/3 | 10.4K / 51.2K / 39.5K | 2.6〜13.5 分 |
+| HM6 | 合計 10 以上までのサイコロの期待回数 (m+n) | 3/3 | 11.9K / 11.2K / 11.0K | 2.7〜3.1 分 |
+| HC1 | 異なる部分文字列の数 (n ≤ 2×10^5) | 3/3 | 5.2K / 3.8K / 7.5K | 1.0〜2.0 分 |
+| HC2 | 区間加算と区間二乗和 (n, q ≤ 10^5) | 3/3 | 12.6K / 12.8K / 15.8K | 3.4〜4.5 分 |
+| HC3 | 木で距離ちょうど k の頂点対 (n ≤ 2×10^4) | 3/3 | 11.6K / 14.1K / 15.4K | 3.6〜4.8 分 |
+| HC4 | [L, R] ≤ 10^18 で隣接桁が違い K の倍数 | 3/3 | 2.6K / 3.8K / 4.3K | 0.8〜1.3 分 |
+
+- コードは 12 本とも、適切なアルゴリズムを選んでいた。
+  サフィックスオートマトン、遅延伝播付きの区間木、再帰を使わない重心分解、桁 DP。
+  テストは最大でも 2 秒以内に通った。
+- decode は 53〜72 tok/s。DSpark の当たり方は問題で違い、HM2 が最も速く、HC3 が最も遅い。
+- HM5 は、同じ問題でも 10K〜51K tokens とばらついた。上限の 65536 に近い回があるので、これ以上難しい問題では max_tokens を上げる。
+- この難易度でもまだ全問正解なので、モデル間で差を出すには、さらに難しい問題が要る。
+
+```bash
+venv-vmlx/bin/python -I scripts/verify-hard-tasks.py         # 正解とテストの検証 (数秒)
+cd scripts && python3 bench-glm53-eval.py --model deepseek-v4.1-flash-uncensored --phase quality \
+    --suite hard --repeats 3 --max-tokens 65536 --concurrency 1 --output-dir ../results/dsv41-mac-hard
+# 生成コード (*-generated.py) を読んでから:
+venv-vmlx/bin/python -I scripts/run-code-tests.py --reviewed results/dsv41-mac-hard
+python3 scripts/summarize-glm53-eval.py results/dsv41-mac-hard   # summary.json の "hard"
+```
+
 ## ベンチの回し方
 
 GLM 版と同じスクリプトを使う。vmlx には `/metrics` が無いので、`bench-glm53-eval.py` はストリーミングから TTFT と decode を測る (backend `plain`)。

@@ -16,7 +16,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import uuid
 
-from glm53_eval_tasks import MATH, MATH_SUFFIX, CODE, CODE_SUFFIX
+from glm53_eval_tasks import MATH, MATH_SUFFIX, CODE, CODE_SUFFIX, HARD_MATH, HARD_CODE
+
+ALL_MATH = {**MATH, **HARD_MATH}
+ALL_CODE = {**CODE, **HARD_CODE}
 
 MODEL = "glm-5.3-flash-uncensored"
 API = "http://127.0.0.1:8910"
@@ -77,7 +80,9 @@ def post(route, body):
     return json.load(urlopen(req, timeout=600))
 
 
-def stream(name, body, route="/v1/chat/completions"):
+def stream(name, body, route="/v1/chat/completions", task=None):
+    # name: 実行ごとの名前 (結果ファイル名)。task: 採点に使う問題名 (繰り返し実行では name と違う)
+    task = task or name
     body = {"model": MODEL, "stream": True, "stream_options": {"include_usage": True}, **body}
     req = Request(API + route, json.dumps(body).encode(), {"Content-Type": "application/json"})
     start = time.perf_counter()
@@ -136,12 +141,14 @@ def stream(name, body, route="/v1/chat/completions"):
            if last is not None and last > first and tokens > 1 else None,
            "finish_reason": finish, "error": error,
            "reasoning": "".join(reasoning), "content": "".join(content)}
-    if name in MATH:
+    if task != name:
+        row["task"] = task
+    if task in ALL_MATH:
         answers = re.findall(r"\\boxed\{([^}]*)\}", row["content"])
         got = answers[-1].replace(",", "").strip() if answers else None
-        row["grade"] = {"expected": MATH[name][1], "got": got,
-                        "pass": error is None and got == MATH[name][1]}
-    elif name in CODE:
+        row["grade"] = {"expected": ALL_MATH[task][1], "got": got,
+                        "pass": error is None and got == ALL_MATH[task][1]}
+    elif task in ALL_CODE:
         blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", row["content"], re.S)
         row["grade"] = {"status": "pending code review and execution"}
         if blocks:
@@ -219,6 +226,10 @@ def main():
     parser.add_argument("--concurrency", choices=["default", "1"], default="default",
                         help="1: quality は 7 問を 1 本ずつ、profile は 1 本ずつの cold prefill だけ "
                              "(decode の 1/2 本は bench-glm53.py で測る)")
+    parser.add_argument("--suite", choices=["base", "hard"], default="base",
+                        help="quality の問題セット。hard は glm53_eval_tasks.HARD_MATH / HARD_CODE")
+    parser.add_argument("--repeats", type=int, default=1, help="--suite hard で各問を何回解かせるか")
+    parser.add_argument("--max-tokens", type=int, default=32768, help="quality の 1 回あたりの max_tokens")
     args = parser.parse_args()
     API, OUT, MODEL = args.url.rstrip("/"), args.output_dir, args.model
     metrics()  # BACKEND を判定
@@ -301,13 +312,22 @@ def main():
                          "/v1/completions") for i in range(concurrency)]
                 wave(label, jobs)
     elif args.phase == "quality":
-        def job(name):
-            prompt = MATH[name][0] + MATH_SUFFIX if name in MATH else CODE[name][0] + CODE_SUFFIX
-            return name, {"messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 32768, "temperature": 1.0, "top_p": 0.95,
-                          # DSV4.1 は enable_thinking を明示しないと思考しない。GLM のテンプレートは無視する。
-                          "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "max"}}
-        if args.concurrency == "1":
+        def job(name, run=None):
+            prompt = ALL_MATH[name][0] + MATH_SUFFIX if name in ALL_MATH else ALL_CODE[name][0] + CODE_SUFFIX
+            return run or name, {"messages": [{"role": "user", "content": prompt}],
+                                 "max_tokens": args.max_tokens, "temperature": 1.0, "top_p": 0.95,
+                                 # DSV4.1 は enable_thinking を明示しないと思考しない。GLM のテンプレートは無視する。
+                                 "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "max"}}, \
+                "/v1/chat/completions", name
+        if args.suite == "hard":
+            if args.concurrency != "1":
+                parser.error("--suite hard は --concurrency 1 で回す")
+            # 1 周ずつ全問を回す (途中で止めても各問の結果が揃うように)
+            for rep in range(args.repeats):
+                for name in [*HARD_MATH, *HARD_CODE]:
+                    run = f"{name}-r{rep}"
+                    wave(f"quality-hard-{run}", [job(name, run)])
+        elif args.concurrency == "1":
             for name in ["M4_powmod", "M1_aime06", "M2_aime99", "M3_digitsum",
                          "C1_inversions", "C2_domino", "C3_minwindow"]:
                 wave(f"quality-c1-{name}", [job(name)])
