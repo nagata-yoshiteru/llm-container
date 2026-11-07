@@ -1,418 +1,268 @@
-# DeepSeek-V4.1-Flash (EXL3 2.9bpw) on 2x DGX Spark
+# GLM-5.3-Flash UNCENSORED / MLX 4bit / Mac Studio (M5 Ultra 256GB)
 
-[deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
-を **EXL3 2.9bpw 量子化** (avg 2.9 bits/weight / codebook mul1 / head_bits=6 /
-mtp_bits=4) で DGX Spark 2 台に **TP=2** で分割して、OpenAI 互換 API を `:8910` に
-生やす構成。
+dealignai の uncensored 版 GLM-5.3-Flash を Mac Studio 1 台で動かす構成。
+[Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) を使い、OpenAI 互換と Anthropic 互換の API を `:8910` で提供する。
+モデル名は `glm-5.3-flash-uncensored`。
 
-- 分散バックエンドは **Ray ではなく `mp`** (torch.distributed SPMD)。head/worker が
-  それぞれ `vllm serve` を `--nnodes/--node-rank/--master-addr` 付きで起動する。
-- ノード間の NCCL は 200GbE QSFP 直結リンクの **RoCEv2 (RDMA)**。
-- **native DSpark speculative decoding (k=3)** — draft がチェックポイント内蔵
-  (`mtp.*` / dspark_block_size=5 / draft experts 128 top-3 / target layers 37-39)。
-  DFlash のような別 drafter も追加 DL も無い。
-- 出典レシピ: **[MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)**。
-  向こうの `start.sh` + NFS share 構成を、この repo 流の
-  「2 台ローカルに重み + docker compose + entrypoint.sh」に読み替えてある。
+DGX Spark x3 RING 版 (`DGX-Spark-3-RING/dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4` ブランチ) を
+この Mac 用に置き換えたもの。DGX 版との違いは次の表のとおり。
 
-## Vision-Exp ブランチから変わったところ
+| | DGX Spark x3 RING (前ブランチ) | Mac Studio (ここ) |
+| --- | --- | --- |
+| 重み | `dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4` (W4A16 NVFP4) | `Solstice-AI/GLM-5.3-Flash-UNCENSORED-mlx-oQ4e-DFlash2` (MLX 4bit) |
+| ランタイム | kindling (vLLM nightly) + mentat、TP=3 | Rapid-MLX 1.0.2 (MLX / mlx-vlm)、1 プロセス |
+| 起動 | `sudo docker compose --profile ...` | `./scripts/serve.sh up` (Docker は使わない) |
+| MTP | k=3 | **無効** (下記) |
+| コンテキスト | 524288 (1M は未検証) | **262144** (1M は未検証) |
+| 同時実行 | 8 | 実質 1 (vision レーンは直列、下記) |
 
-| | Vision-Exp (前ブランチ) | V4.1-Flash (ここ) |
-|---|---|---|
-| 重み | FP8+FP4 ネイティブ 168GB | **EXL3 2.9bpw 197GiB + Engram 190GiB** |
-| イメージ | 上流 `vllm/vllm-openai` pre-release + **ランタイム hotfix 40 個** | `ghcr.io/miaai-lab/deepseek-v4.1-flash-exl3-2x-dgx-sparks` (**overlay 焼き込み済み**) |
-| FlashInfer ブロッカ | SM120 sparse-MLA 1152 幅が無くて上流構成はブロック | overlay の `patch_sm120_block64.py` が **max_image_tokens=0 に pin** して回避 |
-| KV | `--kv-cache-dtype fp8` + `--block-size 256` を手動指定 | **渡さない** (CSA2 自動選択 / `--block-size 64` が必須側) |
-| DSpark | k=3 probabilistic + adaptive=false | k=3 (method=dspark のみ。k の天井 5、実測 3 が最速) |
-| コンテキスト | 1M 張り付き (実際は KV が持たない) | **600K 検証済み** (614,400 が実測天井 / 2.5GiB で 774,400 tok) |
-| 精度 | ネイティブ | 3bit 級量子化。**量子化誤差は気にしない運用** (本体の指示) |
+2026-11-07 に M5 Ultra 256GB / macOS 27.2 で、取得・準備・起動・応答まで確認した。
+単発の decode は約 38.5 tok/s。
+OpenAI 互換・Anthropic 互換・tool call・思考の分離が動くことも確認した。
+**品質 (uncensored の度合い、ベンチ) と長いコンテキストは未検証。**
 
-Vision-Exp 時代までに `patches/` に移植していた hotfix 群は V4.1 では使わない
-(イメージ側に同等の修正が入っている)。`patches/` と `presets/` は前のブランチの
-遺産として残してあるだけなので、この構成では引き合いに出さないこと。
+**取得した重みは、そのままでは正しく動かない。**
+`./scripts/prepare-model.sh` で直した serving ディレクトリを使う (下記「そのままでは動かない 3 点」)。
 
-## 重み (2 種 / 両ノードに)
+## 起動・停止
 
-| 置き場 | HF repo | 中身 | サイズ |
-|---|---|---|---|
-| `MODEL_PATH` (`./models/DeepSeek-V4.1-Flash-EXL3-2.9bpw`) | `Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw` | EXL3 39 shard + config + k_map | 約 197 GiB |
-| `ENGRAM_PATH` (`./models/DeepSeek-V4.1-Flash-engram`) | `deepseek-ai/DeepSeek-V4.1-Flash` の **shard 47+48 + index + config.json のみ** | layers 1/14 の n-gram 埋込 (FP8 rows) | 約 190 GiB |
+```bash
+./scripts/serve.sh up       # 起動。/health が返るまで待つ (ロードに数分)
+./scripts/serve.sh logs     # ログ (.cache/rapid-mlx/logs/serve.log)
+./scripts/serve.sh status   # /health と /v1/models
+./scripts/serve.sh down     # 停止
+```
 
-**Engram テーブルだけは量子化されない。** EXL3 ツリーに入っていないので、
-ネイティブチェックポイントから `--hf-overrides {"engram_table_dir":...}` で別途
-教える。ネイティブ 48 shard / 476GiB 全部は要らない (47+48 だけ / 約 95GiB×2)。
+`up` の前に、再起動のたびに wired メモリの上限を引き上げる (後述)。
 
-- rows は FP8 (`fp8_e4m3fn`)。uint8 として読むと Fluent な garbage が出る
-  (prepare-engram-src.py が作る slim index はその対策込み)。
-- 既にネイティブ checkout を持っている人は `NATIVE_SRC=<path> ./scripts/fetch-model.sh engram`
-  で 190GiB の DL をスキップできる。
-- 上流には「Engram を NVMe に per-rank pack すると prefill が 25-50% 速くなる
-  (`./start.sh pack`)」もあるが、**この repo では未移植** (起動には不要)。
+```bash
+sudo sysctl iogpu.wired_limit_mb=245760
+```
 
-## メモリ予算 (1 台 / 121.7 GiB unified)
+```bash
+curl -fsS http://127.0.0.1:8910/v1/models
+curl -s http://127.0.0.1:8910/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "glm-5.3-flash-uncensored",
+  "messages": [{"role": "user", "content": "What is 17*19? Reply with the integer only."}],
+  "max_tokens": 8000}'
+```
 
-GB10 は host RAM が GPU メモリなので、すべての cudaMalloc が即 host 実メモリの
-commit になる。上流実測 (2026-09-12/13):
+デバッグ時は `./scripts/serve.sh fg` でフォアグラウンド起動する。
+
+## 新規ホストでの準備
+
+```bash
+cp .env.example .env        # 既定値のままでよい。.env が無くても既定値で動く
+# uv が無ければ: curl -LsSf https://astral.sh/uv/install.sh | sh
+./scripts/setup.sh          # ./venv に Python 3.12 + rapid-mlx==1.0.2
+./scripts/fetch-model.sh    # ./models/ に約 186GB (100MB/s 程度で約 30 分)
+./scripts/prepare-model.sh  # mlx-vlm 用の serving ディレクトリを作る (数秒、追加 70MB)
+sudo sysctl iogpu.wired_limit_mb=245760
+./scripts/preflight.sh
+```
+
+- `prepare-model.sh` は `MODEL_PATH` (取得したもの) から `SERVE_MODEL_PATH` (既定 `MODEL_PATH-mlxvlm`) を作る。
+  shard は hardlink で、元のファイルは変更しない。同じディレクトリへの再実行は検証だけ行う。
+
+- macOS 同梱の `python3` は 3.9 で、Rapid-MLX (3.12 以上が必要) は動かない。venv は uv で作る。
+- **Docker は使わない。** macOS の Docker コンテナから Metal GPU は使えないため。
+- setup と取得に sudo は不要。sudo が要るのは `sysctl` だけ。
+- `.env` は compose 時代と同じ `KEY=VALUE` (クォートなし) の書式。
+  スクリプトは `source` せず、必要なキーだけ読む (`scripts/env.sh`)。
+
+## 構成と重み
+
+### なぜ NVFP4 版ではないのか
+
+DGX 版で使っていた `dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4` は modelopt の NVFP4 (CUDA 専用) なので、MLX では読めない。
+dealignai は MLX 版を出していない。
+そこで、同じ dealignai の uncensored 重み (FP8 版、328GB) を Solstice-AI が MLX に変換したものを使う。
+
+| 項目 | 値 |
+| --- | --- |
+| repo | `Solstice-AI/GLM-5.3-Flash-UNCENSORED-mlx-oQ4e-DFlash2` |
+| revision | `bff40d24efb689d33e094083ce4a5d6835601730` で固定 (`.env` の `MODEL_REVISION`) |
+| 量子化 | 4-bit affine / group 64 (~4.6 bpw)。lm_head・router・gate は 8bit、attention の一部は 6/8bit (543 箇所を個別指定) |
+| 形式 | `model_type: glm5_next` (vision tower 込み)、safetensors 38 shard / 185.7GB |
+| 取得しないもの | `mmproj-BF16.gguf`、`speculative/*.gguf` (llama.cpp 用、計 3.5GB) |
+
+8bit 版 (oQ8e) は 342GB あり、256GB 機には入らない。
+
+注意点が 2 つある。
+
+- dealignai の FP8 版は 2026-08-28 に「files fixed · please re-download」として再公開されている (まれに繰り返しループに入る問題の修正)。
+  Solstice 版がどちらの重みから変換したかは明記されていない。
+- uncensored としての性能 (HarmBench の拒否率 0%) は dealignai と Solstice の自己申告。
+  MMLU も dealignai は 87.33%、Solstice は 85.28% と食い違っている。品質は起動後に自分で確認すること。
+
+重みの値そのものは正しい。dealignai FP8 版の shard 1・2・31・32 と全テンソルを突き合わせた結果は次のとおり。
+
+- BF16 / FP8 由来の 8bit・6bit: cos 0.9997〜1.0000
+- 4bit の expert: cos 0.9957 (4bit なら妥当)
+
+### そのままでは動かない 3 点 (`prepare-model.sh` が直す)
+
+Solstice のモデルカードの手順 (mlx-lm で読む) は、mlx-lm に `glm5_next` が無いのでそもそも動かない。
+mlx-vlm で読むと、次の 3 点で壊れる。いずれも 2026-11-07 に実機で確認した。
+
+| # | 症状 | 原因 | 直し方 |
+| --- | --- | --- | --- |
+| 1 | ロード時に `[concatenate] ... (8192,768), (8192,1024), (8192,768)` | config の個別量子化キーが `model.language_model.layers.N.*` で、mlx-vlm が引く `language_model.model.layers.N.*` と一致しない。加えて mlx-vlm は q/k/v などを連結するが、同じ層の中でビット数が混在している (例: layer 20 は q=6bit、k=8bit) | モジュールパス名のキーと、連結後の名前 (`qkv_proj`、`fbg_a_proj`、`qkv_a_proj`、`gate_up_proj`、`embed_q`、`unembed_out`) のキーを config に追加する。混在している 2 個は 6bit から 8bit に再量子化する (相対誤差 0.7%) |
+| 2 | 起動するが、出力が完全に文字化けする (GPU だけ。CPU では正しく答える) | 元版では float32 の `hc_*_base` / `hc_*_scale` が BF16 で保存されている。mlx-vlm の HyperConnection の Metal カーネルは base を float4 として読むため、Sinkhorn の混合行列 (comb) が壊れる (単体テストで cos 0.95)。それが 45 層×2 回積み重なる | 該当するテンソルを float32 に戻す。同じく本来 float32 の `A_log`、`dt_bias`、`e_score_correction_bias` も戻す (計 291 個)。BF16 からの upcast なので、値は BF16 精度のまま |
+| 3 | 毎回、独自の長いシステムプロンプトが注入される | chat template が Solstice 独自の「Protium」テンプレートに差し替えられている | dealignai 版の `chat_template.jinja` (revision 固定) を使い、`tokenizer_config.json` に埋め込まれたテンプレートを削除する |
+
+直したテンソルは追加の shard (`model-zz-mlxvlm-fixup.safetensors`、69MB) に入れる。
+mlx-vlm は index にある shard を名前順に読み、同じキーは後から読んだもので上書きする。
+この仕組みを使うので、元の 38 shard には手を入れない。
+処理内容と、使った mlx-vlm / rapid-mlx のバージョンは `mlxvlm-preparation.json` に残る。
+mlx-vlm のバージョンを上げたら、serving ディレクトリを消して作り直すこと。
+
+### なぜ Rapid-MLX なのか
+
+`glm5_next` のローダーは、2026-11 時点で mlx-lm には無く、mlx-vlm にだけある。
+Rapid-MLX は mlx-vlm の上に、GLM-5.3 用に次のものを載せている。
+
+- ランタイム修正: `patches/glm5_next_runtime.py`、`glm5_next_forget_gate_quant.py`
+- tool parser `glm47` と reasoning parser `glm5`
+- Anthropic Messages API (`/v1/messages`)
+
+Claude Code からそのまま使えるのが、このランタイムを選んだ一番の理由。
+
+- 起動フラグはすべて `scripts/entrypoint.sh` で組み立てる。
+  DGX 版の entrypoint と同じく、まずモデルを検証してから `exec` する。
+- ローカルパスでは parser を名前から推定できないことがある。そのため `--tool-call-parser glm47 --reasoning-parser glm5` を明示している。
+- `--disable-model-downloads` と `HF_HUB_OFFLINE=1` を付けて、起動時に HF へ取りに行かせない。
+  あわせて `DO_NOT_TRACK=1` で利用統計の送信を止め、更新チェックも切る。
+- `--text-only` は付けない。テキスト専用の経路は mlx-lm を使うため、`glm5_next` を読めない。
+
+### MTP / 投機的デコードは既定で無効
+
+Rapid-MLX の公式 alias (`glm5.3-flash-4bit`) は MTP k=1 を使う。
+ただし対象は別の重み (Vontra/TensorFold の 4bit、検閲あり) で、MTP には専用の sidecar を使う。
+uncensored 版にその sidecar を組み合わせた例は見つからなかった。
+そのため `SPEC_DECODE=0` (`--no-spec-decode`) とした。
+Solstice の DFlash2 drafter は GGUF なので、Rapid-MLX では使えない。
+
+## メモリ (256GB unified)
+
+MLX が GPU 用に wired にできる上限は `iogpu.wired_limit_mb` で決まる。
+既定値 (0) では 256GB 機で約 75% (192GiB 前後) にしかならない。
+重みだけで 173GiB あるので、KV と活性化まで入れるには足りない。
 
 | 内訳 | 量 |
-|---|---|
-| EXL3 重み (resident / rank) | 約 99.5 GiB |
-| KV プール (2.5GiB 固定) | 2.5 GiB |
-| CUDA context + NCCL + graphs | 5〜7 GiB |
-| vLLM プロセス / OS / docker | 約 9 GiB |
-| **稼働後の MemAvailable** | **3.7〜4.7 GiB** |
+| --- | --- |
+| 重み (oQ4e) | 185.7GB = 173GiB |
+| wired 上限 (`WIRED_LIMIT_MB`) | 245760MiB = 240GiB (OS に 16GiB を残す) |
+| 参考: Rapid-MLX 公式 alias の実測 (別の 4bit 重み、M3 Ultra) | 重み 181.7GB、32K でピーク 195.6GB |
+| 実測: 起動直後・短いリクエストのあと (M5 Ultra) | 空き (free + inactive + purgeable) 約 74GiB、swap 0.6GB |
 
-- 600K の 1 リクエストが約 2.0GiB。2.5GiB プールは 774,400 トークン (1.26 倍)。
-- 601K prefill 直後の low-water は head で 2.1GiB。これを超える構成
-  (MAX_NUM_SEQS を増やす / batched tokens を上げる) は上流未検証。
-- 常時 3〜4GiB しか遊ばないので、**起動前に他のワークロードを止めるのが最大の対策**。
-  compose 両コンテナに `oom_score_adj: 1000` を付けているのは、kernel OOM 時に
-  デスクトップ側ではなく vLLM を選ばせるため (2026-09-11 に両ノード wedge 事故の実例)。
-- 上流の memguard watchdog (`DSV41_MEM_GUARD`) は既定 off。常時運用では必要なかった
-  とのことなので、この repo でも移植していない。
+- 起動時に Rapid-MLX が「Memory pressure warning: ... 111% projected utilization」と警告する。
+  これは「ディスク上のサイズ × 1.5」という機械的な見積もりによるもので、実測とは合わない。
+  長いコンテキストでの実測は、まだしていない。
+- 240GiB という値は経験則 (OS 分を 8〜16GiB 残す) から決めたもので、上流の推奨値ではない。
+  macOS が固まる・swap が増えるなら下げる。
+- `sysctl` は再起動すると元に戻る。`entrypoint.sh` と `preflight.sh` は、値が足りなければ起動を止める。
+- KV の 1 トークンあたりの量は実測していない。
+  config から見積もると、DSA 層 11 層 × (latent 512 + indexer 128) × bf16 で約 14KB/token になる。
+  256K で約 3.5GiB、1M で約 13GiB。残りの 34 層は KDA (線形 attention) で、状態のサイズはトークン数によらず一定。
+  **DGX 版の README と同じく、見積もりは外れる前提で、起動後に確認すること。**
+- `--kv-cache-dtype int8/int4` は、Rapid-MLX が MLA 系のモデルには拒否する仕様になっている。
+  GLM-5.3 が該当するかは未確認なので、`KV_CACHE_DTYPE` は空 (bf16) のままにしてある。
+- prefix cache は Rapid-MLX の既定で有効。上限 `CACHE_MEMORY_MB` は空なら自動 (空き RAM の約 20%)。
 
----
+## 調整ノブ (`.env`)
 
-## Docker は rootful を使う
+| キー | 既定 | メモ |
+| --- | --- | --- |
+| `MAX_MODEL_LEN` | 262144 | `--context-length`。モデルの上限は 1048576。上げるならメモリと TTFT を実測してから |
+| `MAX_NUM_SEQS` | 4 | 受け付ける同時実行数。ただし vision 込みのモデルは Rapid-MLX が直列に処理する (`/v1/models` の `concurrent_text_requests: false`) |
+| `PREFILL_STEP_SIZE` | 1024 | 公式 alias の推奨値。大きくすると速いが、活性化メモリが増える |
+| `DEFAULT_REASONING_EFFORT` | 空 | 空ならテンプレートの既定 (Max)。`none` / `minimal` / `low` / `medium` / `high` / `xhigh` |
+| `SPEC_DECODE` | 0 | 1 にすると Rapid-MLX の自動判定に任せる (未検証) |
+| `API_HOST` / `API_KEY` | 127.0.0.1 / 空 | LAN に出すなら `API_HOST=0.0.0.0` と `API_KEY` を設定する。キーなしの公開バインドは Rapid-MLX が拒否する |
+| `WIRED_LIMIT_MB` | 245760 | 上記 |
+| `RAPID_MLX_EXTRA_ARGS` | 空 | 空白区切りで追加する。JSON に空白を入れないこと |
 
-この構成は `--device /dev/infiniband` / `memlock unlimited` / host network での RDMA が
-必要なので、**rootless では動かない**。この repo の docker コマンドは全部 `sudo` を付ける。
+reasoning effort について、dealignai のモデルカードには次の注意がある。
 
-```bash
-docker  ...        # rootless (このホストのデフォルト) -- 使わない
-sudo docker ...    # rootful  -- こっちを使う
-```
-
-`sudo docker compose` はカレントディレクトリの `.env` をそのまま読む。ただし
-**`.env` の中で `${HOME}` などのシェル変数は使えない** (sudo で `HOME=/root` になるため)。
-`MODEL_PATH` / `ENGRAM_PATH` は repo 相対 (`./models/...`) か絶対パスで書くこと。
-
-### rootful daemon に nvidia ランタイムを登録する (最初に 1 回)
-
-rootless 側 (`~/.config/docker/daemon.json`) に nvidia ランタイムが登録してあっても、
-**rootful 側 (`/etc/docker/daemon.json`) には効かない**。未登録のまま起動すると
-コンテナ内で NVML が初期化できず、vLLM が起動直後に
-`RuntimeError: Failed to infer device type` で死ぬ。
-
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-ssh -t "$WORKER_MGMT" 'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker'
-```
-
-確認 (**これが通るまで vLLM を起動しない**):
-
-```bash
-sudo docker info | grep -i runtimes          # nvidia が出ること
-
-IMAGE=$(sed -n 's/^VLLM_IMAGE=//p' .env)
-sudo docker run --rm --gpus all \
-  --device /dev/nvidia0 --device /dev/nvidiactl \
-  --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools \
-  "$IMAGE" nvidia-smi                        # GB10 が出ること
-```
-
-#### `--device` を明示している理由
-
-`/etc/nvidia-container-runtime/config.toml` に **`no-cgroups = true`** が入っていると、
-`--gpus all` だけでは GPU が使えない。これは rootless docker で GPU を使うための
-必須設定だが、rootful では nvidia-container-cli が **device cgroup の許可リストを
-更新しなくなる**ため。compose の `devices:` で /dev/nvidia* を明示して通す。
-`no-cgroups = false` にすると rootless 側の GPU が壊れるので設定は触らない。
-それでもダメなときは `x-vllm-service` に `privileged: true` を足す。
-
----
-
-## セットアップ
-
-### 0. repo と .env を 2 台に配る
-
-```bash
-cp .env.example .env
-$EDITOR .env      # HEAD_ROCE_IP / WORKER_ROCE_IP / MODEL_PATH / ENGRAM_PATH を実機に合わせる
-
-# worker へ同期 (2 台とも .env の中身は同じでよい。役割は --profile で切り替える)
-rsync -av --exclude .git --exclude models --exclude vllm-cache ./ "$WORKER:~/repos/llm-container/"
-```
-
-`HEAD_ROCE_IP` / `WORKER_ROCE_IP` / `IB_HCA_NAME` / `NCCL_IB_GID_INDEX` は実機で確認:
-
-```bash
-ip -br addr show enp1s0f0np0     # QSFP 側の IPv4
-show_gids                        # その IPv4 が載っている行の DEV 名 と INDEX (RoCE v2 の方)
-```
-
-> 出典レシピの機体は **spark1 の f1 ↔ spark2 の f0** のピン配線だった。
-> 直結で同じポートを向いているなら `WORKER_ROCE_IF_NAME` 等は不要。
-> NCCL は link-local (169.254.x.x) の alias を通せないことがあるので、静的 IP を
-> 振るか、変わっていたら preflight で検出して直しておく。
-
-### 1. 重みを取得 (2 台とも / 各 約 387 GiB)
-
-```bash
-./scripts/fetch-model.sh                 # EXL3 (197GiB) + Engram (190GiB)
-ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/fetch-model.sh'
-```
-
-- resumable。切れたら同じコマンドの再続行で OK。
-- 区切り取得したいときは `./scripts/fetch-model.sh exl3` / `... engram`。
-- 保存先は `.env` の `MODEL_PATH` / `ENGRAM_PATH`。
-  `hf` が無ければ `pip install -U 'huggingface_hub[cli,hf_transfer]'`。
-
-### 2. イメージを取得 (2 台とも / 約 14GB) — **rootful**
-
-digest 固定。`ghcr.io/miaai-lab/deepseek-v4.1-flash-exl3-2x-dgx-sparks:2.9bpw`
-(= `vllm/vllm-openai:deepseekv41-flash-0909` + ExLlamaV3 v1.4.5 overlay)。
-public / ログイン不要。
-
-```bash
-IMAGE=$(sed -n 's/^VLLM_IMAGE=//p' .env)
-sudo docker pull "$IMAGE"
-ssh -t "$WORKER" "cd ~/repos/llm-container && sudo docker pull \$(sed -n 's/^VLLM_IMAGE=//p' .env)"
-```
-
-> **必ず起動前に pull しておくこと。** 片方が pull 中に rendezvous が始まると
-> ハンドシェイクごと固まる (上流は `IMAGE_SHIP=rsync` で head から配るが、
-> ここでは 2 台とも直接 pull する)。
-
-### 3. メモリを空ける (2 台とも)
-
-重み ~99.5GiB + KV 2.5GiB + ランタイム ~16GiB。`MemAvailable` が **110GiB 以上**
-無ければ起動手順に入らない。GB10 の UVM は一度確保されると完全には返らないので、
-迷ったら再起動が一番確実。
-
-```bash
-docker ps && docker stats --no-stream
-docker stop <他のコンテナ>
-sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
-sudo sysctl -w vm.swappiness=10
-```
-
-### 4. MTU を 9000 に上げる (任意だが推奨 / 一度やれば済む)
-
-QSFP の Ethernet MTU が既定 1500 だと RoCE path MTU が 1024 に落ちる。9000 に上げると
-HCA 上限の 4096 まで上がる。永続化は netplan (`/etc/netplan/40-cx7.yaml` に `mtu: 9000`)。
-手順の詳細は git 履歴の Vision-Exp 版 README §セットアップ4 と同じ。
-
-```bash
-sudo ip link set dev enp1s0f0np0 mtu 9000                # まず一時変更で試す
-ssh -t "$WORKER_MGMT" 'sudo ip link set dev enp1s0f0np0 mtu 9000'
-ibv_devinfo -d rocep1s0f0 | grep active_mtu              # 4096 (5) になっていれば OK
-ping -M do -s 8972 -c 3 "$WORKER"
-```
-
-> **SSH は `$WORKER_MGMT` 経由で。** QSFP 側から入っていると接続が切れる。
-> 確定は `sudo netplan try` (ミスっても 120 秒で revert)。
-
-### 5. preflight
-
-```bash
-./scripts/preflight.sh                                         # head
-ssh "$WORKER" 'cd ~/repos/llm-container && ./scripts/preflight.sh'
-```
-
-NG が出ている状態で起動しても、5〜10 分待たされてから NCCL エラーか OOM-kill で死ぬだけ。
-
----
-
-## 起動
-
-**worker を先に、head を後に。** head が rendezvous の master になるので、worker が先に
-待ち受けている状態にしてから head を上げる。
-
-```bash
-# --- worker ---
-ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose --profile worker up -d'
-
-# --- head ---
-sudo docker compose --profile head up -d
-sudo docker logs -f dsv41-head
-```
-
-EXL3 の GEMM shape は CUDA graph capture 前に全部 autotune される (130 launch / 約 3 秒)。
-初回ブートは JIT 込みで 10〜20 分、2 回目以降は `vllm-cache/` が効く。
-`Application startup complete` が出れば完了。
-
-> 上流は「head のログが 420 秒黙ったら両 rank の py-spy を叩く」hang detector を
-> 持っているが、この repo では未移植。怪しいときは手で:
-> `sudo docker exec dsv41-head py-spy dump --native <pid>`
-
-### 確認
-
-```bash
-curl -s http://127.0.0.1:8910/health
-curl -s http://127.0.0.1:8910/v1/models | python3 -m json.tool
-
-# smoke: thinking を落として 17*19。期待値は "323"
-curl -s http://127.0.0.1:8910/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-v4.1-flash",
-       "messages":[{"role":"user","content":"What is 17*19? Reply with the integer only."}],
-       "max_tokens":32,"temperature":0,
-       "chat_template_kwargs":{"enable_thinking":false}}'
-```
-
-> **コールドスタート後の最初の 1 発はタイムアウトすることがある。** 新しい prompt
-> shape に対するウォームアップで異常ではない。投げ直せば通る。
-> thinking を入れた通常の応答は公式既定 **temperature=1.0 / top_p=0.95**。
-
-### 停止
-
-```bash
-sudo docker compose --profile head down
-ssh -t "$WORKER" 'cd ~/repos/llm-container && sudo docker compose --profile worker down'
-```
-
-コンテナを落としても UVM は完全には解放されない。別の構成に切り替えるときは
-**両ノードを再起動してから**始めること。
-
----
+- 拒否がほぼ 0 になるのは reasoning off と max のとき。low では拒否が一部残るよう、意図的に作られている。
+- max で `max_tokens` が小さい (2000 程度) と、思考だけで予算を使い切り、content が空になる。
+  6000 以上を推奨。
+- テンプレートには `enable_thinking` という変数が無い。
 
 ## 使う
 
-`network_mode: host` なので、head に届くアドレスならどれでも叩ける。
-
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://<head>:8910/v1", api_key="local")
+client = OpenAI(base_url="http://127.0.0.1:8910/v1", api_key="local")
 r = client.chat.completions.create(
-    model="deepseek-v4.1-flash-exl3",       # deepseek-v4.1-flash でも通る
+    model="glm-5.3-flash-uncensored",
     messages=[{"role": "user", "content": "..."}],
-    temperature=1.0, top_p=0.95,            # 公式既定
+    max_tokens=8000,
 )
-r.choices[0].message.reasoning              # thinking はここ (content には混ざらない)
 ```
 
-### thinking / reasoning effort
-
-- **thinking は既定 ON。** 消すときは `chat_template_kwargs: {"enable_thinking": false}`。
-- effort は `chat_template_kwargs.reasoning_effort` で渡す。**既定 "high"**。
-  取りうる値: `low`(=50) / `high`(=75) / `max`(=100) / 1〜100 の整数。
-- chat template はイメージ側の `files/chat_template.jinja`
-  (DeepSeek 純正 `encoding.py` の移植) が読まれる。
-
-### 画像
-
-EXL3 チェックポイントは vision tower を持つ (CED 20+20 / CSA2 / Engram L1,L14 /
-vision tower / native DSpark)。既定は ON (`LANGUAGE_MODEL_ONLY=0`) で、
-`LIMIT_MM={"image":100}` / `MAX_NUM_BATCHED_TOKENS >= 1536` が条件。
-
-ただし **SM12x では overlay が `max_image_tokens` を 0 に pin する**。
-FlashInfer の SM120 sparse-MLA prefill に 1152 幅 (SWA128 + 画像 1024) のカーネルが
-無く、 widened パスは guarded branch で通さない設計。つまり画像は通るが
-**双方向可視性は入っていない**。上流の実測では OCR・複数画像の属性精度への影響は
-nil だったが、ネイティブとの parity probe は無い。**dense な文書タスクは自分で
-検証してから信用すること。** text-only で動かすなら `LANGUAGE_MODEL_ONLY=1`
-(MAX_NUM_BATCHED_TOKENS も 1024 に下げてよい)。
-
-### Anthropic 互換 (`/v1/messages`) — Claude Code から使う
-
-vLLM は Anthropic Messages API も生やすので、変換プロキシなしで Claude Code を
-直結できる。`scripts/local-llm-on.sh` / `local-llm-off.sh` が設定ファイルを差し替える。
+Claude Code から使うときは `scripts/local-llm-on.sh` / `local-llm-off.sh` で設定ファイルを切り替える。
+Anthropic 互換のベース URL は `/v1` を付けない `http://localhost:8910` にする。
 
 ```jsonc
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8910",
     "ANTHROPIC_AUTH_TOKEN": "local",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "deepseek-v4.1-flash",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4.1-flash",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "deepseek-v4.1-flash"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "glm-5.3-flash-uncensored",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3-flash-uncensored",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "glm-5.3-flash-uncensored"
   }
 }
 ```
 
-### ストリーミング時の注意
+## 速度
 
-reasoning から content へ切り替わるデルタは **両方のフィールドを同時に持つ**。
-片方だけ拾うともう片方が落ちる (`elif` にしない)。
+2026-11-07、M5 Ultra 256GB、`scripts/bench-glm53.py` (256 tokens、temperature=0、reasoning_effort=max、各 3 回) で測った。
+結果は `results/glm53-mac-oq4e.json` (git 管理外)。
 
-```python
-rc, cc = delta.get("reasoning"), delta.get("content")
-if rc: reasoning.append(rc)
-if cc: content.append(cc)
-```
+| 条件 | decode |
+| --- | --- |
+| 1 本 (prose / code) | 37.4〜39.0 tok/s (平均 約 38.5) |
+| 2 本同時 | 1 本は 38.8、もう 1 本は 19.3 tok/s。合計は伸びない (直列に処理される) |
 
-### 状態を見る
+- スモークテストでは、思考なしの短い応答が 1〜3 秒で返った。
+  tool call (`glm47`)、思考の分離 (`reasoning` / Anthropic の `thinking` ブロック)、`/v1/messages` も動いた。
+- prefill (TTFT) と長いコンテキストは未計測。
+  参考値として、Rapid-MLX 公式 alias は M3 Ultra で 8K の TTFT が 22.8 秒 (およそ 360 tok/s)。
+  長い入力を投げるときは、クライアントのタイムアウトを伸ばすこと。
+
+参考 (別の重み):
+
+| 出典 | 重み | 機体 | decode |
+| --- | --- | --- | --- |
+| Rapid-MLX 公式 alias | Vontra 4bit + MTP | M3 Ultra 256GB | 27.8 tok/s |
+| omlx.ai (llmcheck 経由) | pipenetwork の mixed 4/8bit | M5 Ultra 256GB | 61.7 tok/s (1K) / 58.1 tok/s (64K)、MTP なし |
+
+## 検証とベンチ
+
+DGX 版のベンチスクリプトは、`:8910` と `glm-5.3-flash-uncensored` を前提にしているので、そのまま使える。
+`bench-glm53.py` は実行を確認した。`bench-glm53-eval.py` と `bench-glm53-long-context.py` はまだ試していない。
 
 ```bash
-curl -s http://127.0.0.1:8910/metrics | grep -E '^vllm:(kv_cache_usage_perc|num_requests)'
-sudo docker logs -f dsv41-head
+python3 scripts/bench-glm53.py --label mac-oq4e --output results/glm53-mac-oq4e.json
+python3 scripts/bench-glm53-eval.py --phase quality --output-dir results/glm53-mac-oq4e-quality
+# long-context は既定が 1M 入力と DGX の IP なので、引数で上書きする
+python3 scripts/bench-glm53-long-context.py --input-tokens 200000 --concurrencies 1 --memory-hosts
 ```
 
-イメージ内の overlay は `[dsv41-mem]` 行でフェーズごとのメモリをログに出す。
-prefill 前後の MemAvailable 減少をこの行で追うと予算管理が楽。
+## このブランチで消したもの
 
----
-
-## コンテキストと調整ノブ
-
-**`presets/` は Vision-Exp / 0731 時代のもので、この構成には適用しないこと。**
-KV を手で大きくする系譜が異なり、`--kv-cache-dtype` を入れると壊れる。
-
-| ノブ | 既定 | 動かすとき |
-|---|---|---|
-| `MAX_MODEL_LEN` | 600000 | 天井 614,400 (実測)。短くするのは自由。KV プール (2.5GiB=774,400 tok) に注意 |
-| `MAX_NUM_SEQS` | 2 | 上流検証済みは 2 まで。**4 ストリームのバッチ運用なら DSpark を外す方が速い** (集計 54 vs 42 t/s) |
-| `MAX_NUM_BATCHED_TOKENS` | 1536 | vision ON の下限 1536 (=画像 1024+1)。`LANGUAGE_MODEL_ONLY=1` なら 1024 可。上流のエージェント向けプロファイルは 1536/96 |
-| `GPU_MEMORY_UTILIZATION` | 0.88 | KV を固定している今は起動時 sanity check 相当 (0.92 は 20MB 足りて失敗した実例あり) |
-| DSpark k | 3 | 天井 5 だが散文実測で k=3 > k=5 > なし (28/25/23 t/s)。`.env` の `VLLM_EXTRA_ARGS` 内の `num_speculative_tokens` を編集。外すと ~3.5GiB 空く |
-| `DSV41_IO_THREADS` | 96 | Engram ランダム行読みのスレッド。host CPU 圧を優先するなら 32 |
-| `KV プール` | 2.5GiB | `VLLM_KV_ARGS` の `--kv-cache-memory-bytes`。1GiB (658K tok) まで落とすと 4x128K がちょうど載る |
-| `DSV41_CACHE_GIB` / `DSV41_RESIDENT_SCALES` | 0 (off) | Engram 行キャッシュ。**rows の再利用はほぼ 0% という実測なので既定 off**。上げるなら MemAvailable の実測余裕があるときだけ |
-| `LONG_PREFILL_TOKEN_THRESHOLD` | off | 入れるなら `MAX_NUM_BATCHED_TOKENS - THRESHOLD >= 256` |
-
-### QSFP を 2 枚使う (dual-HCA) — 帯域がほぼ倍
-
-GB10 の QSFP ケージは PCIe x4 が 2 本で 2 枚の独立 NIC に見える。1 枚しか設定しないと
-帯域を半分捨てる。手順 (netplan / MTU / 確認) は git 履歴の Vision-Exp 版 README の
-「QSFP を 2 枚使う」がそのまま使える。注意点は共通:
-
-```
-.env: IB_HCA_NAME=rocep1s0f0,roceP2p1s0f0
-      ROCE_IF_NAME=enp1s0f0np0,enP2p1s0f0np0
-      NCCL_IB_MERGE_NICS=1 / NCCL_CROSS_NIC=1
-      ★NCCL_IB_GID_INDEX は必ず空にする (index がずれると無言ハング)
-```
-
-### cooperative MoE (上流の拡張 / ここでは未有効化)
-
-上流には decode 向けの cooperative MoE 専用経路がある (decode +25〜35%、非 bit-exact)。
-`DSV41_COOPERATIVE_MOE=1` + `EXL3_OVERLAY_HOST` + `extensions/.../cooperative_moe.so`
-(binary pin あり) が必要で、既定 off のオプション。やる気になったら上流 repo を読むこと。
-
----
-
-## ハマりどころ
-
-- **`--kv-cache-dtype` を渡さない。** fp8_ds_mla/GLM 式の手指定は NG。CSA2 が自動選択。
-  (`--block-size 64` 側は逆に必須。SM12x の paged indexer kernel が 32/64 のみで、
-  128 は ratio-1 indexer 層の最初の decode で死ぬ)
-- **Engram が無いと「動く」。** マウント抜けは entrypoint が fail-closed で弾くが、
-  別モデルの engram ディレクトリを指しているとFluentな garbage が返る。
-  rows が fp8_e4m3fn として解釈されていること (`prepare-engram-src.py` の slim index) を確認。
-- **exllamav3 は lock buffer が 1 device 1 個。** `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`
-  と `DSV41_EXL3_SERIAL_STREAMS=1` を切るとクロスストリームの EXL3 GEMM で
-  デッドロックする (上流 boot 11-14)。速そうでも戻さないこと。
-- **page cache が RAM を食って見える。** EXL3 の mmap ロード後は page cache を
-  捨てないと MemAvailable 9GiB あっても NVRM が OOM する (GB10 ドライバは MemFree から
-  取る)。`DSV41_DROP_PAGE_CACHE=1` がその対策で既定 on。
-- **JSON に空白を入れると死ぬ。** `VLLM_*_ARGS` は空白で分割して `vllm serve` に渡す。
-  `--hf-overrides {"engram_table_dir":"/models/..."} `は末尾空白に注意。
-- **NCCL が 10.0.0.x もどきの loopback alias を使えない** という上流の注意は、
-  この repo の「QSFP 直結 IP を明示」で代替している。rendezvous が無言で 60 秒後に
-  死ぬのは GID index ずれが定番 (`ibv_modify_qp` errno 61)。`show_gids` で確認。
-- **再起動後の link-local IP。** NVIDIA の connect-two-sparks は 169.254.x.x を振る。
-  変わっていないか preflight が確認する。
+`docker-compose.yml`、`Dockerfile.kindling`、`patches/kindling/`、`README.glm53-3spark.md`、
+`scripts/prepare-glm53-tp3.py`、`scripts/test-glm53-*.py` は DGX/kindling 専用なので削除した
+(RING ブランチに残っている)。
+`README.dspark.md`、`presets/`、`patches/` は、さらに前のブランチから引き継いだものなので、この構成では使わない。
 
 ## 出典
 
-- [MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)
-  — 本構成のレシピ (start.sh / overlay / 実測値)。イメージ公開:
-  `ghcr.io/miaai-lab/deepseek-v4.1-flash-exl3-2x-dgx-sparks:2.9bpw`
-- [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) —
-  ネイティブチェックポイント (Engram の出所)
-- [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw) —
-  EXL3 量子化ツリー (39 shard / mul1 / 2.9bpw / quantizer 1.4.2 / runtime ExLlamaV3 1.4.5)
-- 前段: [MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
-  — Vision-Exp ブランチで移植した元レシピ。`patches/` はそちらの遺産
+- [dealignai/GLM-5.3-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/GLM-5.3-Flash-UNCENSORED-FP8): 元の uncensored 重みとモデルカード
+- [Solstice-AI/GLM-5.3-Flash-UNCENSORED-mlx-oQ4e-DFlash2](https://huggingface.co/Solstice-AI/GLM-5.3-Flash-UNCENSORED-mlx-oQ4e-DFlash2): 使用する MLX 版
+- [raullenchai/Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) v1.0.2: ランタイム ([GLM-5.3 alias](https://rapidmlx.com/models/glm-5.3-flash))
+- [TensorFold/GLM-5.3-Flash-MLX-4bit-MTP](https://huggingface.co/Vontra/GLM-5.3-Flash-MLX-4bit-MTP): 公式 alias の重み (比較用)
+- [llmcheck: GLM-5.3-Flash on M5 Ultra](https://llmcheck.net/models/glm-53-flash-on-m5-ultra/): 速度の参考値
