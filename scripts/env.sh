@@ -41,7 +41,8 @@ load_env() {
 
     # --- API ---
     SERVED_MODEL_NAME=$(env_get SERVED_MODEL_NAME deepseek-v4.1-flash-uncensored)
-    API_HOST=$(env_get API_HOST 127.0.0.1)
+    # 0.0.0.0 = LAN からも受ける。手元だけにするなら 127.0.0.1。API_KEY を設定すると認証が付く。
+    API_HOST=$(env_get API_HOST 0.0.0.0)
     HOST_PORT=$(env_get HOST_PORT 8910)
     API_KEY=$(env_get API_KEY "")
 

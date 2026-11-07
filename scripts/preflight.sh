@@ -121,8 +121,11 @@ if lsof -nP -iTCP:"${HOST_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
 else
     ok ":${HOST_PORT} は空いている"
 fi
-if [ "${API_HOST}" != "127.0.0.1" ] && [ "${API_HOST}" != "localhost" ] && [ -z "${API_KEY}" ]; then
-    ng "API_HOST=${API_HOST} で API_KEY が空。LAN に出すなら API_KEY を設定する"
+if [ "${API_HOST}" != "127.0.0.1" ] && [ "${API_HOST}" != "localhost" ]; then
+    LAN_IPS=$(ipconfig getifaddr en0 2>/dev/null; ipconfig getifaddr en1 2>/dev/null)
+    echo "  LAN から: $(printf '%s' "${LAN_IPS}" | tr '\n' ' ' | sed -E 's/([0-9.]+)/http:\/\/\1:'"${HOST_PORT}"'/g')"
+    [ -n "${API_KEY}" ] && ok "API_HOST=${API_HOST} / API_KEY あり" \
+        || warn "API_HOST=${API_HOST} で API_KEY が空。LAN の誰でも認証なしで叩ける"
 fi
 
 echo

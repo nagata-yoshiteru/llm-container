@@ -126,7 +126,7 @@ greedy と max effort を組み合わせると、難問で同じ所をぐるぐ�
 | `DSPARK` | auto | `auto` はバンドルの draft を使う。`off` で先読みなし |
 | `DEFAULT_ENABLE_THINKING` | 空 | 空ならテンプレートの既定。`true` / `false` |
 | `DEFAULT_TEMPERATURE` / `DEFAULT_TOP_P` | 1.0 / 1.0 | DeepSeek-V4.1 の推奨値 |
-| `API_HOST` / `API_KEY` | 127.0.0.1 / 空 | LAN に出すなら両方を設定する |
+| `API_HOST` / `API_KEY` | 0.0.0.0 / 空 | 既定は LAN からも受ける (`http://<この Mac の IP>:8910`)。**キーが空だと LAN の誰でも認証なしで叩ける**。`API_KEY` を設定すると `Authorization: Bearer <key>` (Anthropic 形式なら `x-api-key`) が必要になる。手元だけにするなら `127.0.0.1` |
 | `VMLX_EXTRA_ARGS` | 空 | 空白区切りで追加する |
 
 ## 速度と正答率 (1 本ずつ)
