@@ -104,6 +104,16 @@ greedy と max effort を組み合わせると、難問で同じ所をぐるぐ�
 
 | 実測: ロード後の MLX active | 220.5GB = 205GiB (本体 + DSpark) |
 | 実測: ベンチ後の空き (free + inactive + purgeable) | 約 33GiB、swap 0.7GB |
+| 実測: 137K tokens の prefill 中のピーク | used 241.2GiB / wired 229.7GiB (80 秒) |
+| 実測: 548K tokens の prefill 中のピーク | used 242.5GiB / wired 232.2GiB (348 秒、約 1,575 tok/s) |
+
+- 2026-11-08 に 1 秒間隔で `vm_stat` を記録して測った。
+  ピークはアイドル時より約 20GiB 高い。その大半は prefill の一時バッファで、入力長にはほとんど比例しない
+  (137K と 548K の差は 1.3GiB)。KV は 4bit 常駐で小さいため。
+  swap は増えず (0.49GB のまま)、圧縮メモリは最大 2.2GiB。
+- 548K 入力の末尾で「Record 000123 の quantity は？」と聞くと、正しく 122 と続けた (raw completion)。
+- context の上限は 1,048,576 tokens (vmlx の `Declared model context ceiling`、capabilities の `max_prompt_tokens`)。
+  1M の入力は未計測。メモリはほぼ増えない見込みだが、prefill に 11 分ほどかかる計算になる。
 
 - Engram はページキャッシュ経由で読む。wired の外にある残りのメモリが、ここで効いてくる。
 - 起動前の空きメモリは 215GiB 以上を目安にしている (`preflight.sh`)。
