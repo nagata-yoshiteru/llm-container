@@ -37,7 +37,8 @@ x-env: &env
   MEM_FRACTION_STATIC: ${MEM_FRACTION_STATIC:-0.95}
   SPEC_ALGO: ${SPEC_ALGO:-DSPARK}
   DSPARK_BLOCK_SIZE: ${DSPARK_BLOCK_SIZE:-3}
-  EXTRA_SGLANG_ARGS: --fp8-gemm-backend flashinfer_cutlass --watchdog-timeout 1800 --sleep-on-idle
+  # Initialize PyTorch's NCCL communicator before weights consume unified RAM.
+  EXTRA_SGLANG_ARGS: --fp8-gemm-backend flashinfer_cutlass --watchdog-timeout 1800 --sleep-on-idle --pre-warm-nccl
   DSV41_MXFP8_BACKEND: b12x
   DSV41_WO_A_W8: ${DSV41_WO_A_W8:-1}
   DSV41_WO_A_W8_MID: ${DSV41_WO_A_W8_MID:-1}
@@ -78,7 +79,7 @@ x-env: &env
   NCCL_BUFFSIZE: ${NCCL_BUFFSIZE:-1048576}
   NCCL_LL128_BUFFSIZE: ${NCCL_LL128_BUFFSIZE:-262144}
   NCCL_PROTO: ${NCCL_PROTO:-^LL128}
-  NCCL_MAX_NCHANNELS: ${NCCL_MAX_NCHANNELS:-8}
+  NCCL_MAX_NCHANNELS: ${NCCL_MAX_NCHANNELS:-4}
   NCCL_DEBUG: ${NCCL_DEBUG:-INFO}
   MAX_JOBS: ${MAX_JOBS:-4}
   READY_TIMEOUT_S: "3600"

@@ -4,7 +4,7 @@
 既存と同じ `docker-compose.yml`、全3台共通の `.env`、`head / worker1 / worker2` profile を使う。
 API は head の8910番。各ホストでモデルプロセスを1つ起動する。
 
-**設定・CPU検証まで実施。Dockerビルド、モデル取得、Engram生成、GPU推論は未実施。**
+**CPU検証済み。提供された実機ログでは重みロード後のNCCL初期化に失敗しており、GPU推論の成功は未確認。**
 元のGLM用vLLM / mentatからSGLangへ変更する。重み名だけを変えてGLMのTPパッチを流用することはできない。
 
 ## 採用方式
@@ -138,6 +138,45 @@ headだけにHTTP healthcheckがあり、workerにはHTTPサーバーを期待�
 起動時にモデル検査が通っても、CPU/GPU共有メモリ、JIT、RDMA、品質は実推論で確認する必要がある。
 まず算術・日本語・ツール呼び出し・同時2件を確認し、メモリ監視下で長文を段階的に増やす。
 ネイティブの最大1Mを、この3台構成で保証するものではない。画像/動画も今回未検証。
+
+## 重みロード後のNCCLメモリ登録エラー
+
+2026-11-17のheadログでは、target/draftのロードとKVプール確保後、最初の
+`torch.distributed.all_reduce` で別のNCCL communicatorが初期化され、
+`ibv_reg_mr_iova2 failed with error Cannot allocate memory` で停止した。
+その直前のGPU空き表示は約11 GB。RDMAメモリ登録の失敗であり、このログだけでは
+ホストのメモリ圧迫・ページ固定・ドライバ側リソースのどれが原因かは確定できない。
+Composeにはすでに `memlock: -1` と `IPC_LOCK` がある。
+
+再試行用に `--pre-warm-nccl` でPyTorchのNCCL通信を重みロード前に初期化し、
+`NCCL_MAX_NCHANNELS=4` で通信バッファと登録数を減らす。
+これは実機での解消確認が必要な対策。モデルやKVプールの設定は変更しない。
+
+更新した `docker-compose.yml` と `.env` を全3台に揃え、まず各ノードで該当roleを停止する。
+
+```bash
+# 各ホストで自分のroleを指定（worker1 / worker2でも実行）
+sudo docker compose --profile head stop --timeout 60 head
+./scripts/preflight.sh --role head
+```
+
+全3台の停止・preflight完了後、各ホストでworker2 → worker1 → headの順に再作成する。
+今回の変更にイメージ再ビルドは不要。`restart` だけでは環境変数が更新されない。
+
+```bash
+# worker2上
+sudo docker compose --profile worker2 up -d --no-build --pull never --force-recreate worker2
+# worker1上
+sudo docker compose --profile worker1 up -d --no-build --pull never --force-recreate worker1
+# head上
+sudo docker compose --profile head up -d --no-build --pull never --force-recreate head
+sudo docker compose --profile head logs -f head
+```
+
+重みロード前のNCCL warmup完了と、上記の `/health`・推論リクエストの成功を確認する。
+再発時は全3台のコンテナログに加え、失敗時刻付近の `sudo journalctl -k` を採取する。
+稼働中なら `sudo docker exec deepseek41-head sh -c 'ulimit -l; cat /proc/meminfo'`
+で実際のmemlock制限とホスト共有メモリを確認する（workerはコンテナ名を変更）。
 
 ## 静的検証と旧資料
 

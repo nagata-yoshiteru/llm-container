@@ -105,6 +105,7 @@ class Configuration(unittest.TestCase):
                         pass
                     def capture(argv, **kwargs):
                         self.assertEqual(argv[:3], [sys.executable, '-m', 'sglang.launch_server'])
+                        self.assertIn('--pre-warm-nccl', argv)
                         for flag, value in {'--tp': '3', '--ep-size': '1', '--nnodes': '3',
                                             '--node-rank': env['NODE_RANK'], '--model-path': env['MODEL_PATH'],
                                             '--context-length': '32768', '--max-total-tokens': '131072',
