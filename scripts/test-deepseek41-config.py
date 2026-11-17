@@ -39,6 +39,7 @@ class Configuration(unittest.TestCase):
             self.assertEqual(env['MODEL_PATH'], env['DSV41_SOURCE'])
             self.assertEqual(env['DIST_INIT_ADDR'], self.env['HEAD_NODE_IP'] + ':' + self.env['DIST_PORT'])
             for key, value in {'NCCL_NET': 'IB', 'NCCL_ALGO': 'Ring',
+                               'NCCL_NET_HOST_REGISTER': '1',
                                'NCCL_IB_SUBNET_AWARE_ROUTING': '1', 'NCCL_IB_EXTENDED_IPV4_GIDS': '1',
                                'NCCL_IB_PRESERVE_PCI_DOMAIN': '1', 'SKIP_PREPARE': '1',
                                'SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE': '0',
@@ -116,6 +117,16 @@ class Configuration(unittest.TestCase):
                         raise Captured()
                     with patch.object(module.subprocess, 'Popen', capture), self.assertRaises(Captured):
                         module.serve()
+
+    def test_nccl_net_host_register_patch_applies_to_pinned_source(self):
+        source = ROOT / '.cache/deepseek41-tp3/nccl/src/transport/net.cc'
+        patch_path = ROOT / 'patches/deepseek41/nccl-net-host-register.patch'
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'src/transport/net.cc'
+            target.parent.mkdir(parents=True)
+            target.write_bytes(source.read_bytes())
+            subprocess.run(['patch', '--batch', '-p1', '-i', str(patch_path)],
+                           cwd=tmp, check=True, capture_output=True, text=True)
 
     def test_reject_truncated_safetensors_and_foreign_config(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -76,6 +76,8 @@ x-env: &env
   NCCL_P2P_DISABLE: "1"
   NCCL_SHM_DISABLE: "1"
   NCCL_CUMEM_ENABLE: "0"
+  # Local NCCL patch: ordinary host RAM + cudaHostRegister for NET buffers.
+  NCCL_NET_HOST_REGISTER: ${NCCL_NET_HOST_REGISTER:-1}
   NCCL_BUFFSIZE: ${NCCL_BUFFSIZE:-1048576}
   NCCL_LL128_BUFFSIZE: ${NCCL_LL128_BUFFSIZE:-262144}
   NCCL_PROTO: ${NCCL_PROTO:-^LL128}
@@ -85,7 +87,7 @@ x-env: &env
   READY_TIMEOUT_S: "3600"
 
 x-model: &model
-  image: ${SGLANG_IMAGE:-llm-deepseek41-sglang:tp3-1017-v1}
+  image: ${SGLANG_IMAGE:-llm-deepseek41-sglang:tp3-1017-v2}
   pull_policy: build
   build:
     context: ./.cache/deepseek41-tp3/upstream

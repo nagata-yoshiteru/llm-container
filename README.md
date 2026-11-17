@@ -4,7 +4,7 @@
 既存と同じ `docker-compose.yml`、全3台共通の `.env`、`head / worker1 / worker2` profile を使う。
 API は head の8910番。各ホストでモデルプロセスを1つ起動する。
 
-**CPU検証済み。提供された実機ログでは重みロード後のNCCL初期化に失敗しており、GPU推論の成功は未確認。**
+**CPU検証と修正NCCLの3台AllReduce検証済み。モデル推論の成功は未確認。**
 元のGLM用vLLM / mentatからSGLangへ変更する。重み名だけを変えてGLMのTPパッチを流用することはできない。
 
 ## 採用方式
@@ -144,13 +144,45 @@ headだけにHTTP healthcheckがあり、workerにはHTTPサーバーを期待�
 2026-11-17のheadログでは、target/draftのロードとKVプール確保後、最初の
 `torch.distributed.all_reduce` で別のNCCL communicatorが初期化され、
 `ibv_reg_mr_iova2 failed with error Cannot allocate memory` で停止した。
-その直前のGPU空き表示は約11 GB。RDMAメモリ登録の失敗であり、このログだけでは
-ホストのメモリ圧迫・ページ固定・ドライバ側リソースのどれが原因かは確定できない。
-Composeにはすでに `memlock: -1` と `IPC_LOCK` がある。
+その直前のGPU空き表示は約11 GB。さらにpre-warmを有効にした再試行でも、
+worker1が重みロード前に同じ登録エラーを返した。Composeにはすでに
+`memlock: -1` と `IPC_LOCK` があり、モデル容量を減らすだけでは解決しない。
 
 再試行用に `--pre-warm-nccl` でPyTorchのNCCL通信を重みロード前に初期化し、
 `NCCL_MAX_NCHANNELS=4` で通信バッファと登録数を減らす。
-これは実機での解消確認が必要な対策。モデルやKVプールの設定は変更しない。
+この2点だけでは解消しなかった。次のv2イメージで通信バッファの確保方法も変更する。
+
+### v2: NCCLのNETバッファをcudaHostRegisterへ変更
+
+ホスト上の小さなプログラムで、`cudaHostAlloc` で確保した領域を分割して
+`ibv_reg_mr_iova2` へ登録すると、モデルなしでも `ENOMEM` を再現した。
+通常RAMの確保後に `cudaHostRegister` する方式では比較テストが成功した。
+ドライバ内部の根本原因は未確定だが、この環境で失敗する確保経路を切り分けられた。
+
+`patches/deepseek41/nccl-net-host-register.patch` はNET通信バッファだけを
+ページ境界に揃えた通常RAM + `cudaHostRegisterMapped` へ変更する。
+対応する解放も `cudaHostUnregister` + `free` に揃え、CPU/GPUのアドレス一致を検査する。
+モデル・KV・他のCUDA allocationやRoCEルーティングは変更しない。
+`NCCL_NET_HOST_REGISTER=1` はこのローカルパッチ専用の設定で、0なら旧経路に戻る。
+
+2026-11-18 JST、3台のホスト上で同じ修正ライブラリを使い、設定0でworker1の
+登録エラーを再現、設定1で4通信グループ×3サイズ（float32の1 / 1024 / 262144要素）の
+AllReduceと全rankの結果照合・解放が成功した。検証用ビルドはSM121のfloat32 Ring
+AllReduceに限定しており、本番Dockerビルドは通常どおり全collectiveを含む。
+検証コードは `scripts/test-deepseek41-nccl.cpp`。コンテナ内のモデル起動・推論は別途確認する。
+
+**v1からv2への更新には全3台で再ビルドが必要。** 更新したDockerfile・Compose・patches・
+scripts・`.env` を揃え、まず各ホストで自分のroleのイメージをビルドする。
+
+```bash
+# worker2上 / worker1上 / head上で、それぞれ対応する1行を実行
+sudo docker compose --profile worker2 build worker2
+sudo docker compose --profile worker1 build worker1
+sudo docker compose --profile head build head
+```
+
+`.env` の `SGLANG_IMAGE` は `llm-deepseek41-sglang:tp3-1017-v2`。
+全台のビルド完了後に下記の順で再作成する。`restart` では旧イメージのままなので不可。
 
 更新した `docker-compose.yml` と `.env` を全3台に揃え、まず各ノードで該当roleを停止する。
 
@@ -161,7 +193,7 @@ sudo docker compose --profile head stop --timeout 60 head
 ```
 
 全3台の停止・preflight完了後、各ホストでworker2 → worker1 → headの順に再作成する。
-今回の変更にイメージ再ビルドは不要。`restart` だけでは環境変数が更新されない。
+v2イメージのビルドを先に完了させる。`restart` だけではイメージや環境変数が更新されない。
 
 ```bash
 # worker2上
@@ -173,10 +205,40 @@ sudo docker compose --profile head up -d --no-build --pull never --force-recreat
 sudo docker compose --profile head logs -f head
 ```
 
-重みロード前のNCCL warmup完了と、上記の `/health`・推論リクエストの成功を確認する。
+NCCLログの `NCCL_NET_HOST_REGISTER set by environment to 1`、
+重みロード前のNCCL warmup完了、上記の `/health`・推論リクエストの成功を確認する。
 再発時は全3台のコンテナログに加え、失敗時刻付近の `sudo journalctl -k` を採取する。
 稼働中なら `sudo docker exec deepseek41-head sh -c 'ulimit -l; cat /proc/meminfo'`
 で実際のmemlock制限とホスト共有メモリを確認する（workerはコンテナ名を変更）。
+
+### NCCL初期化直後にworkerが終了する場合
+
+続く再試行では、worker1が `ncclCommInitRank` 中に `unhandled system error`、
+head/worker2が `remote process exited or there was a network error` で終了した。
+これは重みロード前かつpre-warm collectiveより前の失敗で、前回のメモリ登録エラーと
+同じ原因とはまだ確認できない。3台の `.env` と起動記録のpre-warm設定は一致している。
+2026-11-18 JSTのホスト上の検査では、全6リンクで1 MiB×100回の双方向
+`ib_write_bw` が成功した。ただし、コンテナ内のNCCL collectiveやCUDAメモリの登録は未検証。
+
+提供ログではNCCL出力が行の途中で途切れ、system errorの詳細が残っていなかった。
+`boot.py` はengineのstdoutをpipeで受けるため、NCCLのC stdioバッファが強制終了時に
+失われる可能性がある。entrypointで `NCCL_DEBUG_FILE` を指定し、NCCL側の行バッファを
+使って、起動ごと・プロセスごとのログをホストの次の場所へ保存する。
+この変更は診断用で、起動障害を解消したものではない。
+
+```text
+.cache/deepseek41-tp3/runtime/state/nccl/rank*-<起動時刻>-<hostname>-<pid>.log
+```
+
+更新した `scripts/entrypoint.sh` を全3台に揃えて再起動する。bind mountなので
+イメージ再ビルドは不要。NCCL詳細はDockerログから上記ファイルへ移り、Pythonの
+例外やモデルの進行状況は引き続きDockerログに出る。
+再発後はまずworker1の最新ログを確認する（他の2台にも同じ場所に保存される）。
+
+```bash
+ls -lt .cache/deepseek41-tp3/runtime/state/nccl/
+tail -n 200 .cache/deepseek41-tp3/runtime/state/nccl/<対象ログ名>
+```
 
 ## 静的検証と旧資料
 

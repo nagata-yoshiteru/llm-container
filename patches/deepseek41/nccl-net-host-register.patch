@@ -1,0 +1,114 @@
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -19,6 +19,57 @@
+ #include "compiler.h"
+ #include <assert.h>
+ #include "register_inline.h"
++
++// GB10: cudaHostAlloc-backed NET buffers can fail ibv_reg_mr_iova2 with
++// ENOMEM even before model loading. Use page-aligned ordinary host memory
++// registered with CUDA. Keep the allocation/free pairing local to NET buffers.
++NCCL_PARAM(NetHostRegister, "NET_HOST_REGISTER", 0);
++
++static ncclResult_t ncclNetHostCalloc(char** ptr, size_t size) {
++  if (!ncclParamNetHostRegister()) return ncclCudaHostCalloc(ptr, size);
++  *ptr = nullptr;
++  if (size == 0) return ncclSuccess;
++  ncclResult_t result = ncclSuccess;
++  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
++  void* devicePtr = nullptr;
++  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
++  NCCLCHECKGOTO(ncclIbMalloc((void**)ptr, size), result, finish);
++  CUDACHECKGOTO(cudaHostRegister(*ptr, size, cudaHostRegisterMapped), result, free_host);
++  CUDACHECKGOTO(cudaHostGetDevicePointer(&devicePtr, *ptr, 0), result, unregister_host);
++  // NET's connectMap uses the same address on CPU and GPU. Refuse devices
++  // without that UVA property instead of publishing an invalid GPU pointer.
++  if (devicePtr != *ptr) {
++    WARN("NET_HOST_REGISTER requires identical CPU/GPU host-buffer addresses");
++    result = ncclInternalError;
++    goto unregister_host;
++  }
++  INFO(NCCL_ALLOC, "NET_HOST_REGISTER allocated %zu bytes at %p", size, *ptr);
++  goto finish;
++unregister_host:
++  if (cudaHostUnregister(*ptr) != cudaSuccess) {
++    WARN("NET_HOST_REGISTER cleanup could not unregister host storage");
++    goto finish;
++  }
++free_host:
++  free(*ptr);
++  *ptr = nullptr;
++finish:
++  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
++  return result;
++}
++
++static ncclResult_t ncclNetHostFree(void* ptr) {
++  if (!ncclParamNetHostRegister()) return ncclCudaHostFree(ptr);
++  if (ptr == nullptr) return ncclSuccess;
++  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
++  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
++  cudaError_t status = cudaHostUnregister(ptr);
++  // Do not free storage still registered with CUDA if unregistering failed.
++  if (status == cudaSuccess) free(ptr);
++  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
++  CUDACHECK(status);
++  return ncclSuccess;
++}
+ 
+ static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
+ 
+@@ -676,7 +727,7 @@
+     }
+   }
+   if (!cuda && state->hostBuff == NULL) {
+-    NCCLCHECK(ncclCudaHostCalloc(&state->hostBuff, state->size));
++    NCCLCHECK(ncclNetHostCalloc(&state->hostBuff, state->size));
+   }
+   if (cpuPtr) *cpuPtr = cuda ? state->cudaBuff : state->hostBuff;
+   if (gpuPtr) *gpuPtr = (cpuPtr && sameProcess) ? *cpuPtr : NULL;
+@@ -707,7 +758,7 @@
+       }
+       NCCLCHECK(ncclCudaFree(state->cudaBuff, proxyState->memManager));
+     }
+-    if (state->hostBuff) NCCLCHECK(ncclCudaHostFree(state->hostBuff));
++    if (state->hostBuff) NCCLCHECK(ncclNetHostFree(state->hostBuff));
+   }
+ 
+   if (peer->send.refcount || peer->recv.refcount) return ncclSuccess;
+@@ -954,7 +1005,7 @@
+     }
+   }
+   if (map->sameProcess) {
+-    NCCLCHECK(ncclCudaHostCalloc(&map->mems[NCCL_NET_MAP_HOSTMEM].cpuPtr, map->mems[NCCL_NET_MAP_HOSTMEM].size));
++    NCCLCHECK(ncclNetHostCalloc(&map->mems[NCCL_NET_MAP_HOSTMEM].cpuPtr, map->mems[NCCL_NET_MAP_HOSTMEM].size));
+     map->mems[NCCL_NET_MAP_HOSTMEM].gpuPtr = map->mems[NCCL_NET_MAP_HOSTMEM].cpuPtr;
+   } else {
+     NCCLCHECK(netCreateShm(proxyState, map->mems + NCCL_NET_MAP_HOSTMEM));
+@@ -1132,7 +1183,7 @@
+       map->mems[NCCL_NET_MAP_DEVMEM].cpuPtr = map->mems[NCCL_NET_MAP_DEVMEM].gpuPtr;
+     }
+   }
+-  NCCLCHECK(ncclCudaHostCalloc(&map->mems[NCCL_NET_MAP_HOSTMEM].cpuPtr, map->mems[NCCL_NET_MAP_HOSTMEM].size));
++  NCCLCHECK(ncclNetHostCalloc(&map->mems[NCCL_NET_MAP_HOSTMEM].cpuPtr, map->mems[NCCL_NET_MAP_HOSTMEM].size));
+   map->mems[NCCL_NET_MAP_HOSTMEM].gpuPtr = map->mems[NCCL_NET_MAP_HOSTMEM].cpuPtr;
+   if (ncclGdrCopy && /*1==*/map->sameProcess && resources->sameDevice) {
+     uint64_t *cpuPtr, *gpuPtr;
+@@ -1215,7 +1266,7 @@
+     }
+     struct connectMapMem* mems = resources->map.mems;
+     if (resources->map.sameProcess) {
+-      NCCLCHECK(ncclCudaHostFree(mems[NCCL_NET_MAP_HOSTMEM].cpuPtr));
++      NCCLCHECK(ncclNetHostFree(mems[NCCL_NET_MAP_HOSTMEM].cpuPtr));
+     } else {
+       NCCLCHECK(ncclShmIpcClose(&mems[NCCL_NET_MAP_HOSTMEM].createDesc));
+     }
+@@ -1269,7 +1320,7 @@
+       }
+     }
+     struct connectMapMem* mems = resources->map.mems;
+-    NCCLCHECK(ncclCudaHostFree(mems[NCCL_NET_MAP_HOSTMEM].cpuPtr));
++    NCCLCHECK(ncclNetHostFree(mems[NCCL_NET_MAP_HOSTMEM].cpuPtr));
+     NCCLCHECK(ncclCudaFree(mems[NCCL_NET_MAP_DEVMEM].cpuPtr, proxyState->memManager));
+     if (!resources->map.sameProcess || ncclCuMemEnable()) {
+       // cuMem API support
