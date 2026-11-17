@@ -1,75 +1,37 @@
 #!/usr/bin/env bash
-# =============================================================================
-# dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 (modelopt NVFP4) の重みを取得する。
-#
-#   ./scripts/fetch-model.sh          # SOURCE_MODEL_PATH に元 checkpoint (約 181GiB)
-#   ./scripts/fetch-model.sh <path>   # 保存先を上書き
-#
-# DeepSeek-V4.1 と違い **追加テーブルは無い**。MTP の draft head
-# (num_nextn_predict_layers=1) も同じ shard 群に入っているので、
-# model_mtp.safetensors のような別ファイルは落とさない。
-#
-# 3 台とも「同じ絶対パス」に落とす必要がある。head で実行したあと、
-# worker1 / worker2 でも同じコマンドを実行すること (rsync でコピーしてもよい)。
-# resumable: 失敗したら同じコマンドを再実行すれば続きから。
-#
-# 181GiB は 1 台のディスクに置くので、事前に空きを確認すること
-# (この repo の生成物は置き場を問わないが、3 台すべてで同じパスにする)。
-#
-# rootless / rootful どちらの docker とも無関係。sudo は不要。
-# =============================================================================
+# Downloads pinned native checkpoint, including Engram and DSpark weights.
+# Run separately on each host; no sudo, Docker, conversion or remote writes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-MODEL_REPO="${MODEL_REPO:-dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4}"
-EXPECTED_SHARDS=121
-NEED_GIB=195
-
-env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -1 || true; }
-
-MODEL_PATH_DEST="${1:-$(env_get SOURCE_MODEL_PATH)}"
-MODEL_PATH_DEST="${MODEL_PATH_DEST:-./models/GLM-5.3-Flash-UNCENSORED-NVFP4}"
-if [ -f "${MODEL_PATH_DEST}/tp3-preparation.json" ]; then
-    echo "TP=3 の serving ディレクトリには download できません。SOURCE_MODEL_PATH を使ってください。" >&2
-    exit 1
-fi
-
-if ! command -v hf >/dev/null 2>&1; then
-    echo "huggingface_hub CLI (hf) が見つかりません。以下でインストールしてください:" >&2
-    echo "  pip install -U 'huggingface_hub[cli,hf_transfer]'" >&2
-    exit 1
-fi
-
-# hf_transfer があれば有効化 (光スイッチ経由でも回線が太ければ効く)
-python3 -c 'import hf_transfer' 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1
-
-check_disk() {  # $1=宛先dir $2=必要GiB
-    mkdir -p "$1"
-    local avail_kb; avail_kb=$(df -Pk "$(dirname "$1")" | awk 'NR==2 {print $4}')
-    if [ "${avail_kb}" -lt $(( $2 * 1024 * 1024 )) ]; then
-        echo "WARN: $(dirname "$1") の空きが ${2}GiB 未満です ($((avail_kb / 1024 / 1024)) GiB)" >&2
-    fi
-}
-
-echo "==> GLM-5.3-Flash-UNCENSORED-NVFP4: ${MODEL_REPO} -> ${MODEL_PATH_DEST} (約 181GiB)"
-check_disk "${MODEL_PATH_DEST}" "${NEED_GIB}"
-
-# ★ shard を positional で並べない。素の引数なしでリポジトリ全体を落とす
-#   (旧 huggingface CLI でも新 hf でも同じ挙動。--include だと新版が無視して
-#    一部だけ落ちる事故がある)。
-hf download "${MODEL_REPO}" --local-dir "${MODEL_PATH_DEST}" --max-workers 8
-
-n=$(find "${MODEL_PATH_DEST}" -maxdepth 1 -name 'model-*.safetensors' | wc -l)
-echo "==> safetensors shards: ${n} (${EXPECTED_SHARDS} なら OK)"
-[ "${n}" -eq "${EXPECTED_SHARDS}" ] || echo "WARN: shard 数が ${EXPECTED_SHARDS} と違います" >&2
-
-for f in config.json generation_config.json model.safetensors.index.json; do
-    [ -f "${MODEL_PATH_DEST}/${f}" ] || echo "WARN: ${f} がありません" >&2
-done
-
-echo
-echo "==> 取得結果"
-du -sh "${MODEL_PATH_DEST}" 2>/dev/null || true
-echo
-echo "==> これを 3 台とも同じパスに置くこと (head / worker1 / worker2)。"
-echo "    ./scripts/preflight.sh で shard 数と空きメモリを確認してから起動する。"
+command -v hf >/dev/null || { echo 'Install huggingface_hub (hf CLI) first.' >&2; exit 1; }
+python3 - "$@" <<'PY'
+import hashlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from deepseek41_config import LOCK, ROOT, read_env, check_model
+env = read_env()
+pin = LOCK['model']
+if env.get('MODEL_REPO') != pin['repository'] or env.get('MODEL_REVISION') != pin['revision']:
+    raise SystemExit('MODEL_REPO / MODEL_REVISION must match source-lock.json')
+if len(sys.argv) > 2:
+    raise SystemExit('Usage: fetch-model.sh [destination]')
+destination = Path(sys.argv[1]) if len(sys.argv) == 2 else ROOT / env['MODEL_PATH']
+destination.mkdir(parents=True, exist_ok=True)
+if (destination / 'tp3-preparation.json').exists():
+    raise SystemExit('Refusing a GLM padded serving directory')
+if (destination / 'config.json').exists():
+    if hashlib.sha256((destination / 'config.json').read_bytes()).hexdigest() != pin['config_sha256']:
+        raise SystemExit('Destination contains a different model/config; choose an empty directory')
+free = shutil.disk_usage(destination).free / 2**30
+print(f'{pin["repository"]}@{pin["revision"]} -> {destination}', flush=True)
+print(f'Checkpoint ~475 GiB, local Engram pack ~63 GiB extra; free={free:.1f} GiB', flush=True)
+if free < 550:
+    print('Note: fresh download + Engram preparation needs about 550 GiB; existing downloads can resume.', flush=True)
+subprocess.run(['hf', 'download', pin['repository'], '--revision', pin['revision'],
+                '--local-dir', str(destination), '--max-workers', '4'], check=True)
+check_model(destination)
+print('48 shards and Engram headers validated. Next: prepare-deepseek41-tp3.py --pack <role>')
+PY

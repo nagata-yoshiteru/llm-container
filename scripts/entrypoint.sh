@@ -1,45 +1,7 @@
 #!/usr/bin/env bash
-# Local validation; the image's /entrypoint.sh owns kindling launch flags.
+# Validate before importing SGLang's sitecustomize or allocating GPU memory.
 set -euo pipefail
-[[ ${TP:-} == 3 ]] || { echo 'This configuration requires TP_SIZE=3' >&2; exit 1; }
-[[ ${MOE_BACKEND:-} == marlin ]] || { echo 'The uncensored W4A16 checkpoint requires Marlin' >&2; exit 1; }
-python3 - <<'PY'
-import json, os
-from pathlib import Path
-p = Path(os.environ['MODEL_DIR'])
-c = json.loads((p / 'config.json').read_text())
-t = c['text_config']
-assert t.get('tp_pad_orig') == dict(num_attention_heads=64, linear_num_heads=64, moe_intermediate_size=2048), 'Run scripts/prepare-glm53-tp3.py'
-assert (t['num_attention_heads'], t['linear_attn_config']['num_heads'], t['moe_intermediate_size']) == (66, 66, 2304)
-assert t['vocab_size'] == 154880, 'Do not expand logical vocabulary'
-assert (p / 'tp3-preparation.json').is_file(), 'Missing TP=3 preparation manifest'
-groups = c['quantization_config']['config_groups']
-assert groups and all(g.get('input_activations') is None for g in groups.values()), 'Expected W4A16 checkpoint'
-print('GLM53 uncensored: TP=3 padded config / W4A16 validated', flush=True)
-PY
-# A ring claim made before mentatd has probed every cable fails at once with
-# "no such order of free nodes exists". A ring of TP boxes has TP cables, each
-# its own two-node island, so the head waits for that many before claiming.
-if [[ ${ROLE:-} == head && ${MENTAT_CLAIM_LAYOUT:-} == ring ]]; then
-  python3 - <<'PY'
-import json, os, time
-from urllib.request import urlopen
-want, deadline, seen = int(os.environ['TP']), time.monotonic() + 600, -1
-while True:
-    try:
-        n = len(json.load(urlopen('http://127.0.0.1:6380/status', timeout=5)).get('islands') or [])
-    except Exception:
-        n = -1
-    if n >= want:
-        print(f'ring: mentat sees {n} cable islands', flush=True)
-        break
-    if time.monotonic() > deadline:
-        print(f'ring: only {n} of {want} cable islands after 600 s; claiming anyway', flush=True)
-        break
-    if n != seen:
-        print(f'ring: waiting for {want} cable islands, have {max(n, 0)}', flush=True)
-        seen = n
-    time.sleep(5)
-PY
-fi
-exec /entrypoint.sh "$@"
+NCCL_IB_GID_INDEX=$(python3 -S /opt/llm/deepseek41_config.py)
+export NCCL_IB_GID_INDEX
+echo "DeepSeek V4.1-1017: rank=${NODE_RANK}/3, NVMe Engram, RoCEv2 GID=${NCCL_IB_GID_INDEX}"
+exec python3 -u /opt/dsv41/boot.py run

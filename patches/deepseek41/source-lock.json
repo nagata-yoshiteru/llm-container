@@ -1,0 +1,24 @@
+{
+  "recipe": {
+    "repository": "MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks",
+    "revision": "64b02dea8681fb1d8e3a659ea432a8e9e9ba3995",
+    "sha256": "1cdea56dbea2eff0f474855aa4ef8d62ffe7eb539839ffa2258219f8c8b07c75"
+  },
+  "nccl": {
+    "repository": "NVIDIA/nccl",
+    "revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "sha256": "230dbb3f4eae4eaa020fc9942586833ea5d20efbcc78c4cdb0404f607ec3c0af"
+  },
+  "nccl_patch": {
+    "repository": "FujitsuPolycom/sparkring",
+    "revision": "dcfc97430ea8095dd31233b6595bdd14a4b63097",
+    "path": "spark_transport/nccl/nccl-2.30.7-dual-pci-domain.patch",
+    "sha256": "8e2b8715d62d2b07a74caca3778da0eff2e7b54caf8a184bb728f179a5d1eba4"
+  },
+  "model": {
+    "repository": "dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+    "revision": "c19ca5ca4eaeb79d29fdf08aea8327da95b1116a",
+    "config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+    "index_sha256": "74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8"
+  }
+}
