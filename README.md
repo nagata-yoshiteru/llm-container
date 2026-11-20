@@ -240,6 +240,28 @@ ls -lt .cache/deepseek41-tp3/runtime/state/nccl/
 tail -n 200 .cache/deepseek41-tp3/runtime/state/nccl/<対象ログ名>
 ```
 
+## 起動後の速度・正解率ベンチマーク
+
+`scripts/bench-deepseek41.py` はSGLangのstreaming APIを使う。サーバーが空いている状態で、
+新しい結果ディレクトリを指定する。speedは1K/4K/8K程度の入力を各2回と、
+256-token生成を同時1件/2件で各2回、qualityは数学6問・Python実装4問を各1回実行する。
+
+```bash
+python3 scripts/bench-deepseek41.py --phase speed --output-dir results/deepseek41-run1
+python3 scripts/bench-deepseek41.py --phase quality --output-dir results/deepseek41-run1
+# 保存された C*.py の内容を確認してから実行テストする
+python3 scripts/bench-deepseek41.py --phase grade-code --output-dir results/deepseek41-run1
+```
+
+qualityはtemperature=0・thinking有効・出力上限4096 tokens。数学は最終整数を照合し、
+コードはランダム入力・境界条件・大きな入力で採点する。コード実行にはASTによる制限と
+CPU/メモリ/時間制限を設けているが、セキュリティsandboxではないため事前の内容確認が必要。
+この10問はローカルの動作・品質確認用で、一般的な能力を推定できる規模の公開ベンチではない。
+
+prefillは使用トークン数÷TTFTのクライアント側実効値（待ち時間・初回decodeを含む）。
+decodeもDSparkのまとめ出力を含むstreaming推定値。サーバーのGPU処理時間そのものではない。
+問題文・全回答・reasoning・usage・finish reason・時刻列はJSONに保存される。
+
 ## 静的検証と旧資料
 
 ```bash

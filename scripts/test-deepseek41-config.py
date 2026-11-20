@@ -109,7 +109,8 @@ class Configuration(unittest.TestCase):
                         self.assertIn('--pre-warm-nccl', argv)
                         for flag, value in {'--tp': '3', '--ep-size': '1', '--nnodes': '3',
                                             '--node-rank': env['NODE_RANK'], '--model-path': env['MODEL_PATH'],
-                                            '--context-length': '32768', '--max-total-tokens': '131072',
+                                            '--context-length': env['CONTEXT_LENGTH'],
+                                            '--max-total-tokens': env['MAX_TOTAL_TOKENS'],
                                             '--speculative-algorithm': 'DSPARK', '--speculative-dspark-block-size': '3',
                                             '--tool-call-parser': 'deepseekv41', '--reasoning-parser': 'deepseek-v41'}.items():
                             self.assertEqual(argv[argv.index(flag) + 1], value)
