@@ -27,11 +27,9 @@ if (destination / 'config.json').exists():
         raise SystemExit('Destination contains a different model/config; choose an empty directory')
 free = shutil.disk_usage(destination).free / 2**30
 print(f'{pin["repository"]}@{pin["revision"]} -> {destination}', flush=True)
-print(f'Checkpoint ~475 GiB, local Engram pack ~63 GiB extra; free={free:.1f} GiB', flush=True)
-if free < 550:
-    print('Note: fresh download + Engram preparation needs about 550 GiB; existing downloads can resume.', flush=True)
+print(f'Checkpoint ~475 GiB; free={free:.1f} GiB. Existing downloads can resume.', flush=True)
 subprocess.run(['hf', 'download', pin['repository'], '--revision', pin['revision'],
                 '--local-dir', str(destination), '--max-workers', '4'], check=True)
 check_model(destination)
-print('48 shards and Engram headers validated. Next: prepare-deepseek41-tp3.py --pack <role>')
+print('48 shards and Engram headers validated. For vLLM: python3 scripts/prepare-spark-ds41f.py')
 PY
