@@ -11,7 +11,7 @@ GLM-5.3-Flash 版 (`Mac-Studio-256G/dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4` �
 | --- | --- | --- |
 | 重み | Solstice-AI の MLX 4bit (oQ4e)、常駐 173GiB | dealignai の JANG_2K (routed expert 平均 2.47bit)、常駐 197GiB |
 | ディスク | 186GB | 424GB (うち Engram 203GB はディスクから読む) |
-| ランタイム | Rapid-MLX 1.0.2 + hotfix | vmlx 1.6.84 + jang 2.5.53 (`./venv-vmlx`) |
+| ランタイム | Rapid-MLX 1.0.2 + hotfix | vmlx 1.6.84 + hotfix + jang 2.5.53 (`./venv-vmlx`) |
 | 先読み | 無効 | DSpark (バンドル同梱の MTP draft、3 段) |
 | 同時実行 | 実質 1 | 1 (vmlx が固定する) |
 | decode (1 本) | 約 38.5 tok/s | **約 54 tok/s** (48.6〜59.3) |
@@ -138,6 +138,23 @@ greedy と max effort を組み合わせると、難問で同じ所をぐるぐ�
 | `DEFAULT_TEMPERATURE` / `DEFAULT_TOP_P` | 1.0 / 1.0 | DeepSeek-V4.1 の推奨値 |
 | `API_HOST` / `API_KEY` | 0.0.0.0 / 空 | 既定は LAN からも受ける (`http://<この Mac の IP>:8910`)。**キーが空だと LAN の誰でも認証なしで叩ける**。`API_KEY` を設定すると `Authorization: Bearer <key>` (Anthropic 形式なら `x-api-key`) が必要になる。手元だけにするなら `127.0.0.1` |
 | `VMLX_EXTRA_ARGS` | 空 | 空白区切りで追加する |
+
+## vmlx の hotfix (Anthropic の adaptive thinking)
+
+Claude Code などの Anthropic 形式のクライアントは、`thinking: {"type": "adaptive"}` (考える深さをモデルに任せる) を送ることがある。
+素の vmlx 1.6.84 は、DSV4.1 ではこれを HTTP 400 で拒否する (`deepseek_v4_1 does not support native thinking_mode='adaptive'`)。
+
+- 原因: `/v1/messages` は adaptive を `chat_template_kwargs.thinking_mode=adaptive` に変換する (`api/anthropic_adapter.py`)。
+  その先で、モデル登録の `native_thinking_modes` に adaptive を持たないモデルは拒否される (`server._resolve_enable_thinking`)。
+  1.6.84 で adaptive を持つのは MiniMax M3 だけ。DSV4.1 には「考えるかどうかをモデルが決める」モードが無い。
+- 対処: `scripts/vmlx_launch.py` が、DSV4.1 を読み込んでいるときだけ adaptive を `{"type": "enabled"}` (予算なし) に読み替える。
+  そのうえで、同じプロセスで vmlx を起動する。
+  結果は「思考 ON」。effort は `output_config.effort` などで指定があればそれを使い、無ければエンコーダの既定 (high = 75) になる。
+  enabled / disabled の経路と、ほかのモデルの経路には手を入れない。
+- vmlx のバージョンが 1.6.84 以外なら、起動を止める (fail-closed)。
+  上流で直っていないことを確かめてから通すときは、`VMLX_HOTFIX_ALLOW_VERSION=<版>` を付けて起動する。
+- 確認 (2026-11-09): hotfix なしでは adaptive が 400 になった。hotfix ありでは 200 で、思考と本文が別々のブロックで返った (ストリーミングあり・なしの両方)。
+  `output_config.effort` 付きの adaptive、enabled、disabled (思考なし) も、これまでどおり動いた。
 
 ## 速度と正答率 (1 本ずつ)
 

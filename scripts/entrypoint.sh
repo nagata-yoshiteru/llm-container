@@ -68,4 +68,6 @@ fi
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DO_NOT_TRACK=1
 
 echo "+ vmlx ${ARGS[*]}" | sed -E 's/(--api-key )[^ ]+/\1***/'
-exec "${VMLX}" "${ARGS[@]}"
+# vmlx を直接 exec せず、hotfix を当ててから同じプロセスで起動する
+# (Anthropic の thinking.type=adaptive が DSV4.1 で 400 になる問題。scripts/vmlx_launch.py 参照)
+exec "${VENV_DIR}/bin/python" -I "${REPO_ROOT}/scripts/vmlx_launch.py" "${ARGS[@]}"
